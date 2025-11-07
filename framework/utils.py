@@ -40,7 +40,7 @@ def download_report_data(uri, save_to):
         if 'issues.apache.org/jira/' in uri:
             issue_key = uri.split('/')[-1].split('?')[0] # 移除可能的查询参数
             api_uri = f"https://issues.apache.org/jira/si/jira.issueviews:issue-xml/{issue_key}/{issue_key}.xml"
-            print(f"  -> [JIRA] Remapped to XML view", end="")
+            print(f"  -> [JIRA] Remapped to XML view")
 
         elif 'github.com/' in uri and '/issues/' in uri and 'api.github.com' not in uri:
             parts = urlparse(uri).path.split('/')
@@ -49,28 +49,27 @@ def download_report_data(uri, save_to):
                 repo = parts[2]
                 issue_num = parts[4]
                 api_uri = f"https://api.github.com/repos/{org}/{repo}/issues/{issue_num}"
-                print(f"  -> [GitHub] Remapped to API view", end="")
+                print(f"  -> [GitHub] Remapped to API view")
                 if os.environ.get('GH_TOKEN'):
                     headers['Authorization'] = f"token {os.environ['GH_TOKEN']}"
 
         elif 'bugzilla' in uri and 'show_bug.cgi?id=' in uri:
             parsed_url = urlparse(uri)
             api_uri = urlunparse(parsed_url._replace(query=f"ctype=xml&{parsed_url.query}"))
-            print(f"  -> [Bugzilla] Remapped to XML view", end="")
+            print(f"  -> [Bugzilla] Remapped to XML view")
 
         elif 'sourceforge.net/p/' in uri and '/bugs/' in uri:
             api_uri = uri.replace('/p/', '/rest/p/')
             if not api_uri.endswith('/'):
                 api_uri += '/'
-            print(f"  -> [SourceForge] Remapped to REST API", end="")
+            print(f"  -> [SourceForge] Remapped to REST API")
         
         elif 'storage.googleapis.com/google-code-archive' in uri and uri.endswith('.json'):
-            print(f"  -> [Google Code] Using direct JSON URL", end="")
-        
-        else:
-            print(f"  -> [Unknown] Attempting direct download", end="")
+            print(f"  -> [Google Code] Using direct JSON URL")
 
-        
+        else:
+            print(f"  -> [Unknown] Attempting direct download")
+
         response = session.get(api_uri, headers=headers, timeout=20)
         response.raise_for_status()
         

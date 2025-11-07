@@ -9,6 +9,7 @@ import utils
 import config
 import codecs
 import shutil
+import json
 
 # Tee class for duplicating stderr output
 class Tee(object):
@@ -173,7 +174,7 @@ def process_project(project_id, project_name, repository_url, issue_tracker_name
                 except IndexError:
                     continue 
 
-                # --- 4a. Download Report (NEW LOGIC) ---
+                # 4a. Download Report
                 if not report_url or report_url == "NA":
                     print(f"  -> Skipping report for bug {bug_id} (missing URL).")
                 else:
@@ -186,11 +187,11 @@ def process_project(project_id, project_name, repository_url, issue_tracker_name
                     if os.path.exists(report_file):
                         pass 
                     else:
-                        print(f"\n  -> Downloading report for bug {bug_id}...")
+                        print(f"\n  -> Downloading report for bug {bug_id}...", end="")
                         utils.download_report_data(report_url, report_file)
 
 
-                # --- 4b. Generate Patch (Existing logic) ---
+                # 4b. Generate Patch
                 if not commit_buggy or not commit_fixed:
                     print(f"  -> Skipping patch for bug {bug_id} (missing commit hash).")
                     continue
@@ -201,7 +202,7 @@ def process_project(project_id, project_name, repository_url, issue_tracker_name
                     continue 
 
                 print(f"  -> Generating patch for bug {bug_id} ({commit_buggy} -> {commit_fixed})")
-
+                
                 cmd_diff_list = [
                     'git',
                     f'--git-dir={cache_repo_dir}',

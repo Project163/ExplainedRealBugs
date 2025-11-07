@@ -18,6 +18,15 @@ HugeBugRepository（基于 defects4j）是一个旨在自动化从各种软件�
 4.  生成代表每个错误修复的代码更改的补丁文件（`.diff` 或 `.patch`）。
 5.  将此信息整合为结构化格式，包括一个将错误报告链接到其相应修复提交的 CSV 文件（`active-bugs.csv`）。
 6.  收集错误报告及相关数据。
+7.  提供清理脚本以删除特定项目的数据。
+
+## 功能特性
+
+*   **自动化错误挖掘**: 自动克隆仓库、下载错误报告并识别错误修复提交。
+*   **多跟踪器支持**: 支持 Jira、GitHub 和 Bugzilla 等问题跟踪器。
+*   **结构化输出**: 生成干净、结构化的数据集，包括补丁文件和将错误映射到提交的 CSV 文件。
+*   **错误日志记录**: 挖掘过程中的所有错误消息都会记录到 `error.txt` 中，便于调试。
+*   **数据清理**: 包含一个脚本，可选择性地删除指定项目的所有缓存和输出数据。
 
 ## 入门指南
 
@@ -77,7 +86,23 @@ HugeBugRepository（基于 defects4j）是一个旨在自动化从各种软件�
 python framework/fast_bug_miner.py
 ```
 
-该脚本将处理必要的缓存和输出目录的创建。
+该脚本将处理必要的缓存和输出目录的创建。在此过程中遇到的任何错误都将记录在根目录下的 `error.txt` 文件中，以方便调试。
+
+### 清理数据
+
+该框架包含一个脚本，用于清理特定项目的所有数据（挖掘输出和缓存）。这对于删除损坏的数据或重新开始非常有用。
+
+1.  **创建 `delete.txt` 文件：**
+    创建一个名为 `framework/delete.txt` 的文件。该文件应列出您要清理的项目，格式与 `framework/example.txt` 相同。
+
+2.  **运行清理脚本：**
+    ```sh
+    python framework/clean_bug_and_cache.py
+    ```
+    您也可以使用 `-i` 标志指定不同的输入文件：
+    ```sh
+    python framework/clean_bug_and_cache.py -i path/to/your/project_list.txt
+    ```
 
 ### 输出
 
