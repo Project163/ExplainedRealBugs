@@ -209,8 +209,13 @@ def main():
         if not os.path.exists(out_file) or os.path.getsize(out_file) == 0:
             if debug: print(f"Downloading {uri} to {out_file}")
             if not get_file(uri, out_file, session):
-                if give_up: # Google tracker special logic
+                if args.tracker_name == 'github':
+                    if debug: print(f"[GitHub] Failed to download {uri}. Assuming end of results.")
                     break
+
+                elif give_up: # Google tracker special logic
+                    break
+                
                 else:
                     print(f"Error: Could not download {uri}", file=sys.stderr)
                     sys.exit(1)

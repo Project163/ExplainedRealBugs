@@ -51,8 +51,6 @@ def download_report_data(uri, save_to):
                 issue_num = parts[4]
                 api_uri = f"https://api.github.com/repos/{org}/{repo}/issues/{issue_num}"
                 print(f"  -> [GitHub] Remapped to API view")
-                if os.environ.get('GH_TOKEN'):
-                    headers['Authorization'] = f"token {os.environ['GH_TOKEN']}"
 
         elif 'bugzilla' in uri and 'show_bug.cgi?id=' in uri:
             parsed_url = urlparse(uri)
@@ -73,6 +71,10 @@ def download_report_data(uri, save_to):
 
         else:
             print(f"  -> [Unknown] Attempting direct download")
+
+        if 'api.github.com' in api_uri and os.environ.get('GH_TOKEN'):
+            headers['Authorization'] = f"token {os.environ.get('GH_TOKEN')}"
+            print(f"  -> [GitHub] Using token for authentication")
 
         response = session.get(api_uri, headers=headers, timeout=20)
         response.raise_for_status()

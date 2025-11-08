@@ -274,6 +274,9 @@ def main():
     
     # save original stderr
     original_stderr = sys.stderr
+
+    # import os
+    # print(f"--- 架构师诊断: 脚本看到的 GH_TOKEN = {os.environ.get('GH_TOKEN')} ---")
     
     try:
         # open error log file and redirect stderr
