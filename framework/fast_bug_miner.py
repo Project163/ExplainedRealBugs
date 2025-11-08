@@ -175,10 +175,12 @@ def process_project(project_id, project_name, repository_url, issue_tracker_name
                     continue 
 
                 # 4a. Download Report
+                report_file = None
+                ext = '.json'
+
                 if not report_url or report_url == "NA":
                     print(f"  -> Skipping report for bug {bug_id} (missing URL).")
-                else:
-                    ext = '.json' 
+                else: 
                     if 'issues.apache.org/jira' in report_url or 'bz.apache.org/bugzilla' in report_url:
                         ext = '.xml' 
                     
@@ -189,7 +191,31 @@ def process_project(project_id, project_name, repository_url, issue_tracker_name
                     else:
                         print(f"\n  -> Downloading report for bug {bug_id}...", end="")
                         utils.download_report_data(report_url, report_file)
+                        
+                # 4a.1 Download timeline if GitHub issue
+                if ext == '.json' and report_file and os.path.exists(report_file):
+                    
+                    timeline_file = os.path.join(output_reports_dir, f"{bug_id}.timeline.json")
 
+                    if not os.path.exists(timeline_file):
+                        timeline_url = None
+                        try:
+                            with open(report_file, 'r', encoding='utf-8') as f:
+                                data = json.load(f)
+
+                            if 'api.github.com' in data.get('url', ''):
+                                timeline_url = data.get('timeline_url') # 获取 timeline_url
+                                print(f"  -> Found timeline URL in GitHub API response: {timeline_url}")
+                                
+                        except json.JSONDecodeError:
+                            print(f"  -> [Warning] {report_file} 不是有效的 JSON，无法查找 timeline URL。")
+                        except Exception as e:
+                            print(f"  -> [Warning] 解析 {report_file} 时出错: {e}")
+
+                        if timeline_url:
+                            print(f"\n  -> Downloading timeline (discussion) for bug {bug_id}...", end="")
+
+                            utils.download_report_data(timeline_url, timeline_file)                
 
                 # 4b. Generate Patch
                 if not commit_buggy or not commit_fixed:

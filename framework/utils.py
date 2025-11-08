@@ -6,6 +6,7 @@ import os
 import sys
 import requests  
 import requests.adapters 
+import json
 from urllib.parse import urlparse, urlunparse 
 
 # Read debug flag from environment variable
@@ -66,6 +67,9 @@ def download_report_data(uri, save_to):
         
         elif 'storage.googleapis.com/google-code-archive' in uri and uri.endswith('.json'):
             print(f"  -> [Google Code] Using direct JSON URL")
+        
+        elif 'timeline' in uri:
+            print(f"  -> [GitHub] Downloading timeline JSON")
 
         else:
             print(f"  -> [Unknown] Attempting direct download")
