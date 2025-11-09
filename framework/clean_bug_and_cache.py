@@ -37,7 +37,7 @@ def main():
     )
     
     # 允许用户指定输入文件，默认为 framework/example.txt
-    default_input = os.path.join(config.SCRIPT_DIR, 'delete.txt')
+    default_input = os.path.join(config.SCRIPT_DIR, 'example.txt')
     parser.add_argument(
         '-i', '--input', 
         dest='input_file', 
