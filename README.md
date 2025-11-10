@@ -30,7 +30,7 @@ The primary goal of this project is to build a comprehensive bug repository. It 
 
 ## Bug Repository Overview
 
-Currently, the repository contains bug data for **12** projects, with a total of **44,419** bugs. Below is a summary of the bug counts for each project.
+Currently, the repository contains bug data for **227** projects, with a total of **44,419** bugs. Below is a summary of the bug counts for each project.
 
 <details>
 <summary>Click to expand for a detailed list of all projects</summary>
