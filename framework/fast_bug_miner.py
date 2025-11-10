@@ -238,7 +238,10 @@ def process_project(project_id, project_name, repository_url, issue_tracker_name
                     '--', 
                     sub_project_path
                 ]
-
+                
+                git_env = os.environ.copy()
+                git_env['GIT_TERMINAL_PROMPT'] = '0'  # disable git prompts
+                
                 try:
                     result = subprocess.run(
                         cmd_diff_list, 
@@ -247,7 +250,10 @@ def process_project(project_id, project_name, repository_url, issue_tracker_name
                         capture_output=True, 
                         text=True,
                         encoding='utf-8',
-                        errors='ignore'
+                        errors='ignore',
+                        stdin=subprocess.DEVNULL,
+                        timeout=1800,
+                        env=git_env
                     )
                     
                     with open(patch_file, 'w', encoding='utf-8') as f:

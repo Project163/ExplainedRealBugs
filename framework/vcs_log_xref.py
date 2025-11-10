@@ -25,6 +25,9 @@ def get_git_parent(commit_hash, repo_dir):
             commit_hash
         ]
 
+        git_env = os.environ.copy()
+        git_env['GIT_TERMINAL_PROMPT'] = '0'  # disable git prompts
+
         # shell=False for Windows compatibility
         result = subprocess.run(
             cmd_list, 
@@ -33,7 +36,10 @@ def get_git_parent(commit_hash, repo_dir):
             text=True, 
             check=True, 
             encoding='utf-8', 
-            errors='ignore'
+            errors='ignore',
+            stdin=subprocess.DEVNULL,
+            timeout=1800,
+            env=git_env
         )
         parts = result.stdout.strip().split()
         

@@ -109,6 +109,11 @@ def exec_cmd(cmd_list, desc, output_file=None):
         print("FAIL", file=sys.stderr)
         print(f"Internal Error: exec_cmd now requires 'cmd' to be a list.", file=sys.stderr)
         return False, "exec_cmd requires list"
+
+    emd_env = os.environ.copy()
+
+    if cmd_list and 'git' in cmd_list[0]:
+        emd_env['GIT_TERMINAL_PROMPT'] = '0'  # disable git prompts
         
     try:
         stdout_handle = None
@@ -124,7 +129,10 @@ def exec_cmd(cmd_list, desc, output_file=None):
                     stderr=subprocess.PIPE, 
                     text=True,
                     encoding='utf-8',
-                    errors='ignore'
+                    errors='ignore',
+                    stdin=subprocess.DEVNULL,
+                    timeout=1800,
+                    env=emd_env
                 )
                 log = f"(stdout written to {output_file})\n" + (result.stderr or "")
             except IOError as e:
@@ -142,7 +150,10 @@ def exec_cmd(cmd_list, desc, output_file=None):
                 capture_output=True, 
                 text=True,
                 encoding='utf-8',
-                errors='ignore'
+                errors='ignore',
+                stdin=subprocess.DEVNULL,
+                timeout=1800,
+                env=emd_env
             )
             log = (result.stdout or "") + (result.stderr or "")
         
