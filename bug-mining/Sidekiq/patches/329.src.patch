@@ -1,0 +1,267 @@
+diff --git a/Changes.md b/Changes.md
+index 49169620..7747e2a2 100644
+--- a/Changes.md
++++ b/Changes.md
+@@ -5,6 +5,10 @@
+ HEAD
+ ----------
+ 
++- Reimplement `retry_all` and `kill_all` API methods to use ZPOPMIN,
++  approximately 30-60% faster. [#6481]
++- Add preload testing binary at `examples/testing/sidekiq_boot` to verify your Rails app boots correctly with Sidekiq Enterprise's app preloading.
++- Fix circular require with ActiveJob adapter [#6477]
+ - Fix potential race condition leading to incorrect serialized values for CurrentAttributes [#6475]
+ 
+ 7.3.4
+diff --git a/lib/sidekiq/api.rb b/lib/sidekiq/api.rb
+index f5b8eabd..fa206d65 100644
+--- a/lib/sidekiq/api.rb
++++ b/lib/sidekiq/api.rb
+@@ -668,6 +668,41 @@ module Sidekiq
+       end
+     end
+ 
++    def pop_each
++      Sidekiq.redis do |c|
++        size.times do
++          data, score = c.zpopmin(name, 1)&.first
++          break unless data
++          yield data, score
++        end
++      end
++    end
++
++    def retry_all
++      c = Sidekiq::Client.new
++      pop_each do |msg, _|
++        job = Sidekiq.load_json(msg)
++        # Manual retries should not count against the retry limit.
++        job["retry_count"] -= 1 if job["retry_count"]
++        c.push(job)
++      end
++    end
++
++    # Move all jobs from this Set to the Dead Set.
++    # See DeadSet#kill
++    def kill_all(notify_failure: false, ex: nil)
++      ds = DeadSet.new
++      opts = {notify_failure: notify_failure, ex: ex, trim: false}
++
++      begin
++        pop_each do |msg, _|
++          ds.kill(msg, opts)
++        end
++      ensure
++        ds.trim
++      end
++    end
++
+     def each
+       initial_size = @_size
+       offset_size = 0
+@@ -765,10 +800,6 @@ module Sidekiq
+ 
+   ##
+   # The set of scheduled jobs within Sidekiq.
+-  # Based on this, you can search/filter for jobs.  Here's an
+-  # example where I'm selecting jobs based on some complex logic
+-  # and deleting them from the scheduled set.
+-  #
+   # See the API wiki page for usage notes and examples.
+   #
+   class ScheduledSet < JobSet
+@@ -779,26 +810,12 @@ module Sidekiq
+ 
+   ##
+   # The set of retries within Sidekiq.
+-  # Based on this, you can search/filter for jobs.  Here's an
+-  # example where I'm selecting all jobs of a certain type
+-  # and deleting them from the retry queue.
+-  #
+   # See the API wiki page for usage notes and examples.
+   #
+   class RetrySet < JobSet
+     def initialize
+       super("retry")
+     end
+-
+-    # Enqueues all jobs pending within the retry set.
+-    def retry_all
+-      each(&:retry) while size > 0
+-    end
+-
+-    # Kills all jobs pending within the retry set.
+-    def kill_all
+-      each(&:kill) while size > 0
+-    end
+   end
+ 
+   ##
+@@ -811,20 +828,31 @@ module Sidekiq
+       super("dead")
+     end
+ 
++    # Trim dead jobs which are over our storage limits
++    def trim
++      hash = Sidekiq.default_configuration
++      now = Time.now.to_f
++      Sidekiq.redis do |conn|
++        conn.multi do |transaction|
++          transaction.zremrangebyscore(name, "-inf", now - hash[:dead_timeout_in_seconds])
++          transaction.zremrangebyrank(name, 0, - hash[:dead_max_jobs])
++        end
++      end
++    end
++
+     # Add the given job to the Dead set.
+     # @param message [String] the job data as JSON
+-    # @option opts [Boolean] :notify_failure  (true) Whether death handlers should be called
++    # @option opts [Boolean] :notify_failure (true) Whether death handlers should be called
++    # @option opts [Boolean] :trim (true) Whether Sidekiq should trim the structure to keep it within configuration
+     # @option opts [Exception] :ex (RuntimeError) An exception to pass to the death handlers
+     def kill(message, opts = {})
+       now = Time.now.to_f
+       Sidekiq.redis do |conn|
+-        conn.multi do |transaction|
+-          transaction.zadd(name, now.to_s, message)
+-          transaction.zremrangebyscore(name, "-inf", now - Sidekiq::Config::DEFAULTS[:dead_timeout_in_seconds])
+-          transaction.zremrangebyrank(name, 0, - Sidekiq::Config::DEFAULTS[:dead_max_jobs])
+-        end
++        conn.zadd(name, now.to_s, message)
+       end
+ 
++      trim if opts[:trim] != false
++
+       if opts[:notify_failure] != false
+         job = Sidekiq.load_json(message)
+         if opts[:ex]
+@@ -839,11 +867,6 @@ module Sidekiq
+       end
+       true
+     end
+-
+-    # Enqueue all dead jobs
+-    def retry_all
+-      each(&:retry) while size > 0
+-    end
+   end
+ 
+   ##
+diff --git a/test/api_test.rb b/test/api_test.rb
+index 57d10289..6ba8a886 100644
+--- a/test/api_test.rb
++++ b/test/api_test.rb
+@@ -724,13 +724,6 @@ describe "API" do
+       assert_equal 1, ps.size
+       assert_equal 1, ps.to_a.size
+     end
+-
+-    def add_retry(jid = "bob", at = Time.now.to_f)
+-      payload = Sidekiq.dump_json("class" => "ApiJob", "args" => [1, "mike"], "queue" => "default", "jid" => jid, "retry_count" => 2, "failed_at" => Time.now.to_f, "error_backtrace" => ["line1", "line2"])
+-      @cfg.redis do |conn|
+-        conn.zadd("retry", at.to_s, payload)
+-      end
+-    end
+   end
+ 
+   describe "dead set" do
+@@ -783,5 +776,53 @@ describe "API" do
+       assert_equal 1, ds.size
+       assert_equal 1, death_handler_call_count
+     end
++
++    it "can retry and kill all safely" do
++      dcount = 1000
++      hash = Sidekiq.default_configuration
++      hash[:dead_max_jobs] = dcount
++
++      dcount.times do
++        add_dead
++      end
++      rcount = 500
++      rcount.times do
++        add_retry
++      end
++
++      q = Sidekiq::Queue.new
++      ds = Sidekiq::DeadSet.new
++      rs = Sidekiq::RetrySet.new
++      assert_equal dcount, ds.size
++      assert_equal rcount, rs.size
++
++      ds.retry_all
++      assert_equal 0, ds.size
++      assert_equal dcount, q.size
++
++      timing("kill_all") { rs.kill_all }
++      assert_equal rcount, ds.size
++      assert_equal 0, rs.size
++    end
++  end
++end
++
++def timing(str)
++  yield
++  # p [str, (a = Time.now; yield; (Time.now - a))]
++end
++
++def add_retry(jid = "bob", at = Time.now.to_f)
++  payload = Sidekiq.dump_json("class" => "ApiJob", "args" => [1, "mike"], "queue" => "default", "jid" => jid, "retry_count" => 2, "failed_at" => Time.now.to_f, "error_backtrace" => ["line1", "line2"])
++  @cfg.redis do |conn|
++    conn.zadd("retry", at.to_s, payload)
++  end
++end
++
++def add_dead(jid = nil, at = Time.now.to_f)
++  jid ||= SecureRandom.hex(12)
++  payload = Sidekiq.dump_json("class" => "ApiJob", "args" => [1, "mike"], "queue" => "default", "jid" => jid)
++  @cfg.redis do |conn|
++    conn.zadd("dead", at.to_s, payload)
+   end
+ end
+diff --git a/test/dead_set_test.rb b/test/dead_set_test.rb
+index 0fe7025d..37715880 100644
+--- a/test/dead_set_test.rb
++++ b/test/dead_set_test.rb
+@@ -4,6 +4,10 @@ require_relative "helper"
+ require "sidekiq/api"
+ 
+ describe "DeadSet" do
++  before do
++    @config = reset!
++  end
++
+   def dead_set
+     Sidekiq::DeadSet.new
+   end
+@@ -16,7 +20,7 @@ describe "DeadSet" do
+   end
+ 
+   it "should remove dead jobs older than Sidekiq::DeadSet.timeout" do
+-    old, Sidekiq::Config::DEFAULTS[:dead_timeout_in_seconds] = Sidekiq::Config::DEFAULTS[:dead_timeout_in_seconds], 10
++    @config[:dead_timeout_in_seconds] = 10
+     Time.stub(:now, Time.now - 11) do
+       dead_set.kill(Sidekiq.dump_json(jid: "000103", class: "MyJob3", args: [])) # the oldest
+     end
+@@ -28,12 +32,10 @@ describe "DeadSet" do
+     assert_nil dead_set.find_job("000103")
+     assert dead_set.find_job("000102")
+     assert dead_set.find_job("000101")
+-  ensure
+-    Sidekiq::Config::DEFAULTS[:dead_timeout_in_seconds] = old
+   end
+ 
+   it "should remove all but last Sidekiq::DeadSet.max_jobs-1 jobs" do
+-    old, Sidekiq::Config::DEFAULTS[:dead_max_jobs] = Sidekiq::Config::DEFAULTS[:dead_max_jobs], 3
++    @config[:dead_max_jobs] = 3
+     dead_set.kill(Sidekiq.dump_json(jid: "000101", class: "MyJob1", args: []))
+     dead_set.kill(Sidekiq.dump_json(jid: "000102", class: "MyJob2", args: []))
+     dead_set.kill(Sidekiq.dump_json(jid: "000103", class: "MyJob3", args: []))
+@@ -41,7 +43,5 @@ describe "DeadSet" do
+     assert_nil dead_set.find_job("000101")
+     assert dead_set.find_job("000102")
+     assert dead_set.find_job("000103")
+-  ensure
+-    Sidekiq::Config::DEFAULTS[:dead_max_jobs] = old
+   end
+ end

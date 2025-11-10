@@ -1,0 +1,607 @@
+diff --git a/src/yb/client/clone_namespace-test.cc b/src/yb/client/clone_namespace-test.cc
+index 78d1d391ec..497896f47d 100644
+--- a/src/yb/client/clone_namespace-test.cc
++++ b/src/yb/client/clone_namespace-test.cc
+@@ -22,6 +22,7 @@
+ #include "yb/util/backoff_waiter.h"
+ 
+ DECLARE_bool(enable_db_clone);
++DECLARE_uint64(snapshot_coordinator_cleanup_delay_ms);
+ 
+ namespace yb {
+ namespace client {
+@@ -128,7 +129,6 @@ TEST_F(CloneNamespaceTest, CloneAfterDrop) {
+   ASSERT_OK(snapshot_util_->WaitScheduleSnapshot(schedule_id));
+ 
+   ASSERT_NO_FATALS(WriteData(WriteOpType::INSERT, 0 /* transaction */));
+-  auto row_count = CountTableRows(table_);
+   auto ht = cluster_->mini_master()->master()->clock()->Now();
+ 
+   ASSERT_OK(client_->DeleteTable(kTableName));
+@@ -139,7 +139,7 @@ TEST_F(CloneNamespaceTest, CloneAfterDrop) {
+   YBTableName clone(YQL_DATABASE_CQL, kTargetNamespaceName, kTableName.table_name());
+   TableHandle clone_handle;
+   ASSERT_OK(clone_handle.Open(clone, client_.get()));
+-  ASSERT_EQ(CountTableRows(clone_handle), row_count);
++  ASSERT_EQ(CountTableRows(clone_handle), kNumRows);
+ }
+ 
+ TEST_F(CloneNamespaceTest, DropClonedNamespace) {
+@@ -160,5 +160,31 @@ TEST_F(CloneNamespaceTest, DropClonedNamespace) {
+   ASSERT_OK(client_->DeleteNamespace(kTargetNamespaceName));
+ }
+ 
++TEST_F(CloneNamespaceTest, CloneFromOldestSnapshot) {
++  // Check that we can use the oldest snapshot in a schedule to clone.
++  const auto kInterval = 5s;
++  const auto kRetention = 10s;
++  ANNOTATE_UNPROTECTED_WRITE(FLAGS_snapshot_coordinator_cleanup_delay_ms) = 100;
++
++  auto schedule_id = ASSERT_RESULT(snapshot_util_->CreateSchedule(
++      table_, kTableName.namespace_type(), kTableName.namespace_name(), kInterval, kRetention));
++
++  auto first_snapshot = ASSERT_RESULT(snapshot_util_->WaitScheduleSnapshot(schedule_id));
++  ASSERT_NO_FATALS(WriteData(WriteOpType::INSERT, 0 /* transaction */));
++  auto ht = cluster_->mini_master()->master()->clock()->Now();
++
++  // Wait for the first snapshot to be deleted and check that we can clone to a time between the
++  // first and the second snapshot's hybrid times.
++  ASSERT_OK(snapshot_util_->WaitSnapshotCleaned(TryFullyDecodeTxnSnapshotId(first_snapshot.id())));
++
++  ASSERT_OK(CloneAndWait(
++      kTableName.namespace_name(), YQLDatabase::YQL_DATABASE_CQL, ht, kTargetNamespaceName));
++
++  YBTableName clone(YQL_DATABASE_CQL, kTargetNamespaceName, kTableName.table_name());
++  TableHandle clone_handle;
++  ASSERT_OK(clone_handle.Open(clone, client_.get()));
++  ASSERT_EQ(CountTableRows(clone_handle), kNumRows);
++}
++
+ } // namespace client
+ } // namespace yb
+diff --git a/src/yb/client/snapshot_test_util.cc b/src/yb/client/snapshot_test_util.cc
+index 4ec20d4ffc..db34810928 100644
+--- a/src/yb/client/snapshot_test_util.cc
++++ b/src/yb/client/snapshot_test_util.cc
+@@ -284,6 +284,18 @@ Status SnapshotTestUtil::DeleteSnapshot(const TxnSnapshotId& snapshot_id) {
+   return Status::OK();
+ }
+ 
++Status SnapshotTestUtil::WaitSnapshotCleaned(const TxnSnapshotId& snapshot_id) {
++  return WaitFor([&]() -> Result<bool> {
++    auto snapshots = VERIFY_RESULT(ListSnapshots());
++    for (const auto& snapshot : snapshots) {
++      if (TryFullyDecodeTxnSnapshotId(snapshot.id()) == snapshot_id) {
++        return false;
++      }
++    }
++    return true;
++  }, 30s, "Wait for snapshot to be cleaned up");
++}
++
+ Status SnapshotTestUtil::WaitAllSnapshotsDeleted() {
+   RETURN_NOT_OK(WaitFor([this]() -> Result<bool> {
+     auto snapshots = VERIFY_RESULT(ListSnapshots());
+@@ -379,8 +391,7 @@ Result<SnapshotScheduleId> SnapshotTestUtil::CreateSchedule(
+       VERIFY_RESULT(MakeBackupServiceProxy()).CreateSnapshotSchedule(req, &resp, &controller));
+   auto id = VERIFY_RESULT(FullyDecodeSnapshotScheduleId(resp.snapshot_schedule_id()));
+   if (wait_snapshot) {
+-    RETURN_NOT_OK(WaitScheduleSnapshot(id, std::numeric_limits<int>::max(),
+-        HybridTime::kMin, 60s * kTimeMultiplier));
++    RETURN_NOT_OK(WaitScheduleSnapshot(id));
+   }
+   return id;
+ }
+@@ -421,35 +432,24 @@ Result<TxnSnapshotId> SnapshotTestUtil::PickSuitableSnapshot(
+   return STATUS_FORMAT(NotFound, "Not found suitable snapshot for $0", hybrid_time);
+ }
+ 
+-Status SnapshotTestUtil::WaitScheduleSnapshot(
++Result<master::SnapshotInfoPB> SnapshotTestUtil::WaitScheduleSnapshot(
+     const SnapshotScheduleId& schedule_id, HybridTime min_hybrid_time) {
+-  return WaitScheduleSnapshot(schedule_id, std::numeric_limits<int>::max(), min_hybrid_time);
+-}
+-
+-Status SnapshotTestUtil::WaitScheduleSnapshot(
+-    const SnapshotScheduleId& schedule_id, int max_snapshots, HybridTime min_hybrid_time) {
+-  return WaitScheduleSnapshot(schedule_id, max_snapshots, min_hybrid_time,
+-      ((max_snapshots == 1) ? 0s : kSnapshotInterval) + kSnapshotInterval / 2);
+-}
++  master::SnapshotInfoPB matching_snapshot;
++  RETURN_NOT_OK(WaitFor([&]() -> Result<bool> {
++    for (const auto& snapshot : VERIFY_RESULT(ListSnapshots())) {
++      if (TryFullyDecodeSnapshotScheduleId(snapshot.entry().schedule_id()) != schedule_id) {
++        continue;
++      }
+ 
+-Status SnapshotTestUtil::WaitScheduleSnapshot(
+-    const SnapshotScheduleId& schedule_id, int max_snapshots,
+-    HybridTime min_hybrid_time, MonoDelta timeout) {
+-  return WaitFor([this, schedule_id, max_snapshots, min_hybrid_time]() -> Result<bool> {
+-    auto snapshots = VERIFY_RESULT(ListSnapshots());
+-    EXPECT_LE(snapshots.size(), max_snapshots);
+-    LOG(INFO) << "Snapshots: " << AsString(snapshots);
+-    for (const auto& snapshot : snapshots) {
+-      EXPECT_EQ(TryFullyDecodeSnapshotScheduleId(snapshot.entry().schedule_id()), schedule_id);
+-      if (snapshot.entry().state() == master::SysSnapshotEntryPB::COMPLETE
+-          && HybridTime::FromPB(snapshot.entry().snapshot_hybrid_time()) >= min_hybrid_time) {
++      if (snapshot.entry().state() == master::SysSnapshotEntryPB::COMPLETE &&
++          HybridTime::FromPB(snapshot.entry().snapshot_hybrid_time()) >= min_hybrid_time) {
++        matching_snapshot = snapshot;
+         return true;
+       }
+     }
+-      return false;
+-    },
+-    timeout,
+-    "Schedule snapshot");
++    return false;
++  }, kSnapshotInterval + kSnapshotInterval / 2, "Schedule did not create a snapshot in time"));
++  return matching_snapshot;
+ }
+ 
+ } // namespace client
+diff --git a/src/yb/client/snapshot_test_util.h b/src/yb/client/snapshot_test_util.h
+index 1ef3711eec..5448e00672 100644
+--- a/src/yb/client/snapshot_test_util.h
++++ b/src/yb/client/snapshot_test_util.h
+@@ -104,6 +104,8 @@ class SnapshotTestUtil {
+   Status WaitAllSnapshotsDeleted();
+ 
+   Result<ImportedSnapshotData> StartImportSnapshot(const master::SnapshotInfoPB& snapshot);
++
++  Status WaitSnapshotCleaned(const TxnSnapshotId& snapshot_id);
+   Status WaitAllSnapshotsCleaned();
+ 
+   Result<SnapshotScheduleId> CreateSchedule(
+@@ -126,16 +128,8 @@ class SnapshotTestUtil {
+   Result<TxnSnapshotId> PickSuitableSnapshot(
+       const SnapshotScheduleId& schedule_id, HybridTime hybrid_time);
+ 
+-  Status WaitScheduleSnapshot(
+-      const SnapshotScheduleId& schedule_id, HybridTime min_hybrid_time);
+-
+-  Status WaitScheduleSnapshot(
+-      const SnapshotScheduleId& schedule_id, int max_snapshots = 1,
+-      HybridTime min_hybrid_time = HybridTime::kMin);
+-
+-  Status WaitScheduleSnapshot(
+-      const SnapshotScheduleId& schedule_id, int max_snapshots,
+-      HybridTime min_hybrid_time, MonoDelta timeout);
++  Result<master::SnapshotInfoPB> WaitScheduleSnapshot(
++      const SnapshotScheduleId& schedule_id, HybridTime min_hybrid_time = HybridTime::kMin);
+ 
+  private:
+   template <class F>
+diff --git a/src/yb/integration-tests/master_path_handlers-itest.cc b/src/yb/integration-tests/master_path_handlers-itest.cc
+index e06dc51f0e..6a354d32c0 100644
+--- a/src/yb/integration-tests/master_path_handlers-itest.cc
++++ b/src/yb/integration-tests/master_path_handlers-itest.cc
+@@ -710,7 +710,7 @@ TEST_F_EX(
+   auto schedule_id = ASSERT_RESULT(snapshot_util->CreateSchedule(
+       nullptr, YQL_DATABASE_CQL, table->name().namespace_name(),
+       client::WaitSnapshot::kFalse, kInterval, kRetention));
+-  ASSERT_OK(snapshot_util->WaitScheduleSnapshot(schedule_id, 1, HybridTime::kMin, 10s));
++  ASSERT_OK(snapshot_util->WaitScheduleSnapshot(schedule_id));
+   auto schedules = ASSERT_RESULT(snapshot_util->ListSchedules(schedule_id));
+   ASSERT_EQ(schedules.size(), 1);
+ 
+diff --git a/src/yb/integration-tests/minicluster-snapshot-test.cc b/src/yb/integration-tests/minicluster-snapshot-test.cc
+index 7725d75246..b31a148f9a 100644
+--- a/src/yb/integration-tests/minicluster-snapshot-test.cc
++++ b/src/yb/integration-tests/minicluster-snapshot-test.cc
+@@ -323,6 +323,7 @@ TEST_F(MasterSnapshotTest, FailSysCatalogWriteWithStaleTable) {
+   SnapshotScheduleId schedule_id = ASSERT_RESULT(CreateSnapshotSchedule(
+       &proxy, table_name.namespace_type(), table_name.namespace_name(), MonoDelta::FromSeconds(60),
+       MonoDelta::FromSeconds(600), timeout));
++  ASSERT_OK(WaitScheduleSnapshot(&proxy, schedule_id, timeout));
+ 
+   auto table_creator = client_->NewTableCreator();
+   client::YBSchemaBuilder b;
+diff --git a/src/yb/master/catalog_manager_ext.cc b/src/yb/master/catalog_manager_ext.cc
+index ffe668b512..dbff49f8de 100644
+--- a/src/yb/master/catalog_manager_ext.cc
++++ b/src/yb/master/catalog_manager_ext.cc
+@@ -1382,10 +1382,9 @@ Result<std::pair<SnapshotInfoPB, std::unordered_set<TabletId>>>
+       snapshot_schedule_id, read_time);
+ 
+   // Find or create a snapshot that covers read_time.
+-  auto suitable_snapshot = VERIFY_RESULT(snapshot_coordinator_.GetSuitableSnapshot(
++  auto snapshot_id = VERIFY_RESULT(snapshot_coordinator_.GetSuitableSnapshotForRestore(
+       snapshot_schedule_id, read_time, LeaderTerm(), deadline));
+-  auto snapshot_id = VERIFY_RESULT(FullyDecodeTxnSnapshotId(suitable_snapshot.id()));
+-  LOG(INFO) << Format("Found suitable snapshot: $0", snapshot_id);
++  LOG(INFO) << Format("Found suitable snapshot for restore: $0", snapshot_id);
+ 
+   ListSnapshotSchedulesResponsePB resp;
+   RETURN_NOT_OK(snapshot_coordinator_.ListSnapshotSchedules(snapshot_schedule_id, &resp));
+diff --git a/src/yb/master/master_snapshot_coordinator.cc b/src/yb/master/master_snapshot_coordinator.cc
+index 1f6aaf42d0..d21e2647d8 100644
+--- a/src/yb/master/master_snapshot_coordinator.cc
++++ b/src/yb/master/master_snapshot_coordinator.cc
+@@ -175,49 +175,6 @@ auto MakeDoneCallback(
+   };
+ }
+ 
+-bool SnapshotSuitableForRestoreAt(const SysSnapshotEntryPB& entry, HybridTime restore_at) {
+-  return (entry.state() == master::SysSnapshotEntryPB::COMPLETE ||
+-          entry.state() == master::SysSnapshotEntryPB::CREATING) &&
+-         HybridTime::FromPB(entry.snapshot_hybrid_time()) >= restore_at;
+-}
+-
+-// Returns the suitable TxnSnapshotId instead of SnapshotInfoPB as the snapshot might still be in
+-// creating state.
+-Result<TxnSnapshotId> FindSnapshotSuitableForRestoreAt(
+-    const SnapshotScheduleInfoPB& schedule, HybridTime restore_at) {
+-  if (schedule.snapshots().empty()) {
+-    return STATUS(NotFound, "Schedule does not have any snapshots.");
+-  }
+-  std::vector<std::reference_wrapper<const SnapshotInfoPB>> snapshots(
+-      schedule.snapshots().begin(), schedule.snapshots().end());
+-  // Don't rely on the implementation sorting the snapshots by creation time.
+-  std::sort(
+-      snapshots.begin(), snapshots.end(), [](const SnapshotInfoPB& lhs, const SnapshotInfoPB& rhs) {
+-        return HybridTime::FromPB(lhs.entry().snapshot_hybrid_time()) <
+-               HybridTime::FromPB(rhs.entry().snapshot_hybrid_time());
+-      });
+-  if (restore_at < HybridTime::FromPB(snapshots[0].get().entry().snapshot_hybrid_time())) {
+-    const auto& earliest_snapshot = snapshots[0];
+-    return STATUS_FORMAT(
+-        IllegalState,
+-        "Trying to restore to $0 which is earlier than the configured retention. "
+-        "Not allowed. Earliest snapshot that can be used is $1 and was taken at $2.",
+-        restore_at, TryFullyDecodeTxnSnapshotId(earliest_snapshot.get().id()),
+-        HybridTime::FromPB(earliest_snapshot.get().entry().snapshot_hybrid_time()));
+-  }
+-  // Return the id of the oldest valid snapshot created after the restore_at time.
+-  auto it = std::find_if(
+-      snapshots.begin(), snapshots.end(), [&restore_at](const SnapshotInfoPB& snapshot) {
+-        return SnapshotSuitableForRestoreAt(snapshot.entry(), restore_at);
+-      });
+-  if (it != snapshots.end()) {
+-    return FullyDecodeTxnSnapshotId(it->get().id());
+-  }
+-  return STATUS_FORMAT(
+-      NotFound,
+-      "The schedule does not have any valid snapshots created after the restore at time.");
+-}
+-
+ std::vector<SnapshotScheduleId> GetSchedulesForTable(
+     const SnapshotSchedulesToObjectIdsMap& schedules_to_tables_map, const TableId& table_id) {
+   std::vector<SnapshotScheduleId> result;
+@@ -733,66 +690,86 @@ class MasterSnapshotCoordinator::Impl {
+     return result;
+   }
+ 
+-  Result<SnapshotInfoPB> WaitForSnapshotToComplete(
+-      const TxnSnapshotId& snapshot_id, HybridTime restore_at, CoarseTimePoint deadline) {
+-    while (CoarseMonoClock::now() < deadline) {
+-      ListSnapshotsResponsePB resp;
++  // Returns the earliest time we can restore to with this snapshot. For all snapshots except the
++  // very first one taken after creating a snapshot schedule, this is the previous snapshot's hybrid
++  // time. For the first snapshot, this is the snapshot's hybrid time.
++  HybridTime ComputeMinRestoreTime(const SnapshotState& snapshot) {
++    auto prev_snapshot_time = snapshot.previous_snapshot_hybrid_time();
++    return HybridTime(prev_snapshot_time ? prev_snapshot_time : snapshot.snapshot_hybrid_time());
++  }
+ 
+-      RETURN_NOT_OK_PREPEND(
+-          ListSnapshots(snapshot_id, false, {}, &resp), "Failed to list snapshots");
+-      if (resp.snapshots().size() != 1) {
+-        return STATUS_FORMAT(
+-            IllegalState, "Wrong number of snapshots received $0", resp.snapshots().size());
++  Result<bool> IsSnapshotSuitableForRestoreAt(
++      const SnapshotState& snapshot, HybridTime restore_at) {
++    auto state = VERIFY_RESULT(snapshot.AggregatedState());
++    return (state == SysSnapshotEntryPB::COMPLETE || state == SysSnapshotEntryPB::CREATING) &&
++           restore_at <= snapshot.snapshot_hybrid_time() &&
++           restore_at >= ComputeMinRestoreTime(snapshot);
++  }
++
++  // Returns the suitable TxnSnapshotId instead of SnapshotInfoPB as the snapshot might still be in
++  // creating state.
++  Result<TxnSnapshotId> FindSnapshotSuitableForRestoreAt(
++      const SnapshotScheduleId& schedule_id, HybridTime restore_at) EXCLUDES(mutex_) {
++    std::lock_guard lock(mutex_);
++    const auto [begin, end] = snapshots_.get<ScheduleTag>().equal_range(schedule_id);
++
++    for (auto it = begin; it != end; ++it) {
++      if (VERIFY_RESULT(IsSnapshotSuitableForRestoreAt(**it, restore_at))) {
++        return (*it)->id();
+       }
++    }
++    return STATUS_FORMAT(
++        NotFound,
++        "The schedule does not have any valid snapshots created after the restore time ($0).",
++        restore_at);
++  }
+ 
+-      if (resp.snapshots()[0].entry().state() == master::SysSnapshotEntryPB::COMPLETE) {
+-        if (SnapshotSuitableForRestoreAt(resp.snapshots()[0].entry(), restore_at)) {
+-          return resp.snapshots()[0];
++  Result<TxnSnapshotId> WaitForSnapshotToComplete(
++      const TxnSnapshotId& snapshot_id, HybridTime restore_at, CoarseTimePoint deadline) {
++    while (CoarseMonoClock::now() < deadline) {
++      // Have to look up the snapshot each iteration because the snapshot is only valid while the
++      // mutex is held.
++      {
++        std::lock_guard lock(mutex_);
++        const auto& snapshot = VERIFY_RESULT(FindSnapshot(snapshot_id)).get();
++        if (VERIFY_RESULT(snapshot.AggregatedState()) == master::SysSnapshotEntryPB::COMPLETE) {
++          return snapshot.id();
+         }
+-        return STATUS_FORMAT(
+-            IllegalState, "Snapshot is not suitable for restore at $0", restore_at);
+       }
+       std::this_thread::sleep_for(100ms);
+     }
+-    return STATUS_FORMAT(TimedOut, "Timed out completing a snapshot $0", snapshot_id);
++    return STATUS_FORMAT(TimedOut, "Timed out waiting for snapshot $0 to complete", snapshot_id);
+   }
+ 
+-  Result<SnapshotInfoPB> GetSuitableSnapshot(
++  Result<TxnSnapshotId> GetSuitableSnapshotForRestore(
+       const SnapshotScheduleId& schedule_id, HybridTime restore_at, int64_t leader_term,
+       CoarseTimePoint deadline) {
+-    while (CoarseMonoClock::now() < deadline) {
+-      ListSnapshotSchedulesResponsePB resp;
+-      RETURN_NOT_OK_PREPEND(ListSnapshotSchedules(schedule_id, &resp),
+-                            "Failed to list snapshot schedules");
+-      if (resp.schedules().size() < 1) {
+-        return STATUS_FORMAT(InvalidArgument, "Unknown schedule: $0", schedule_id);
+-      }
+-      auto snapshot_result = FindSnapshotSuitableForRestoreAt(resp.schedules()[0], restore_at);
+-      if (snapshot_result.ok()) {
+-        return WaitForSnapshotToComplete(*snapshot_result, restore_at, deadline);
+-      }
+-      if (!snapshot_result.status().IsNotFound()) {
+-        return snapshot_result.status();
+-      }
+-      snapshot_result = CreateForSchedule(schedule_id, leader_term, deadline);
+-      if (snapshot_result.ok()) {
+-        return WaitForSnapshotToComplete(*snapshot_result, restore_at, deadline);
+-      }
+-      if (MasterError(snapshot_result.status()) == MasterErrorPB::PARALLEL_SNAPSHOT_OPERATION) {
+-        continue;
+-      }
++    SCHECK_LE(
++        restore_at, GetCurrentHybridTime(), InvalidArgument,
++        Format("Cannot restore to $0 since it is in the future", restore_at));
++
++    TxnSnapshotId snapshot_id = TxnSnapshotId::Nil();
++
++    // First check if a suitable snapshot already exists.
++    auto snapshot_result = FindSnapshotSuitableForRestoreAt(schedule_id, restore_at);
++    if (snapshot_result.ok()) {
++      snapshot_id = *snapshot_result;
++    } else if (!snapshot_result.status().IsNotFound()) {
+       return snapshot_result.status();
++    } else {
++      // If a suitable snapshot does not exist, try to create one.
++      VERIFY_RESULT(CreateForSchedule(schedule_id, leader_term, deadline));
++      snapshot_id = VERIFY_RESULT(FindSnapshotSuitableForRestoreAt(schedule_id, restore_at));
+     }
+-    return STATUS_FORMAT(
+-        TimedOut, "Timed out getting a suitable snapshot id from schedule $0", schedule_id);
++
++    return WaitForSnapshotToComplete(snapshot_id, restore_at, deadline);
+   }
+ 
+   Status RestoreSnapshotSchedule(
+       const SnapshotScheduleId& schedule_id, HybridTime restore_at,
+       RestoreSnapshotScheduleResponsePB* resp, int64_t leader_term, CoarseTimePoint deadline) {
+-    auto snapshot =
+-        VERIFY_RESULT(GetSuitableSnapshot(schedule_id, restore_at, leader_term, deadline));
+-    auto snapshot_id = VERIFY_RESULT(FullyDecodeTxnSnapshotId(snapshot.id()));
++    const auto snapshot_id = VERIFY_RESULT(
++        GetSuitableSnapshotForRestore(schedule_id, restore_at, leader_term, deadline));
+     TxnSnapshotRestorationId restoration_id = VERIFY_RESULT(Restore(
+         snapshot_id, restore_at, leader_term));
+ 
+@@ -1454,40 +1431,38 @@ class MasterSnapshotCoordinator::Impl {
+ 
+   void PollSchedulesPrepare(PollSchedulesData* data) REQUIRES(mutex_) {
+     auto now = context_.Clock()->Now();
+-    for (const auto& p : schedules_) {
++    for (const auto& schedule : schedules_) {
+       HybridTime last_snapshot_time;
+-      if (p->deleted()) {
+-        auto range = snapshots_.get<ScheduleTag>().equal_range(p->id());
++      if (schedule->deleted()) {
++        auto range = snapshots_.get<ScheduleTag>().equal_range(schedule->id());
+         for (const auto& snapshot : boost::make_iterator_range(range.first, range.second)) {
+           TryDeleteSnapshot(snapshot.get(), data);
+         }
+       } else {
+-        auto& index = snapshots_.get<ScheduleTag>();
+-        auto range = index.equal_range(p->id());
+-        if (range.first != range.second) {
+-          --range.second;
+-          for (; range.first != range.second; ++range.first) {
+-            if ((**range.first).initial_state() != SysSnapshotEntryPB::DELETING) {
++        auto [begin, end] = snapshots_.get<ScheduleTag>().equal_range(schedule->id());
++        if (begin != end) {
++          --end;
++          // Get the first non-deleting snapshot.
++          for (; begin != end; ++begin) {
++            if ((**begin).initial_state() != SysSnapshotEntryPB::DELETING) {
+               break;
+             }
+           }
+-          auto& first_snapshot = **range.first;
+-          data->schedule_min_restore_time[p->id()] =
+-              first_snapshot.previous_snapshot_hybrid_time()
+-                  ? first_snapshot.previous_snapshot_hybrid_time()
+-                  : first_snapshot.snapshot_hybrid_time();
+-          auto gc_limit = now.AddSeconds(-p->options().retention_duration_sec());
++          data->schedule_min_restore_time[schedule->id()] = ComputeMinRestoreTime(**begin);
++
++          // Delete all non-deleting snapshots that are older than the retention duration.
++          auto gc_limit = now.AddSeconds(-schedule->options().retention_duration_sec());
+           VLOG_WITH_FUNC(4) << "Gc limit: " << gc_limit;
+-          for (; range.first != range.second; ++range.first) {
+-            if ((**range.first).snapshot_hybrid_time() >= gc_limit) {
++          for (; begin != end; ++begin) {
++            if ((**begin).snapshot_hybrid_time() >= gc_limit) {
+               break;
+             }
+-            TryDeleteSnapshot(range.first->get(), data);
++            TryDeleteSnapshot(begin->get(), data);
+           }
+-          last_snapshot_time = (**range.second).snapshot_hybrid_time();
++          last_snapshot_time = (**end).snapshot_hybrid_time();
+         }
+       }
+-      p->PrepareOperations(last_snapshot_time, now, &data->schedule_operations);
++      schedule->PrepareOperations(last_snapshot_time, now, &data->schedule_operations);
+     }
+   }
+ 
+@@ -1629,6 +1604,10 @@ class MasterSnapshotCoordinator::Impl {
+     (**it).SnapshotFinished(snapshot_id, status);
+   }
+ 
++  HybridTime GetCurrentHybridTime() {
++    return context_.Clock()->MaxGlobalNow();
++  }
++
+   Status SubmitCreate(
+       const SysRowEntries& entries, bool imported, const SnapshotScheduleId& schedule_id,
+       HybridTime previous_snapshot_hybrid_time, TxnSnapshotId snapshot_id, int64_t leader_term,
+@@ -1652,7 +1631,7 @@ class MasterSnapshotCoordinator::Impl {
+       }
+     }
+ 
+-    request->set_snapshot_hybrid_time(context_.Clock()->MaxGlobalNow().ToUint64());
++    request->set_snapshot_hybrid_time(GetCurrentHybridTime().ToUint64());
+     request->set_operation(tserver::TabletSnapshotOpRequestPB::CREATE_ON_MASTER);
+     request->dup_snapshot_id(snapshot_id.AsSlice());
+     request->set_imported(imported);
+@@ -2106,6 +2085,9 @@ class MasterSnapshotCoordinator::Impl {
+ 
+   SnapshotCoordinatorContext& context_;
+   CatalogManager* cm_;
++
++  // Guards the maps below and their members. Members should not be accessed without holding the
++  // mutex to avoid data races, though this is currently unenforced.
+   mutable std::mutex mutex_;
+   class ScheduleTag;
+   using Snapshots = boost::multi_index_container<
+@@ -2367,15 +2349,10 @@ Result<std::vector<SnapshotScheduleId>> MasterSnapshotCoordinator::GetSnapshotSc
+   return impl_->GetSnapshotSchedules(type, object_id);
+ }
+ 
+-Result<SnapshotInfoPB> MasterSnapshotCoordinator::GetSuitableSnapshot(
++Result<TxnSnapshotId> MasterSnapshotCoordinator::GetSuitableSnapshotForRestore(
+     const SnapshotScheduleId& schedule_id, HybridTime restore_at, int64_t leader_term,
+     CoarseTimePoint deadline) {
+-  return impl_->GetSuitableSnapshot(schedule_id, restore_at, leader_term, deadline);
+-}
+-
+-Result<SnapshotInfoPB> MasterSnapshotCoordinator::WaitForSnapshotToComplete(
+-    const TxnSnapshotId& snapshot_id, HybridTime restore_at, CoarseTimePoint deadline) {
+-  return impl_->WaitForSnapshotToComplete(snapshot_id, restore_at, deadline);
++  return impl_->GetSuitableSnapshotForRestore(schedule_id, restore_at, leader_term, deadline);
+ }
+ 
+ Result<bool> MasterSnapshotCoordinator::IsTableCoveredBySomeSnapshotSchedule(
+diff --git a/src/yb/master/master_snapshot_coordinator.h b/src/yb/master/master_snapshot_coordinator.h
+index e195649d4d..9369c9db58 100644
+--- a/src/yb/master/master_snapshot_coordinator.h
++++ b/src/yb/master/master_snapshot_coordinator.h
+@@ -173,11 +173,10 @@ class MasterSnapshotCoordinator : public tablet::SnapshotCoordinator {
+   Result<std::vector<SnapshotScheduleId>> GetSnapshotSchedules(
+       SysRowEntryType type, const std::string& object_id);
+ 
+-  Result<SnapshotInfoPB> GetSuitableSnapshot(
++  // Returns the id of a completed snapshot suitable for restoring to the given restore time.
++  Result<TxnSnapshotId> GetSuitableSnapshotForRestore(
+       const SnapshotScheduleId& schedule_id, HybridTime restore_at, int64_t leader_term,
+       CoarseTimePoint deadline);
+-  Result<SnapshotInfoPB> WaitForSnapshotToComplete(
+-      const TxnSnapshotId& snapshot_id, HybridTime restore_at, CoarseTimePoint deadline);
+   Result<bool> IsTableCoveredBySomeSnapshotSchedule(const TableInfo& table_info);
+ 
+   // Returns true if there are one or more non-deleted
+diff --git a/src/yb/master/snapshot_state.cc b/src/yb/master/snapshot_state.cc
+index 8d9f597931..a93b4a4607 100644
+--- a/src/yb/master/snapshot_state.cc
++++ b/src/yb/master/snapshot_state.cc
+@@ -124,14 +124,14 @@ std::string SnapshotState::ToString() const {
+ }
+ 
+ Status SnapshotState::ToPB(
+-    SnapshotInfoPB* out, ListSnapshotsDetailOptionsPB options) {
++    SnapshotInfoPB* out, ListSnapshotsDetailOptionsPB options) const {
+   out->set_id(id_.data(), id_.size());
+   return ToEntryPB(out->mutable_entry(), ForClient::kTrue, options);
+ }
+ 
+ Status SnapshotState::ToEntryPB(
+     SysSnapshotEntryPB* out, ForClient for_client,
+-    ListSnapshotsDetailOptionsPB options) {
++    ListSnapshotsDetailOptionsPB options) const {
+   out->set_state(for_client ? VERIFY_RESULT(AggregatedState()) : initial_state());
+   out->set_snapshot_hybrid_time(snapshot_hybrid_time_.ToUint64());
+   if (previous_snapshot_hybrid_time_) {
+diff --git a/src/yb/master/snapshot_state.h b/src/yb/master/snapshot_state.h
+index 9ac0c50b9d..d8eff68b8e 100644
+--- a/src/yb/master/snapshot_state.h
++++ b/src/yb/master/snapshot_state.h
+@@ -113,10 +113,10 @@ class SnapshotState : public StateWithTablets {
+   // The `options` argument for `ToPB` and `ToEntryPB` controls which entry types are serialized.
+   // Pass `nullopt` to serialize all entry types.
+   Status ToPB(
+-      SnapshotInfoPB* out, ListSnapshotsDetailOptionsPB options);
++      SnapshotInfoPB* out, ListSnapshotsDetailOptionsPB options) const;
+   Status ToEntryPB(
+       SysSnapshotEntryPB* out, ForClient for_client,
+-      ListSnapshotsDetailOptionsPB options);
++      ListSnapshotsDetailOptionsPB options) const;
+   Status StoreToWriteBatch(docdb::KeyValueWriteBatchPB* out);
+   Status TryStartDelete();
+   void PrepareOperations(TabletSnapshotOperations* out);
+@@ -130,13 +130,13 @@ class SnapshotState : public StateWithTablets {
+   std::optional<SysSnapshotEntryPB::State> GetTerminalStateForStatus(const Status& status) override;
+   Status CheckDoneStatus(const Status& status) override;
+ 
+-  TxnSnapshotId id_;
+-  HybridTime snapshot_hybrid_time_;
+-  HybridTime previous_snapshot_hybrid_time_;
++  const TxnSnapshotId id_;
++  const HybridTime snapshot_hybrid_time_;
++  const HybridTime previous_snapshot_hybrid_time_;
+   SysRowEntries entries_;
+   // When snapshot is taken as a part of snapshot schedule schedule_id_ will contain this
+   // schedule id. Otherwise it will be nil.
+-  SnapshotScheduleId schedule_id_;
++  const SnapshotScheduleId schedule_id_;
+   int64_t version_;
+   bool delete_started_ = false;
+   AsyncTaskTracker cleanup_tracker_;
+diff --git a/src/yb/master/state_with_tablets.h b/src/yb/master/state_with_tablets.h
+index cdf8c0aaa6..f5cab30997 100644
+--- a/src/yb/master/state_with_tablets.h
++++ b/src/yb/master/state_with_tablets.h
+@@ -98,7 +98,7 @@ class StateWithTablets {
+   }
+ 
+   template <class PB>
+-  void TabletsToPB(google::protobuf::RepeatedPtrField<PB>* out) {
++  void TabletsToPB(google::protobuf::RepeatedPtrField<PB>* out) const {
+     out->Reserve(narrow_cast<int>(tablets_.size()));
+     for (const auto& tablet : tablets_) {
+       auto* tablet_state = out->Add();
+diff --git a/src/yb/yql/pgwrapper/pg_packed_row-test.cc b/src/yb/yql/pgwrapper/pg_packed_row-test.cc
+index b878a77672..4b50431594 100644
+--- a/src/yb/yql/pgwrapper/pg_packed_row-test.cc
++++ b/src/yb/yql/pgwrapper/pg_packed_row-test.cc
+@@ -1034,7 +1034,7 @@ TEST_P(PgPackedRowTest, RestorePITRSnapshotAfterOldSchemaGC) {
+   auto schedule_id = ASSERT_RESULT(snapshot_util_->CreateSchedule(
+       nullptr, YQL_DATABASE_PGSQL, kDbName,
+       client::WaitSnapshot::kFalse, kInterval, kRetention));
+-  ASSERT_OK(snapshot_util_->WaitScheduleSnapshot(schedule_id, 1, HybridTime::kMin, 10s));
++  ASSERT_OK(snapshot_util_->WaitScheduleSnapshot(schedule_id));
+   auto schedules = ASSERT_RESULT(snapshot_util_->ListSchedules(schedule_id));
+   ASSERT_EQ(schedules.size(), 1);
+ 

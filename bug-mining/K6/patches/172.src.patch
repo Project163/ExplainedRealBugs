@@ -1,0 +1,290 @@
+diff --git a/cmd/run.go b/cmd/run.go
+index 34bd75907..e49911747 100644
+--- a/cmd/run.go
++++ b/cmd/run.go
+@@ -47,6 +47,7 @@ import (
+ 	"github.com/loadimpact/k6/js"
+ 	"github.com/loadimpact/k6/lib"
+ 	"github.com/loadimpact/k6/lib/consts"
++	"github.com/loadimpact/k6/lib/types"
+ 	"github.com/loadimpact/k6/loader"
+ 	"github.com/loadimpact/k6/ui/pb"
+ )
+@@ -63,6 +64,7 @@ const (
+ 	invalidConfigErrorCode       = 104
+ 	externalAbortErrorCode       = 105
+ 	cannotStartRESTAPIErrorCode  = 106
++	scriptExceptionErrorCode     = 107
+ )
+ 
+ // TODO: fix this, global variables are not very testable...
+@@ -347,6 +349,11 @@ func getExitCodeFromEngine(err error) ExitCode {
+ 		}
+ 	}
+ 
++	var serr types.ScriptException
++	if errors.As(err, &serr) {
++		return ExitCode{error: serr, Code: scriptExceptionErrorCode, Hint: "script exception"}
++	}
++
+ 	return ExitCode{error: errors.New("engine error"), Code: genericEngineErrorCode, Hint: err.Error()}
+ }
+ 
+@@ -403,26 +410,36 @@ func runCmdFlagSet() *pflag.FlagSet {
+ // Creates a new runner.
+ func newRunner(
+ 	logger *logrus.Logger, src *loader.SourceData, typ string, filesystems map[string]afero.Fs, rtOpts lib.RuntimeOptions,
+-) (lib.Runner, error) {
++) (runner lib.Runner, err error) {
+ 	switch typ {
+ 	case "":
+-		return newRunner(logger, src, detectType(src.Data), filesystems, rtOpts)
++		runner, err = newRunner(logger, src, detectType(src.Data), filesystems, rtOpts)
+ 	case typeJS:
+-		return js.New(logger, src, filesystems, rtOpts)
++		runner, err = js.New(logger, src, filesystems, rtOpts)
+ 	case typeArchive:
+-		arc, err := lib.ReadArchive(bytes.NewReader(src.Data))
++		var arc *lib.Archive
++		arc, err = lib.ReadArchive(bytes.NewReader(src.Data))
+ 		if err != nil {
+ 			return nil, err
+ 		}
+ 		switch arc.Type {
+ 		case typeJS:
+-			return js.NewFromArchive(logger, arc, rtOpts)
++			runner, err = js.NewFromArchive(logger, arc, rtOpts)
+ 		default:
+ 			return nil, fmt.Errorf("archive requests unsupported runner: %s", arc.Type)
+ 		}
+ 	default:
+ 		return nil, fmt.Errorf("unknown -t/--type: %s", typ)
+ 	}
++
++	if err != nil {
++		var serr types.ScriptException
++		if errors.As(err, &serr) {
++			err = ExitCode{error: serr, Code: scriptExceptionErrorCode, Hint: "script exception"}
++		}
++	}
++
++	return runner, err
+ }
+ 
+ func detectType(data []byte) string {
+diff --git a/core/engine_test.go b/core/engine_test.go
+index 88bfb94d2..320344f9c 100644
+--- a/core/engine_test.go
++++ b/core/engine_test.go
+@@ -29,6 +29,7 @@ import (
+ 	"time"
+ 
+ 	"github.com/sirupsen/logrus"
++	"github.com/spf13/afero"
+ 	"github.com/stretchr/testify/assert"
+ 	"github.com/stretchr/testify/require"
+ 	"gopkg.in/guregu/null.v3"
+@@ -703,6 +704,59 @@ func TestSetupTeardownThresholds(t *testing.T) {
+ 	}
+ }
+ 
++func TestSetupException(t *testing.T) {
++	t.Parallel()
++
++	script := []byte(`
++	import bar from "./bar.js";
++	export function setup() {
++		bar();
++	};
++	export default function() {
++	};
++	`)
++
++	memfs := afero.NewMemMapFs()
++	require.NoError(t, afero.WriteFile(memfs, "/bar.js", []byte(`
++	export default function () {
++        baz();
++	}
++	function baz() {
++		        throw new Error("baz");
++			}
++	`), 0x666))
++	runner, err := js.New(
++		testutils.NewLogger(t),
++		&loader.SourceData{URL: &url.URL{Scheme: "file", Path: "/script.js"}, Data: script},
++		map[string]afero.Fs{"file": memfs},
++		lib.RuntimeOptions{},
++	)
++	require.NoError(t, err)
++
++	_, run, wait := newTestEngine(t, nil, runner, nil, lib.Options{
++		SystemTags:      &stats.DefaultSystemTagSet,
++		SetupTimeout:    types.NullDurationFrom(3 * time.Second),
++		TeardownTimeout: types.NullDurationFrom(3 * time.Second),
++		VUs:             null.IntFrom(3),
++	})
++	defer wait()
++
++	errC := make(chan error)
++	go func() { errC <- run() }()
++
++	select {
++	case <-time.After(10 * time.Second):
++		t.Fatal("Test timed out")
++	case err := <-errC:
++		require.Error(t, err)
++		var exception types.ScriptException
++		require.ErrorAs(t, err, &exception)
++		require.Equal(t, "Error: baz\n\tat baz (file:///bar.js:7:8(4))\n"+
++			"\tat file:///bar.js:4:5(3)\n\tat setup (file:///script.js:7:204(4))\n",
++			err.Error())
++	}
++}
++
+ func TestEmittedMetricsWhenScalingDown(t *testing.T) {
+ 	t.Parallel()
+ 	tb := httpmultibin.NewHTTPMultiBin(t)
+diff --git a/js/bundle.go b/js/bundle.go
+index c5a56fdad..bb334a05e 100644
+--- a/js/bundle.go
++++ b/js/bundle.go
+@@ -317,6 +317,10 @@ func (b *Bundle) instantiate(logger logrus.FieldLogger, rt *goja.Runtime, init *
+ 	*init.ctxPtr = common.WithRuntime(ctx, rt)
+ 	unbindInit := common.BindToGlobal(rt, common.Bind(rt, init, init.ctxPtr))
+ 	if _, err := rt.RunProgram(b.Program); err != nil {
++		var exception *goja.Exception
++		if errors.As(err, &exception) {
++			err = &scriptException{inner: exception}
++		}
+ 		return err
+ 	}
+ 	unbindInit()
+diff --git a/js/bundle_test.go b/js/bundle_test.go
+index 93c565f6b..bb73f2918 100644
+--- a/js/bundle_test.go
++++ b/js/bundle_test.go
+@@ -88,7 +88,9 @@ func TestNewBundle(t *testing.T) {
+ 	})
+ 	t.Run("Error", func(t *testing.T) {
+ 		_, err := getSimpleBundle(t, "/script.js", `throw new Error("aaaa");`)
+-		assert.EqualError(t, err, "Error: aaaa at file:///script.js:1:7(3)")
++		exception := new(scriptException)
++		assert.ErrorAs(t, err, &exception)
++		assert.EqualError(t, err, "Error: aaaa\n\tat file:///script.js:1:7(3)\n")
+ 	})
+ 	t.Run("InvalidExports", func(t *testing.T) {
+ 		_, err := getSimpleBundle(t, "/script.js", `exports = null`)
+@@ -164,7 +166,7 @@ func TestNewBundle(t *testing.T) {
+ 				{
+ 					"Promise", "base",
+ 					`module.exports.default = function() {}; new Promise(function(resolve, reject){});`,
+-					"ReferenceError: Promise is not defined at file:///script.js:1:45(4)",
++					"ReferenceError: Promise is not defined\n\tat file:///script.js:1:45(4)\n",
+ 				},
+ 			}
+ 
+diff --git a/js/initcontext_test.go b/js/initcontext_test.go
+index 05aeef6b9..99bb5cbaf 100644
+--- a/js/initcontext_test.go
++++ b/js/initcontext_test.go
+@@ -131,7 +131,7 @@ func TestInitContextRequire(t *testing.T) {
+ 			fs := afero.NewMemMapFs()
+ 			assert.NoError(t, afero.WriteFile(fs, "/file.js", []byte(`throw new Error("aaaa")`), 0o755))
+ 			_, err := getSimpleBundle(t, "/script.js", `import "/file.js"; export default function() {}`, fs)
+-			assert.EqualError(t, err, "Error: aaaa at file:///file.js:2:7(4)")
++			assert.EqualError(t, err, "Error: aaaa\n\tat file:///file.js:2:7(4)\n\tat reflect.methodValueCall (native)\n\tat file:///script.js:1:117(14)\n")
+ 		})
+ 
+ 		imports := map[string]struct {
+diff --git a/js/runner.go b/js/runner.go
+index 3c2a29204..791a3e327 100644
+--- a/js/runner.go
++++ b/js/runner.go
+@@ -710,6 +710,10 @@ func (u *VU) runFn(
+ 	startTime := time.Now()
+ 	v, err = fn(goja.Undefined(), args...) // Actually run the JS script
+ 	endTime := time.Now()
++	var exception *goja.Exception
++	if errors.As(err, &exception) {
++		err = &scriptException{inner: exception}
++	}
+ 
+ 	select {
+ 	case <-ctx.Done():
+@@ -726,3 +730,22 @@ func (u *VU) runFn(
+ 
+ 	return v, isFullIteration, endTime.Sub(startTime), err
+ }
++
++type scriptException struct {
++	inner *goja.Exception
++}
++
++var _ types.ScriptException = &scriptException{}
++
++func (s *scriptException) Error() string {
++	// this calls String instead of error so that by default if it's printed to print the stacktrace
++	return s.inner.String()
++}
++
++func (s *scriptException) StackTrace() string {
++	return s.inner.String()
++}
++
++func (s *scriptException) Unwrap() error {
++	return s.inner
++}
+diff --git a/js/runner_test.go b/js/runner_test.go
+index ebe2fbf2e..76a31892a 100644
+--- a/js/runner_test.go
++++ b/js/runner_test.go
+@@ -93,7 +93,7 @@ func TestRunnerNew(t *testing.T) {
+ 
+ 	t.Run("Invalid", func(t *testing.T) {
+ 		_, err := getSimpleRunner(t, "/script.js", `blarg`)
+-		assert.EqualError(t, err, "ReferenceError: blarg is not defined at file:///script.js:1:1(0)")
++		assert.EqualError(t, err, "ReferenceError: blarg is not defined\n\tat file:///script.js:1:1(0)\n")
+ 	})
+ }
+ 
+diff --git a/lib/executor/helpers.go b/lib/executor/helpers.go
+index 108b1b329..7d5f32830 100644
+--- a/lib/executor/helpers.go
++++ b/lib/executor/helpers.go
+@@ -22,6 +22,7 @@ package executor
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"fmt"
+ 	"math/big"
+ 	"time"
+@@ -96,10 +97,10 @@ func getIterationRunner(
+ 			return false
+ 		default:
+ 			if err != nil {
+-				if s, ok := err.(fmt.Stringer); ok {
+-					// TODO better detection for stack traces
++				var exception types.ScriptException
++				if errors.As(err, &exception) {
+ 					// TODO don't count this as a full iteration?
+-					logger.WithField("source", "stacktrace").Error(s.String())
++					logger.WithField("source", "stacktrace").Error(exception.StackTrace())
+ 				} else {
+ 					logger.Error(err.Error())
+ 				}
+diff --git a/lib/types/types.go b/lib/types/types.go
+index f349c1513..60dd1c392 100644
+--- a/lib/types/types.go
++++ b/lib/types/types.go
+@@ -280,3 +280,10 @@ func GetDurationValue(v interface{}) (time.Duration, error) {
+ 		return time.Duration(n) * time.Millisecond, nil
+ 	}
+ }
++
++// ScriptException is an interface used to represent an error as a result of a script exception.
++type ScriptException interface {
++	error
++	// StackTrace is the string representation of the stacktrace of where the script exception happened
++	StackTrace() string
++}

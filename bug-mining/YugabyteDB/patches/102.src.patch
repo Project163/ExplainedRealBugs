@@ -1,0 +1,376 @@
+diff --git a/src/yb/client/ql-tablet-test.cc b/src/yb/client/ql-tablet-test.cc
+index 82f9ae8224..17e460c1a3 100644
+--- a/src/yb/client/ql-tablet-test.cc
++++ b/src/yb/client/ql-tablet-test.cc
+@@ -776,7 +776,7 @@ TEST_F(QLTabletTest, LeaderLease) {
+   QLAddInt32HashValue(req, 1);
+   table.AddInt32ColumnValue(req, kValueColumn, 1);
+   auto status = session->TEST_ApplyAndFlush(op);
+-  ASSERT_TRUE(status.IsIOError()) << "Status: " << status;
++  ASSERT_TRUE(status.IsTimedOut()) << "Status: " << status;
+ }
+ 
+ // This test tries to catch situation when some entries were applied and flushed in RocksDB,
+diff --git a/src/yb/client/session.cc b/src/yb/client/session.cc
+index a417de97e9..90e2de9440 100644
+--- a/src/yb/client/session.cc
++++ b/src/yb/client/session.cc
+@@ -362,6 +362,17 @@ Status YBSession::TEST_Flush() {
+               << " failed: " << error->status();
+     }
+   }
++
++  if (flush_status.status.IsIOError() &&
++      flush_status.status.message() == client::internal::Batcher::kErrorReachingOutToTServersMsg &&
++      !flush_status.errors.empty()) {
++    // TODO: move away from string comparison here and use a more specific status than IOError.
++    // See https://github.com/YugaByte/yugabyte-db/issues/702
++
++    // When any error occurs during the dispatching of YBOperation, YBSession saves the error and
++    // returns IOError. When it happens, just return the first error seen.
++    return flush_status.errors.front()->status();
++  }
+   return std::move(flush_status.status);
+ }
+ 
+diff --git a/src/yb/consensus/log.cc b/src/yb/consensus/log.cc
+index 6e1b844152..c505760998 100644
+--- a/src/yb/consensus/log.cc
++++ b/src/yb/consensus/log.cc
+@@ -219,6 +219,22 @@ DEFINE_RUNTIME_int32(min_segment_size_bytes_to_rollover_at_flush, 0,
+                     "Only rotate wals at least of this size (in bytes) at tablet flush."
+                     "-1 to disable WAL rollover at flush. 0 to always rollover WAL at flush.");
+ 
++// Default 3GB. Assuming 300MBps disk throughput rate.
++DEFINE_RUNTIME_uint64(reject_writes_min_disk_space_mb, 3 * 1024,
++    "Reject writes if less than this much disk space is available on the WAL directory. "
++    "'reject_writes_when_disk_full' must be enabled. Set this flag to a value larger than "
++    "'disk throughput rate' * 10");
++
++DEFINE_RUNTIME_uint32(reject_writes_min_disk_space_check_interval_sec, 60,
++    "Interval in seconds to check for disk space availability. The check will default to a 10s "
++    "if the disk space is less than 'reject_writes_min_disk_space_aggressive_check_mb'");
++
++// Default 18GB. Assuming 300MBps disk throughput rate.
++DEFINE_RUNTIME_uint64(reject_writes_min_disk_space_aggressive_check_mb, 18 * 1024,
++    "Once the available disk space falls below this value we will check the disk space every 10s "
++    "instead of 'reject_writes_min_disk_space_check_interval_sec'. Set this flag to a value larger "
++    "than 'disk throughput rate' * 'reject_writes_min_disk_space_check_interval_sec'");
++
+ // Validate that log_min_segments_to_retain >= 1
+ static bool ValidateLogsToRetain(const char* flagname, int value) {
+   if (value >= 1) {
+@@ -2098,5 +2114,71 @@ void Log::LogEntryBatch::MarkReady() {
+   state_ = kEntryReady;
+ }
+ 
++bool Log::HasSufficientDiskSpaceForWrite() {
++  const auto now = CoarseMonoClock::Now();
++  const auto last_disk_space_check_time =
++      last_disk_space_check_time_.load(std::memory_order_acquire);
++
++  auto check_interval_sec = disk_space_frequent_check_interval_sec_.load(std::memory_order_acquire);
++  if (check_interval_sec == 0) {
++    check_interval_sec = FLAGS_reject_writes_min_disk_space_check_interval_sec;
++  }
++
++  if (IsInitialized(last_disk_space_check_time) &&
++      (now - last_disk_space_check_time < check_interval_sec * 1s)) {
++    return has_free_disk_space_.load(std::memory_order_acquire);
++  }
++
++  std::unique_lock l(disk_space_mutex_, std::defer_lock);
++  if (!l.try_lock_for(std::chrono::milliseconds(0))) {
++    // Someone else is already checking disk space. Just use the cached value.
++
++    if (!IsInitialized(last_disk_space_check_time)) {
++      // Always wait for the initial value to be valid.
++      SharedLock shared_l(disk_space_mutex_);
++    }
++
++    return has_free_disk_space_.load(std::memory_order_acquire);
++  }
++
++  std::string path;
++  {
++    std::lock_guard lock(active_segment_mutex_);
++    path = active_segment_->path();
++  }
++
++  bool has_space = true;
++  // Lets assume we need to check frequently. If we have enough space, we will adjust this value.
++  check_interval_sec =
++      std::min(static_cast<uint32>(10), FLAGS_reject_writes_min_disk_space_check_interval_sec);
++
++  auto free_space_result = get_env()->GetFreeSpaceBytes(path);
++  if (!free_space_result.ok()) {
++    YB_LOG_EVERY_N_SECS(WARNING, 300) << "Unable to get free space: " << free_space_result;
++
++    // Fallback to the last known value.
++    return has_free_disk_space_.load(std::memory_order_acquire);
++  }
++  const auto free_space_mb = *free_space_result / 1024 / 1024;
++
++  if (free_space_mb < FLAGS_reject_writes_min_disk_space_mb) {
++    YB_LOG_EVERY_N_SECS(ERROR, 600) << "Not enough disk space available on " << path
++                                    << ". Free space: " << *free_space_result << " bytes";
++    has_space = false;
++  } else if (free_space_mb < FLAGS_reject_writes_min_disk_space_aggressive_check_mb) {
++    YB_LOG_EVERY_N_SECS(WARNING, 600)
++        << "Low disk space on " << path << ". Free space: " << *free_space_result << " bytes";
++  } else {
++    // We have enough space so no need to check frequently.
++    check_interval_sec = FLAGS_reject_writes_min_disk_space_check_interval_sec;
++  }
++
++  disk_space_frequent_check_interval_sec_.store(check_interval_sec, std::memory_order_release);
++  has_free_disk_space_.store(has_space, std::memory_order_release);
++  last_disk_space_check_time_.store(now, std::memory_order_release);
++
++  return has_space;
++}
++
+ }  // namespace log
+ }  // namespace yb
+diff --git a/src/yb/consensus/log.h b/src/yb/consensus/log.h
+index 3b04e4f67c..db0dd45888 100644
+--- a/src/yb/consensus/log.h
++++ b/src/yb/consensus/log.h
+@@ -337,6 +337,8 @@ class Log : public RefCountedThreadSafe<Log> {
+ 
+   Status TEST_WriteCorruptedEntryBatchAndSync();
+ 
++  bool HasSufficientDiskSpaceForWrite();
++
+  private:
+   friend class LogTest;
+   friend class LogTestBase;
+@@ -668,6 +670,11 @@ class Log : public RefCountedThreadSafe<Log> {
+ 
+   const yb::ash::WaitStateInfoPtr background_synchronizer_wait_state_;
+ 
++  std::atomic<CoarseTimePoint> last_disk_space_check_time_{CoarseTimePoint::min()};
++  std::atomic<bool> has_free_disk_space_{false};
++  std::atomic<uint32> disk_space_frequent_check_interval_sec_{0};
++  std::shared_timed_mutex disk_space_mutex_;
++
+   DISALLOW_COPY_AND_ASSIGN(Log);
+ };
+ 
+diff --git a/src/yb/integration-tests/CMakeLists.txt b/src/yb/integration-tests/CMakeLists.txt
+index 99097326c5..720537eda4 100644
+--- a/src/yb/integration-tests/CMakeLists.txt
++++ b/src/yb/integration-tests/CMakeLists.txt
+@@ -265,6 +265,9 @@ YB_TEST_TARGET_LINK_LIBRARIES(wait_states-itest yb-cql pg_wrapper_test_base)
+ ADD_YB_TEST(minicluster-snapshot-test)
+ YB_TEST_TARGET_LINK_LIBRARIES(minicluster-snapshot-test pg_wrapper_test_base)
+ 
++ADD_YB_TEST(disk_full-test)
++YB_TEST_TARGET_LINK_LIBRARIES(disk_full-test pg_wrapper_test_base)
++
+ ADD_YB_CQL_TEST(cql-index-test)
+ ADD_YB_CQL_TEST(cql-packed-row-test)
+ ADD_YB_CQL_TEST(cql-tablet-split-test)
+diff --git a/src/yb/integration-tests/cdc_service-int-test.cc b/src/yb/integration-tests/cdc_service-int-test.cc
+index 7645938629..2144450bbe 100644
+--- a/src/yb/integration-tests/cdc_service-int-test.cc
++++ b/src/yb/integration-tests/cdc_service-int-test.cc
+@@ -98,6 +98,7 @@ DECLARE_int32(rpc_workers_limit);
+ DECLARE_uint64(transaction_manager_workers_limit);
+ DECLARE_bool(cdc_populate_end_markers_transactions);
+ DECLARE_string(vmodule);
++DECLARE_bool(reject_writes_when_disk_full);
+ 
+ METRIC_DECLARE_entity(cdc);
+ METRIC_DECLARE_gauge_int64(last_read_opid_index);
+@@ -2050,6 +2051,7 @@ class CDCServiceTestMinSpace : public CDCServiceTest {
+ };
+ 
+ TEST_F(CDCServiceTestMinSpace, TestLogRetentionByOpId_MinSpace) {
++  ANNOTATE_UNPROTECTED_WRITE(FLAGS_reject_writes_when_disk_full) = false;
+   docdb::DisableYcqlPackedRow();
+   stream_id_ = ASSERT_RESULT(CreateXClusterStream(*client_, table_.table()->id()));
+ 
+diff --git a/src/yb/integration-tests/disk_full-test.cc b/src/yb/integration-tests/disk_full-test.cc
+new file mode 100644
+index 0000000000..7ed0a550c8
+--- /dev/null
++++ b/src/yb/integration-tests/disk_full-test.cc
+@@ -0,0 +1,119 @@
++// Copyright (c) YugabyteDB, Inc.
++//
++// Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
++// in compliance with the License. You may obtain a copy of the License at
++//
++// http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software distributed under the License
++// is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
++// or implied.  See the License for the specific language governing permissions and limitations
++// under the License.
++//
++
++#include "yb/client/ql-dml-test-base.h"
++#include "yb/client/table.h"
++#include "yb/client/yb_table_name.h"
++#include "yb/yql/pgwrapper/pg_mini_test_base.h"
++
++DECLARE_uint64(reject_writes_min_disk_space_mb);
++DECLARE_uint32(reject_writes_min_disk_space_check_interval_sec);
++
++namespace yb {
++
++class YCqlDiskFullTest : public client::KeyValueTableTest<MiniCluster> {
++ public:
++  YCqlDiskFullTest() = default;
++
++  void SetUp() override {
++    ANNOTATE_UNPROTECTED_WRITE(FLAGS_reject_writes_min_disk_space_check_interval_sec) = 1;
++    client::KeyValueTableTest<MiniCluster>::SetUp();
++  }
++};
++
++TEST_F(YCqlDiskFullTest, TestDiskFull) {
++  CreateTable(client::Transactional::kFalse);
++
++  client::TableHandle table2;
++  const client::YBTableName table_name2(
++      YQL_DATABASE_CQL, client::kTableName.namespace_name(), "table2");
++  client::kv_table_test::CreateTable(
++      client::Transactional::kFalse, NumTablets(), client_.get(), &table2, table_name2);
++
++  constexpr int kNumRows = 100;
++  int i = 0;
++  auto session = CreateSession();
++  for (; i < kNumRows; ++i) {
++    ASSERT_OK(WriteRow(session, i, i));
++  }
++  ++i;
++
++  // Set a large limit to simulate disk full.
++  ANNOTATE_UNPROTECTED_WRITE(FLAGS_reject_writes_min_disk_space_mb) = 10 * 1024 * 1024;  // 10TB
++  SleepFor(2s);
++
++  ASSERT_NOK_STR_CONTAINS(WriteRow(session, i, i), "has insufficient disk space");
++
++  // Selects should continue to work.
++  auto result_kvs = ASSERT_RESULT(SelectAllRows(session));
++  ASSERT_EQ(kNumRows, result_kvs.size());
++
++  // Drop and truncate table should work.
++  ASSERT_OK(client_->DeleteTable(table_name2));
++  ASSERT_OK(client_->TruncateTable(table_.table()->id()));
++
++  ANNOTATE_UNPROTECTED_WRITE(FLAGS_reject_writes_min_disk_space_mb) = 0;
++  SleepFor(2s);
++  ASSERT_OK(WriteRow(session, i, i));
++}
++
++class YSqlDiskFullTest : public pgwrapper::PgMiniTestBase {
++ public:
++  YSqlDiskFullTest() = default;
++
++  void SetUp() override {
++    ANNOTATE_UNPROTECTED_WRITE(FLAGS_reject_writes_min_disk_space_check_interval_sec) = 1;
++    pgwrapper::PgMiniTestBase::SetUp();
++  }
++};
++
++TEST_F(YSqlDiskFullTest, TestDiskFull) {
++  constexpr auto create_table = "CREATE TABLE $0 (key INT PRIMARY KEY, value TEXT)";
++  constexpr auto insert_query = "INSERT INTO $0 (key, value) VALUES ($1, 'v$1')";
++
++  constexpr auto table_name1 = "tbl1";
++  constexpr auto table_name2 = "tbl2";
++
++  auto conn = ASSERT_RESULT(Connect());
++  ASSERT_OK(conn.ExecuteFormat(create_table, table_name1));
++  ASSERT_OK(conn.ExecuteFormat(create_table, table_name2));
++
++  constexpr int kNumRows = 100;
++  int i = 0;
++  for (; i < kNumRows; ++i) {
++    ASSERT_OK(conn.ExecuteFormat(insert_query, table_name1, i));
++  }
++  ++i;
++
++  // Set a large limit to simulate disk full.
++  ANNOTATE_UNPROTECTED_WRITE(FLAGS_reject_writes_min_disk_space_mb) = 10 * 1024 * 1024;  // 10TB
++  SleepFor(2s);
++
++  ASSERT_NOK_STR_CONTAINS(
++      conn.ExecuteFormat(insert_query, table_name1, i), "has insufficient disk space");
++
++  // Selects should still work.
++  auto result_kvs = ASSERT_RESULT(
++      conn.FetchRow<pgwrapper::PGUint64>(Format("SELECT COUNT(*) FROM $0", table_name1)));
++  ASSERT_EQ(kNumRows, result_kvs);
++
++  // Unable to test Drop and Truncate Table since ysql writes on master which being on
++  // the same process will be rejected. In real world, the master would have enough disk space to
++  // perform the drop. Truncate table should work.
++
++  ANNOTATE_UNPROTECTED_WRITE(FLAGS_reject_writes_min_disk_space_mb) = 0;
++  SleepFor(2s);
++  ASSERT_OK(conn.ExecuteFormat(insert_query, table_name1, i));
++}
++
++}  // namespace yb
+diff --git a/src/yb/tablet/tablet_peer.cc b/src/yb/tablet/tablet_peer.cc
+index 219167d558..8aad0ce34a 100644
+--- a/src/yb/tablet/tablet_peer.cc
++++ b/src/yb/tablet/tablet_peer.cc
+@@ -1814,5 +1814,12 @@ RetryableRequestsFlushState TabletPeer::TEST_RetryableRequestsFlusherState() con
+ 
+ Preparer* TabletPeer::DEBUG_GetPreparer() { return prepare_thread_.get(); }
+ 
++bool TabletPeer::HasSufficientDiskSpaceForWrite() {
++  if (log_) {
++    return log_->HasSufficientDiskSpaceForWrite();
++  }
++  return true;
++}
++
+ }  // namespace tablet
+ }  // namespace yb
+diff --git a/src/yb/tablet/tablet_peer.h b/src/yb/tablet/tablet_peer.h
+index 34780c22dd..f896f4b196 100644
+--- a/src/yb/tablet/tablet_peer.h
++++ b/src/yb/tablet/tablet_peer.h
+@@ -485,6 +485,8 @@ class TabletPeer : public std::enable_shared_from_this<TabletPeer>,
+     return local_peer_pb_.permanent_uuid();
+   }
+ 
++  bool HasSufficientDiskSpaceForWrite();
++
+  protected:
+   friend class RefCountedThreadSafe<TabletPeer>;
+   friend class TabletPeerTest;
+diff --git a/src/yb/tserver/tablet_service.cc b/src/yb/tserver/tablet_service.cc
+index 9f38229c80..906ab9f93e 100644
+--- a/src/yb/tserver/tablet_service.cc
++++ b/src/yb/tserver/tablet_service.cc
+@@ -263,6 +263,9 @@ DECLARE_bool(ysql_yb_enable_alter_table_rewrite);
+ DEFINE_test_flag(bool, cdc_sdk_fail_setting_retention_barrier, false,
+     "Fail setting retention barrier on newly created tablets");
+ 
++DEFINE_RUNTIME_bool(reject_writes_when_disk_full, true,
++    "Reject incoming writes to the tablet if we are running out of disk space.");
++
+ METRIC_DEFINE_gauge_uint64(server, ts_split_op_added, "Split OPs Added to Leader",
+     yb::MetricUnit::kOperations, "Number of split operations added to the leader's Raft log.");
+ 
+@@ -2255,6 +2258,13 @@ Status TabletServiceImpl::PerformWrite(
+     return Status::OK();
+   }
+ 
++  if (FLAGS_reject_writes_when_disk_full) {
++    SCHECK(
++        tablet.peer->HasSufficientDiskSpaceForWrite(), IOError,
++        "Write to tablet $0 rejected. Node $1 has insufficient disk space", req->tablet_id(),
++        tablet.peer->tablet_metadata()->fs_manager()->uuid());
++  }
++
+   // For postgres requests check that the syscatalog version matches.
+   if (tablet.tablet->table_type() == TableType::PGSQL_TABLE_TYPE) {
+     CatalogVersionChecker catalog_version_checker(*server_);

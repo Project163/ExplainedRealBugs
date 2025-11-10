@@ -1,0 +1,223 @@
+diff --git a/Changes.md b/Changes.md
+index a2fcc62b..dfa1ad99 100644
+--- a/Changes.md
++++ b/Changes.md
+@@ -3,6 +3,7 @@
+ 
+ - Revert back to Celluloid's TaskFiber for job processing which has proven to be more
+   stable than TaskThread. [#985]
++- Avoid possible lockup during hard shutdown [#997]
+ 
+ At this point, if you are experiencing stability issues with Sidekiq in
+ Ruby 1.9, please try Ruby 2.0.  It seems to be more stable.
+diff --git a/lib/sidekiq/manager.rb b/lib/sidekiq/manager.rb
+index 0aba947a..cc8d3e9d 100644
+--- a/lib/sidekiq/manager.rb
++++ b/lib/sidekiq/manager.rb
+@@ -25,10 +25,11 @@ module Sidekiq
+       @done_callback = nil
+ 
+       @in_progress = {}
++      @threads = {}
+       @done = false
+       @busy = []
+       @fetcher = Fetcher.new(current_actor, options)
+-      @ready = @count.times.map { Processor.new_link(current_actor) }
++      @ready = @count.times.map { Processor.new_link(current_actor).tap {|p| p.proxy_id = p.object_id} }
+     end
+ 
+     def stop(options={})
+@@ -63,6 +64,7 @@ module Sidekiq
+       watchdog('Manager#processor_done died') do
+         @done_callback.call(processor) if @done_callback
+         @in_progress.delete(processor.object_id)
++        @threads.delete(processor.object_id)
+         @busy.delete(processor)
+         if stopped?
+           processor.terminate if processor.alive?
+@@ -77,10 +79,13 @@ module Sidekiq
+     def processor_died(processor, reason)
+       watchdog("Manager#processor_died died") do
+         @in_progress.delete(processor.object_id)
++        @threads.delete(processor.object_id)
+         @busy.delete(processor)
+ 
+         unless stopped?
+-          @ready << Processor.new_link(current_actor)
++          @ready << Processor.new_link(current_actor).tap do |p|
++            p.proxy_id = p.object_id
++          end
+           dispatch
+         else
+           signal(:shutdown) if @busy.empty?
+@@ -105,6 +110,14 @@ module Sidekiq
+       end
+     end
+ 
++    # A hack worthy of Rube Goldberg.  We need to be able
++    # to hard stop a working thread.  But there's no way for us to
++    # get handle to the underlying thread performing work for a processor
++    # so we have it call us and tell us.
++    def real_thread(proxy_id, thr)
++      @threads[proxy_id] = thr
++    end
++
+     def procline(tag)
+       "sidekiq #{Sidekiq::VERSION} #{tag}[#{@busy.size} of #{@count} busy]#{stopped? ? ' stopping' : ''}"
+     end
+@@ -145,10 +158,9 @@ module Sidekiq
+           # it is worse to lose a job than to run it twice.
+           Sidekiq::Fetcher.strategy.bulk_requeue(@in_progress.values)
+ 
+-          logger.debug { "Terminating worker threads" }
++          logger.debug { "Terminating #{@busy.size} busy worker threads" }
+           @busy.each do |processor|
+-            if processor.alive?
+-              t = processor.bare_object.actual_work_thread
++            if processor.alive? && t = @threads.delete(processor.object_id)
+               t.raise Shutdown
+             end
+           end
+diff --git a/lib/sidekiq/middleware/server/retry_jobs.rb b/lib/sidekiq/middleware/server/retry_jobs.rb
+index 8b4bb5e7..d806f500 100644
+--- a/lib/sidekiq/middleware/server/retry_jobs.rb
++++ b/lib/sidekiq/middleware/server/retry_jobs.rb
+@@ -43,13 +43,12 @@ module Sidekiq
+       class RetryJobs
+         include Sidekiq::Util
+ 
+-        # delayed_job uses the same basic formula
+         DEFAULT_MAX_RETRY_ATTEMPTS = 25
+ 
+         def call(worker, msg, queue)
+           yield
+         rescue Sidekiq::Shutdown
+-          # ignore, will be pushed back onto queue
++          # ignore, will be pushed back onto queue during hard_shutdown
+           raise
+         rescue Exception => e
+           raise e unless msg['retry']
+@@ -110,6 +109,7 @@ module Sidekiq
+           end
+         end
+ 
++        # delayed_job uses the same basic formula
+         def seconds_to_delay(count)
+           (count ** 4) + 15 + (rand(30)*(count+1))
+         end
+diff --git a/lib/sidekiq/processor.rb b/lib/sidekiq/processor.rb
+index 7f8a3a45..03e9b4a4 100644
+--- a/lib/sidekiq/processor.rb
++++ b/lib/sidekiq/processor.rb
+@@ -24,10 +24,7 @@ module Sidekiq
+       end
+     end
+ 
+-    # store the actual working thread so we
+-    # can later kill if it necessary during
+-    # hard shutdown.
+-    attr_accessor :actual_work_thread
++    attr_accessor :proxy_id
+ 
+     def initialize(boss)
+       @boss = boss
+@@ -37,8 +34,9 @@ module Sidekiq
+       msgstr = work.message
+       queue = work.queue_name
+ 
+-      @actual_work_thread = Thread.current
+       do_defer do
++        @boss.async.real_thread(proxy_id, Thread.current)
++
+         begin
+           msg = Sidekiq.load_json(msgstr)
+           klass  = msg['class'].constantize
+diff --git a/myapp/app/controllers/work_controller.rb b/myapp/app/controllers/work_controller.rb
+index f2dd9feb..26b8057f 100644
+--- a/myapp/app/controllers/work_controller.rb
++++ b/myapp/app/controllers/work_controller.rb
+@@ -20,7 +20,7 @@ class WorkController < ApplicationController
+ 
+   def long
+     50.times do |x|
+-      HardWorker.perform_async('bob', 10, x)
++      HardWorker.perform_async('bob', 15, x)
+     end
+     render :text => 'enqueued'
+   end
+diff --git a/test/test_middleware.rb b/test/test_middleware.rb
+index 5a7cddcf..6df15906 100644
+--- a/test/test_middleware.rb
++++ b/test/test_middleware.rb
+@@ -82,6 +82,8 @@ class TestMiddleware < Minitest::Test
+       processor = Sidekiq::Processor.new(boss)
+       actor = Minitest::Mock.new
+       actor.expect(:processor_done, nil, [processor])
++      actor.expect(:real_thread, nil, [nil, Celluloid::Thread])
++      boss.expect(:async, actor, [])
+       boss.expect(:async, actor, [])
+       processor.process(Sidekiq::BasicFetch::UnitOfWork.new('queue:default', msg))
+       assert_equal %w(2 before 3 before 0 before work_performed 0 after 3 after 2 after), $recorder.flatten
+diff --git a/test/test_processor.rb b/test/test_processor.rb
+index 7318fd23..39b898a1 100644
+--- a/test/test_processor.rb
++++ b/test/test_processor.rb
+@@ -31,6 +31,8 @@ class TestProcessor < Minitest::Test
+       msg = Sidekiq.dump_json({ 'class' => MockWorker.to_s, 'args' => ['myarg'] })
+       actor = Minitest::Mock.new
+       actor.expect(:processor_done, nil, [@processor])
++      actor.expect(:real_thread, nil, [nil, Celluloid::Thread])
++      @boss.expect(:async, actor, [])
+       @boss.expect(:async, actor, [])
+       @processor.process(work(msg))
+       @boss.verify
+@@ -38,6 +40,9 @@ class TestProcessor < Minitest::Test
+     end
+ 
+     it 'passes exceptions to ExceptionHandler' do
++      actor = Minitest::Mock.new
++      actor.expect(:real_thread, nil, [nil, Celluloid::Thread])
++      @boss.expect(:async, actor, [])
+       msg = Sidekiq.dump_json({ 'class' => MockWorker.to_s, 'args' => ['boom'] })
+       begin
+         @processor.process(work(msg))
+@@ -51,6 +56,9 @@ class TestProcessor < Minitest::Test
+     it 're-raises exceptions after handling' do
+       msg = Sidekiq.dump_json({ 'class' => MockWorker.to_s, 'args' => ['boom'] })
+       re_raise = false
++      actor = Minitest::Mock.new
++      actor.expect(:real_thread, nil, [nil, Celluloid::Thread])
++      @boss.expect(:async, actor, [])
+ 
+       begin
+         @processor.process(work(msg))
+@@ -67,6 +75,8 @@ class TestProcessor < Minitest::Test
+       processor = ::Sidekiq::Processor.new(@boss)
+       actor = Minitest::Mock.new
+       actor.expect(:processor_done, nil, [processor])
++      actor.expect(:real_thread, nil, [nil, Celluloid::Thread])
++      @boss.expect(:async, actor, [])
+       @boss.expect(:async, actor, [])
+       processor.process(work(msgstr))
+       assert_equal [['myarg']], msg['args']
+@@ -93,8 +103,10 @@ class TestProcessor < Minitest::Test
+         def successful_job
+           msg = Sidekiq.dump_json({ 'class' => MockWorker.to_s, 'args' => ['myarg'] })
+           actor = Minitest::Mock.new
++          actor.expect(:real_thread, nil, [nil, Celluloid::Thread])
+           actor.expect(:processor_done, nil, [@processor])
+           @boss.expect(:async, actor, [])
++          @boss.expect(:async, actor, [])
+           @processor.process(work(msg))
+         end
+ 
+@@ -118,6 +130,9 @@ class TestProcessor < Minitest::Test
+         let(:failed_today_key) { "stat:failed:#{Time.now.utc.to_date}" }
+ 
+         def failed_job
++          actor = Minitest::Mock.new
++          actor.expect(:real_thread, nil, [nil, Celluloid::Thread])
++          @boss.expect(:async, actor, [])
+           msg = Sidekiq.dump_json({ 'class' => MockWorker.to_s, 'args' => ['boom'] })
+           begin
+             @processor.process(work(msg))

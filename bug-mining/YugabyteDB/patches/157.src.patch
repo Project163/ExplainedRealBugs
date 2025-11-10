@@ -1,0 +1,225 @@
+diff --git a/src/yb/integration-tests/xcluster/xcluster_db_scoped-test.cc b/src/yb/integration-tests/xcluster/xcluster_db_scoped-test.cc
+index 6506c28e7e..0cdfffe907 100644
+--- a/src/yb/integration-tests/xcluster/xcluster_db_scoped-test.cc
++++ b/src/yb/integration-tests/xcluster/xcluster_db_scoped-test.cc
+@@ -13,6 +13,7 @@
+ 
+ #include <gmock/gmock.h>
+ 
++#include "yb/client/snapshot_test_util.h"
+ #include "yb/client/table.h"
+ #include "yb/client/xcluster_client.h"
+ #include "yb/client/yb_table_name.h"
+@@ -70,6 +71,19 @@ class XClusterDBScopedTest : public XClusterYsqlTestBase {
+       const NamespaceId& namespace_id) {
+     return GetXClusterStreams(namespace_id, /*table_names=*/{}, /*pg_schema_names=*/{});
+   }
++
++  Status EnablePITROnClusters() {
++    return RunOnBothClusters([this](Cluster* cluster) -> Status {
++      client::SnapshotTestUtil snapshot_util;
++      snapshot_util.SetProxy(&cluster->client_->proxy_cache());
++      snapshot_util.SetCluster(cluster->mini_cluster_.get());
++
++      RETURN_NOT_OK(snapshot_util.CreateSchedule(
++          nullptr, YQL_DATABASE_PGSQL, namespace_name, client::WaitSnapshot::kTrue,
++          2s * kTimeMultiplier, 20h));
++      return Status::OK();
++    });
++  }
+ };
+ 
+ TEST_F(XClusterDBScopedTest, TestCreateWithCheckpoint) {
+@@ -906,4 +920,76 @@ TEST_F(XClusterDBScopedTest, DeleteWhenSourceIsDown) {
+     ASSERT_STR_CONTAINS(result, "Bootstrap is required");
+   }
+ 
++// Make sure we can setup replication with hidden tables.
++TEST_F(XClusterDBScopedTest, CreateReplicationWithHiddenTables) {
++  ASSERT_OK(SetUpClusters());
++  // Setup PITR schedule so that dropped tables are hidden.
++  ASSERT_OK(EnablePITROnClusters());
++
++  // Create and drop a table to create a hidden table.
++  auto table_name = ASSERT_RESULT(CreateYsqlTable(
++      /*idx=*/1, /*num_tablets=*/1, &producer_cluster_));
++  std::shared_ptr<client::YBTable> new_table;
++  ASSERT_OK(producer_client()->OpenTable(table_name, &new_table));
++  const auto hidden_table_id = new_table->id();
++
++  auto& catalog_mgr = ASSERT_RESULT(producer_cluster()->GetLeaderMiniMaster())->catalog_manager();
++  auto table = catalog_mgr.GetTableInfo(hidden_table_id);
++  ASSERT_TRUE(table);
++  ASSERT_TRUE(table->LockForRead()->visible_to_client());
++
++  ASSERT_OK(DropYsqlTable(
++      &producer_cluster_, table_name.namespace_name(), table_name.pgschema_name(),
++      table_name.table_name()));
++  ASSERT_NOK(producer_client()->OpenTable(table_name, &new_table));
++
++  ASSERT_FALSE(table->LockForRead()->visible_to_client());
++
++  // Setup replication and make sure it is healthy.
++  ASSERT_OK(CheckpointReplicationGroup());
++  ASSERT_OK(CreateReplicationFromCheckpoint());
++
++  master::GetUniverseReplicationResponsePB resp;
++  ASSERT_OK(VerifyUniverseReplication(&resp));
++  ASSERT_THAT(ExtractTableIds(resp), testing::Contains(producer_table_->id()));
++  ASSERT_THAT(ExtractTableIds(resp), testing::Not(testing::Contains(hidden_table_id)));
++
++  ASSERT_OK(InsertRowsInProducer(0, 10, producer_table_));
++  ASSERT_OK(VerifyWrittenRecords());
++
++  // Make sure the hidden table is still there.
++  ASSERT_TRUE(table->LockForRead()->is_hidden_but_not_deleting());
++}
++
++// Create and drop tables in a loop with PITR which will keep the dropped tables in hidden state.
++TEST_F(XClusterDBScopedTest, CreateDropTablesWithPITR) {
++  ASSERT_OK(SetUpClusters());
++  ASSERT_OK(EnablePITROnClusters());
++
++  ASSERT_OK(CheckpointReplicationGroup());
++  ASSERT_OK(CreateReplicationFromCheckpoint());
++
++  for (int i = 0; i < 5; i++) {
++    auto producer_table_name = ASSERT_RESULT(CreateYsqlTable(
++        /*idx=*/1, /*num_tablets=*/1, &producer_cluster_));
++    std::shared_ptr<client::YBTable> new_producer_table;
++    ASSERT_OK(producer_client()->OpenTable(producer_table_name, &new_producer_table));
++
++    auto consumer_table_name = ASSERT_RESULT(CreateYsqlTable(
++        /*idx=*/1, /*num_tablets=*/1, &consumer_cluster_));
++    std::shared_ptr<client::YBTable> new_consumer_table;
++    ASSERT_OK(consumer_client()->OpenTable(consumer_table_name, &new_consumer_table));
++
++    ASSERT_OK(InsertRowsInProducer(0, 10, new_producer_table));
++    ASSERT_OK(WaitForSafeTimeToAdvanceToNow());
++    ASSERT_OK(VerifyWrittenRecords(new_producer_table, new_consumer_table));
++
++    ASSERT_OK(DropYsqlTable(producer_cluster_, *new_producer_table.get()));
++    ASSERT_OK(DropYsqlTable(consumer_cluster_, *new_consumer_table.get()));
++  }
++
++  ASSERT_OK(InsertRowsInProducer(0, 10, producer_table_));
++  ASSERT_OK(VerifyWrittenRecords());
++}
++
+ }  // namespace yb
+diff --git a/src/yb/integration-tests/xcluster/xcluster_dr-itest.cc b/src/yb/integration-tests/xcluster/xcluster_dr-itest.cc
+index f9b57bb1ef..da26bd7137 100644
+--- a/src/yb/integration-tests/xcluster/xcluster_dr-itest.cc
++++ b/src/yb/integration-tests/xcluster/xcluster_dr-itest.cc
+@@ -69,9 +69,16 @@ class XClusterDRTest : public XClusterYsqlTestBase {
+ 
+     producer_snapshot_util_.SetProxy(&producer_client()->proxy_cache());
+     producer_snapshot_util_.SetCluster(producer_cluster());
++
+     consumer_snapshot_util_.SetProxy(&consumer_client()->proxy_cache());
+     consumer_snapshot_util_.SetCluster(consumer_cluster());
+ 
++    // Setup PITR on both clusters. This is required to restore the clusters to the xCluster safe
++    // time on failover. Even though only target needs PITR, we setup on both clusters to keep them
++    // consistent.
++    ASSERT_OK(producer_snapshot_util_.CreateSchedule(namespace_name, client::WaitSnapshot::kTrue));
++    ASSERT_OK(consumer_snapshot_util_.CreateSchedule(namespace_name, client::WaitSnapshot::kTrue));
++
+     SetReplicationDirection(ReplicationDirection::ProducerToConsumer);
+   }
+ 
+diff --git a/src/yb/master/xcluster/master_xcluster_util.cc b/src/yb/master/xcluster/master_xcluster_util.cc
+index f84108628b..a93ddb668b 100644
+--- a/src/yb/master/xcluster/master_xcluster_util.cc
++++ b/src/yb/master/xcluster/master_xcluster_util.cc
+@@ -24,6 +24,11 @@ namespace yb::master {
+ static const auto kXClusterDDLExtensionName = xcluster::kDDLQueuePgSchemaName;
+ 
+ bool IsTableEligibleForXClusterReplication(const master::TableInfo& table) {
++  if (!table.LockForRead()->visible_to_client()) {
++    // Ignore dropped tables.
++    return false;
++  }
++
+   if (table.GetTableType() != PGSQL_TABLE_TYPE || table.is_system()) {
+     // DB Scoped replication Limited to ysql databases.
+     // System tables are not replicated. DDLs statements will be replicated and executed on the
+diff --git a/src/yb/master/xcluster/xcluster_outbound_replication_group-test.cc b/src/yb/master/xcluster/xcluster_outbound_replication_group-test.cc
+index 4a0be49d16..f86913abf4 100644
+--- a/src/yb/master/xcluster/xcluster_outbound_replication_group-test.cc
++++ b/src/yb/master/xcluster/xcluster_outbound_replication_group-test.cc
+@@ -238,13 +238,16 @@ class XClusterOutboundReplicationGroupMockedTest : public YBTest {
+         "Table $0 already exists in namespace $1", table_id, namespace_id);
+ 
+     auto table_info = TableInfoPtr(new TableInfo(table_id, /*colocated=*/false));
+-    auto l = table_info->LockForWrite();
+-    auto& pb = l.mutable_data()->pb;
+-    pb.set_name(table_name);
+-    pb.set_namespace_id(namespace_id);
+-    pb.mutable_schema()->set_pgschema_name(pg_schema_name);
+-    pb.set_table_type(PGSQL_TABLE_TYPE);
+-    l.Commit();
++    {
++      auto l = table_info->LockForWrite();
++      auto& pb = l.mutable_data()->pb;
++      pb.set_state(master::SysTablesEntryPB::PREPARING);
++      pb.set_name(table_name);
++      pb.set_namespace_id(namespace_id);
++      pb.mutable_schema()->set_pgschema_name(pg_schema_name);
++      pb.set_table_type(PGSQL_TABLE_TYPE);
++      l.Commit();
++    }
+ 
+     std::lock_guard l2(mutex_);
+     namespace_tables[namespace_id].push_back(table_info);
+@@ -253,6 +256,12 @@ class XClusterOutboundReplicationGroupMockedTest : public YBTest {
+       RETURN_NOT_OK(AddTableToXClusterSourceTask(*table_info));
+     }
+ 
++    {
++      auto l = table_info->LockForWrite();
++      l.mutable_data()->pb.set_state(master::SysTablesEntryPB::RUNNING);
++      l.Commit();
++    }
++
+     return table_info;
+   }
+ 
+diff --git a/src/yb/master/xcluster/xcluster_outbound_replication_group.cc b/src/yb/master/xcluster/xcluster_outbound_replication_group.cc
+index 4f6e734411..cc091b9a61 100644
+--- a/src/yb/master/xcluster/xcluster_outbound_replication_group.cc
++++ b/src/yb/master/xcluster/xcluster_outbound_replication_group.cc
+@@ -642,8 +642,16 @@ XClusterOutboundReplicationGroup::GetNamespaceCheckpointInfo(
+     std::unordered_map<TableSchemaNamePair, TableDesignator, TableSchemaNamePairHash>
+         table_names_map;
+     for (auto& table_descriptor : all_tables) {
+-      table_names_map.insert(
+-          {{table_descriptor.name(), table_descriptor.pgschema_name()}, table_descriptor});
++      auto it = InsertOrReturnExisting(
++          &table_names_map,
++          {TableSchemaNamePair(table_descriptor.name(), table_descriptor.pgschema_name()),
++           std::move(table_descriptor)});
++      SCHECK(
++          !it, AlreadyPresent,
++          Format(
++              "$0: Multiple table ids found for table $1.$2. Table ids: $3, $4", ToString(),
++              table_descriptor.pgschema_name(), table_descriptor.name(), it->id,
++              table_descriptor.id));
+     }
+ 
+     for (auto& table : table_names) {
+diff --git a/src/yb/master/xcluster/xcluster_source_manager.cc b/src/yb/master/xcluster/xcluster_source_manager.cc
+index 61828f43f2..9508bfae32 100644
+--- a/src/yb/master/xcluster/xcluster_source_manager.cc
++++ b/src/yb/master/xcluster/xcluster_source_manager.cc
+@@ -474,8 +474,8 @@ Result<std::unique_ptr<XClusterCreateStreamsContext>> XClusterSourceManager::Cre
+   for (const auto& table_id : table_ids) {
+     auto stripped_table_id = xcluster::StripSequencesDataAliasIfPresent(table_id);
+     auto table_info = VERIFY_RESULT(catalog_manager_.FindTableById(stripped_table_id));
+-    SCHECK(
+-        table_info->LockForRead()->visible_to_client(), NotFound, "Table does not exist",
++    SCHECK_FORMAT(
++        table_info->LockForRead()->visible_to_client(), NotFound, "Table $0 does not exist",
+         stripped_table_id);
+ 
+     VLOG(1) << "Creating xcluster streams for table: " << table_id;
