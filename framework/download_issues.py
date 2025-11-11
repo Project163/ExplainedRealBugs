@@ -6,12 +6,13 @@ import re
 import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse, urlunparse, urlencode, quote_plus
-
 import utils
 import time
 
 # Required packages:
 # pip install requests beautifulsoup4
+
+
 
 SUPPORTED_TRACKERS = {
     'google': {
@@ -159,6 +160,173 @@ def main():
     session.headers.update({'User-Agent': 'Mozilla/5.0'})
 
     print("----------------------------------------------")
+
+    if args.tracker_name == 'github':
+        print(f"Using GitHub GraphQL strategy (Issues API) for {tracker_id} (to bypass 10k limit).")
+        sys.stdout.flush()
+        
+        # 1. 验证 GH_TOKEN
+        gh_token = os.environ.get('GH_TOKEN')
+        if not gh_token:
+            print("CRITICAL ERROR: GH_TOKEN environment variable must be set for GraphQL API.", file=sys.stderr)
+            sys.stderr.flush()
+            sys.exit(1)
+        
+        headers = {
+            'Authorization': f'token {gh_token}',
+            'User-Agent': 'Mozilla/5.0'
+        }
+        
+        graphql_endpoint = "https://api.github.com/graphql"
+
+        # 2. 解析项目所有者(owner)和仓库名(name)
+        try:
+            if '/' in tracker_id:
+                owner, name = tracker_id.split('/', 1)
+            elif organization_id:
+                owner = organization_id
+                name = tracker_id
+            else:
+                raise ValueError(f"GitHub project ID '{tracker_id}' must be 'owner/repo' or require -z <org>.")
+        except ValueError as e:
+            print(f"Error parsing GitHub project ID: {e}", file=sys.stderr)
+            sys.stderr.flush()
+            sys.exit(1)
+
+        # 3. 定义 GraphQL Repository.Issues API 查询模板
+        #    获取所有状态 (OPEN, CLOSED)
+        graphql_query_template = """
+        query($owner: String!, $name: String!, $labels: [String!], $cursor: String) {
+          repository(owner: $owner, name: $name) {
+            issues(first: 100, after: $cursor, labels: $labels, states: [OPEN, CLOSED]) {
+              totalCount
+              pageInfo {
+                endCursor
+                hasNextPage
+              }
+              nodes {
+                number
+                url
+              }
+            }
+          }
+        }
+        """
+
+        # 4. 转换 REST 'query' (e.g., 'label=bug,defect') 为标签列表
+        labels_to_search = []
+        if query.startswith('label='):
+            labels_to_search = query.split('=', 1)[1].split(',')
+        else:
+            # 如果查询不是 label=, 也许只传了一个 (e.g., 'bug')
+            labels_to_search = query.split(',')
+            
+        if not labels_to_search:
+            print(f"Error: Could not parse labels from query: {query}", file=sys.stderr)
+            sys.exit(1)
+
+        if debug: print(f"GraphQL will run {len(labels_to_search)} full enumerations for labels: {labels_to_search}")
+
+        # 5. 运行多次遍历 (每个 'OR' 标签一次)
+        all_results_set = set() # 用于在多次运行中去重
+        
+        # 确保 issues_file 在开始时是空的
+        try:
+            open(issues_file, 'w').close() 
+        except IOError as e:
+            print(f"Error: Cannot clear issues file {issues_file}: {e}", file=sys.stderr)
+            sys.exit(1)
+
+
+        for label in labels_to_search:
+            
+            label_name = label.strip()
+            if not label_name: continue
+            
+            if debug: print(f"--- Starting GraphQL Enumeration (Label: {label_name}) ---")
+            sys.stdout.flush()
+            
+            cursor = None
+            hasNextPage = True
+            page_count = 1
+
+            while hasNextPage:
+                variables = {
+                    "owner": owner,
+                    "name": name,
+                    "labels": [label_name], # 每次只查询一个标签
+                    "cursor": cursor
+                }
+                payload = {
+                    "query": graphql_query_template,
+                    "variables": variables
+                }
+                
+                if debug: 
+                    print(f"  -> Fetching page {page_count} for '{label_name}' (Cursor: {cursor})")
+                    sys.stdout.flush()
+                
+                try:
+                    # 使用 session.post
+                    response = session.post(graphql_endpoint, headers=headers, json=payload, timeout=45)
+                    response.raise_for_status()
+                    data = response.json()
+                    
+                    if 'errors' in data:
+                        print(f"GraphQL Error: {data['errors']}", file=sys.stderr)
+                        sys.stderr.flush()
+                        break # 停止此标签的循环
+                        
+                    issues_data = data.get('data', {}).get('repository', {}).get('issues', {})
+                    pageInfo = issues_data.get('pageInfo', {})
+                    
+                    hasNextPage = pageInfo.get('hasNextPage', False)
+                    cursor = pageInfo.get('endCursor', None)
+                    nodes = issues_data.get('nodes', [])
+                    
+                    if not nodes and page_count == 1:
+                        if debug: print(f"  -> No issues found for label {label_name}.")
+                    
+                    # 处理此页面的结果
+                    page_results = []
+                    for node in nodes:
+                        if node:
+                            issue_tuple = (node['number'], node['url'])
+                            # 只有当它没被添加过时才处理
+                            if issue_tuple not in all_results_set:
+                                all_results_set.add(issue_tuple)
+                                page_results.append(issue_tuple)
+                    
+                    # 将此页面的新结果附加到文件
+                    if page_results:
+                        try:
+                            with open(issues_file, 'a', encoding='utf-8') as f:
+                                for issue_id, issue_url in page_results:
+                                    f.write(f"{issue_id},{issue_url}\n")
+                        except IOError as e:
+                            print(f"Cannot write to {issues_file}: {e}", file=sys.stderr)
+                            sys.exit(1) 
+
+                    page_count += 1
+                    time.sleep(1) 
+
+                except requests.exceptions.RequestException as e:
+                    print(f"Error during GraphQL request: {e}. Retrying...", file=sys.stderr)
+                    sys.stderr.flush()
+                    time.sleep(10) 
+                except json.JSONDecodeError:
+                    print(f"Error decoding GraphQL response (Rate Limit?): {response.text}", file=sys.stderr)
+                    print("  -> Sleeping for 60 seconds...")
+                    sys.stderr.flush()
+                    time.sleep(60)
+                except KeyboardInterrupt:
+                    print("GraphQL download interrupted.")
+                    sys.stdout.flush()
+                    sys.exit(1)
+                    
+        print(f"GitHub GraphQL processing complete. Wrote {len(all_results_set)} total unique issues to {issues_file}.")
+        sys.stdout.flush()
+        sys.exit(0) # 任务完成，退出
     
     start = 0
 

@@ -123,17 +123,11 @@ def process_project(project_id, project_name, repository_url, issue_tracker_name
             return False
 
         print(f"Regex for bug-fixing commits: {bug_fix_regex!r}")
-
-        try:
-            processed_regex = codecs.decode(bug_fix_regex, 'unicode_escape')
-        except Exception:
-            print(f"  -> Warning: Could not unescape regex: {bug_fix_regex!r}. Using raw value.", file=sys.stderr)
-            processed_regex = bug_fix_regex
         
         cmd_xref_list = [
             PYTHON_EXECUTABLE,
             os.path.join(config.SCRIPT_DIR, 'vcs_log_xref.py'),
-            '-e', processed_regex,
+            '-e', bug_fix_regex,
             '-l', cache_gitlog_file,
             '-r', cache_repo_dir,
             '-i', cache_issues_file,
@@ -289,7 +283,7 @@ def main():
         with open(ERROR_LOG_FILE, 'w', encoding='utf-8') as error_log:
             sys.stderr = Tee(original_stderr, error_log)
             
-            input_file = os.path.join(config.SCRIPT_DIR, 'example.txt')
+            input_file = os.path.join(config.SCRIPT_DIR, 'test.txt')
             
             if not os.path.exists(input_file):
                 print(f"Error: Input file not found at {input_file}", file=sys.stderr)
