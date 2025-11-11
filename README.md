@@ -30,7 +30,7 @@ The primary goal of this project is to build a comprehensive bug repository. It 
 
 ## Bug Repository Overview
 
-Currently, the repository contains bug data for **298** projects, with a total of **56,950** bugs. Below is a summary of the bug counts for each project.
+Currently, the repository contains bug data for **299** projects, with a total of **59,934** bugs. Below is a summary of the bug counts for each project.
 
 <details>
 <summary>Click to expand for a detailed list of all projects</summary>
@@ -39,16 +39,16 @@ Currently, the repository contains bug data for **298** projects, with a total o
 
 | project_id | bug_count | project_id | bug_count | project_id | bug_count |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| ActiveAdmin | 148 | Babel | 72 | Cayenne_jgroups | 2 |
-| ActixWeb | 41 | Bazel | 379 | Cayenne_jms | 2 |
-| Akka | 110 | Bcel | 124 | Cayenne_xmpp | 2 |
-| Alacritty | 632 | Bevy | 1050 | Chalk | 33 |
-| Alamofire | 14 | Black | 268 | ChartJS | 69 |
-| Alembic | 121 | Bleve | 143 | ChartsSwift | 118 |
-| AssertJ | 577 | Bsf | 11 | Chi | 24 |
-| Assimp | 128 | CakePHP | 336 | Cli | 239 |
-| AutoMapper | 206 | Capybara | 110 | Click | 85 |
-| Axum | 24 | Catch2 | 338 | Closure | 480 |
+| ActiveAdmin | 148 | Babel | 72 | Catch2 | 338 |
+| ActixWeb | 41 | Bazel | 379 | Cayenne_jgroups | 2 |
+| Akka | 110 | Bcel | 124 | Cayenne_jms | 2 |
+| Alacritty | 632 | Beam | 2984 | Cayenne_xmpp | 2 |
+| Alamofire | 14 | Bevy | 1050 | Chalk | 33 |
+| Alembic | 121 | Black | 268 | ChartJS | 69 |
+| AssertJ | 577 | Bleve | 143 | ChartsSwift | 118 |
+| Assimp | 128 | Bsf | 11 | Chi | 24 |
+| AutoMapper | 206 | CakePHP | 336 | Cli | 239 |
+| Axum | 24 | Capybara | 110 | Click | 85 |
 
 --------------------
 
@@ -56,6 +56,7 @@ Currently, the repository contains bug data for **298** projects, with a total o
 
 | project_id | bug_count | project_id | bug_count | project_id | bug_count |
 | :--- | :--- | :--- | :--- | :--- | :--- |
+| Closure | 480 | CypressTestingLibrary | 12 | DoctrineDBAL | 50 |
 | CodeIgniter | 545 | D3 | 273 | DoctrineORM | 66 |
 | Codec | 173 | Daemon | 131 | Dosgi_common | 17 |
 | Collections | 204 | Dbcp | 196 | Doxia_module_apt | 50 |
@@ -65,7 +66,6 @@ Currently, the repository contains bug data for **298** projects, with a total o
 | Csv | 141 | Diesel | 265 | ElectronFiddle | 5 |
 | Curl | 839 | Digester | 39 | Email | 51 |
 | Cypress | 12 | DockerCLI | 21 | Eslint | 694 |
-| CypressTestingLibrary | 12 | DoctrineDBAL | 50 | Etcd | 55 |
 
 --------------------
 
@@ -73,6 +73,7 @@ Currently, the repository contains bug data for **298** projects, with a total o
 
 | project_id | bug_count | project_id | bug_count | project_id | bug_count |
 | :--- | :--- | :--- | :--- | :--- | :--- |
+| Etcd | 55 | Flume_ngcore | 193 | GoRedis | 50 |
 | Exec | 50 | Fmt | 62 | GoSwagger | 357 |
 | ExoPlayer | 9 | Forem | 37 | Gofumpt | 76 |
 | Fabric | 13 | Functor | 6 | Goreleaser | 395 |
@@ -82,7 +83,6 @@ Currently, the repository contains bug data for **298** projects, with a total o
 | FileUpload | 85 | Gitea | 723 | Gulp | 44 |
 | Flake8 | 101 | Glfw | 376 | Hbase_common | 554 |
 | FluentValidation | 14 | Glm | 1 | Helix | 56 |
-| Flume_ngcore | 193 | GoRedis | 50 | Helm | 136 |
 
 --------------------
 
@@ -90,6 +90,7 @@ Currently, the repository contains bug data for **298** projects, with a total o
 
 | project_id | bug_count | project_id | bug_count | project_id | bug_count |
 | :--- | :--- | :--- | :--- | :--- | :--- |
+| Helm | 136 | Imaging | 143 | James_project_mailet_standard | 40 |
 | Hivemall_core | 28 | Incubator_tamaya_api | 13 | James_project_server_container_core | 44 |
 | Homebrew | 138 | Istio | 21 | Jci_core | 8 |
 | HttpClient5 | 143 | JUnit5 | 797 | Jelly_core | 1 |
@@ -99,7 +100,6 @@ Currently, the repository contains bug data for **298** projects, with a total o
 | Hyper | 320 | Jackrabbit_oak_core | 1912 | Jinja2 | 82 |
 | IO | 419 | JacksonDatabind | 844 | Johnzon_core | 81 |
 | Iced | 33 | James_project_core | 21 | Johnzon_jaxrs | 14 |
-| Imaging | 143 | James_project_mailet_standard | 40 | Johnzon_jsonb | 85 |
 
 --------------------
 
@@ -107,6 +107,7 @@ Currently, the repository contains bug data for **298** projects, with a total o
 
 | project_id | bug_count | project_id | bug_count | project_id | bug_count |
 | :--- | :--- | :--- | :--- | :--- | :--- |
+| Johnzon_jsonb | 85 | Laravel | 45 | MShade | 135 |
 | Johnzon_jsonschema | 4 | LeakCanary | 283 | Math | 671 |
 | Johnzon_mapper | 120 | LessJS | 261 | Math_4j | 423 |
 | Jsoup | 427 | LibGDX | 590 | Maven2_artifact | 76 |
@@ -116,7 +117,6 @@ Currently, the repository contains bug data for **298** projects, with a total o
 | Kingfisher | 3 | LottieAndroid | 332 | MetaModel_csv | 11 |
 | Knox_assertion_common | 17 | MDeploy | 40 | MetaModel_excel | 8 |
 | Lang | 641 | MGpg | 27 | MetaModel_jdbc | 37 |
-| Laravel | 45 | MShade | 135 | MetaModel_pojo | 4 |
 
 --------------------
 
@@ -124,6 +124,7 @@ Currently, the repository contains bug data for **298** projects, with a total o
 
 | project_id | bug_count | project_id | bug_count | project_id | bug_count |
 | :--- | :--- | :--- | :--- | :--- | :--- |
+| MetaModel_pojo | 4 | Neovim | 97 | Ognl | 109 |
 | MetaModel_salesforce | 4 | Net | 271 | OkHttp | 30 |
 | Minaftp_api | 18 | Netty | 365 | Oozie_client | 118 |
 | Mitmproxy | 502 | NewtonsoftJson | 14 | PHPStan | 17 |
@@ -133,7 +134,6 @@ Currently, the repository contains bug data for **298** projects, with a total o
 | Mshared_archiver | 22 | Numbers_angle | 2 | Paramiko | 96 |
 | Mypy | 662 | OBSStudio | 86 | Pdfbox_fontbox | 453 |
 | NUnit | 180 | Oak_commons | 39 | Pdfbox_pdfbox | 3119 |
-| Neovim | 97 | Ognl | 109 | Pest | 6 |
 
 --------------------
 
@@ -141,6 +141,7 @@ Currently, the repository contains bug data for **298** projects, with a total o
 
 | project_id | bug_count | project_id | bug_count | project_id | bug_count |
 | :--- | :--- | :--- | :--- | :--- | :--- |
+| Pest | 6 | Proxy | 5 | Quarkus | 280 |
 | PhpFaker | 6 | Psalm | 1282 | Rails | 245 |
 | Pillow | 91 | Pug | 179 | Rand | 54 |
 | PlayFramework | 190 | Pundit | 13 | Rat_core | 124 |
@@ -150,7 +151,6 @@ Currently, the repository contains bug data for **298** projects, with a total o
 | Polly | 39 | Pytest | 532 | Rave_web | 22 |
 | Pool | 187 | Qpid_client | 255 | Rclone | 1433 |
 | Prettier | 10 | Qpidjms_client | 658 | Rdf_jena | 1 |
-| Proxy | 5 | Quarkus | 280 | ReactHookForm | 491 |
 
 --------------------
 
@@ -158,6 +158,7 @@ Currently, the repository contains bug data for **298** projects, with a total o
 
 | project_id | bug_count | project_id | bug_count | project_id | bug_count |
 | :--- | :--- | :--- | :--- | :--- | :--- |
+| ReactHookForm | 491 | Rocket | 272 | Serilog | 81 |
 | ReactRouter | 114 | Rollup | 178 | Shindig_common | 78 |
 | Redis | 113 | RspecCore | 285 | Shiro_core | 98 |
 | Redux | 51 | RxJava | 22 | Shiro_web | 53 |
@@ -167,7 +168,6 @@ Currently, the repository contains bug data for **298** projects, with a total o
 | Retrofit | 21 | Scxml | 123 | Sling_classloader | 35 |
 | Rich | 9 | SeaORM | 6 | Sling_cpconverter | 169 |
 | Ripper | 448 | Sentry_ccommon | 24 | Sling_discovery | 15 |
-| Rocket | 272 | Serilog | 81 | Sling_html | 3 |
 
 --------------------
 
@@ -175,6 +175,7 @@ Currently, the repository contains bug data for **298** projects, with a total o
 
 | project_id | bug_count | project_id | bug_count | project_id | bug_count |
 | :--- | :--- | :--- | :--- | :--- | :--- |
+| Sling_html | 3 | SpringFramework | 5 | Syncthing | 1507 |
 | Sling_log | 55 | SqlxGo | 28 | Tauri | 632 |
 | Sling_messaging_mail | 5 | SqlxRust | 86 | Testcontainers | 2 |
 | Sling_metrics | 8 | Starship | 39 | Text | 90 |
@@ -184,7 +185,6 @@ Currently, the repository contains bug data for **298** projects, with a total o
 | Sling_validation | 18 | Struts1_core | 35 | Tika_app | 54 |
 | Sling_webconsole | 1 | SvelteKit | 570 | Tika_core | 419 |
 | Spdlog | 121 | Symfony | 38 | Tiles_core | 5 |
-| SpringFramework | 5 | Syncthing | 1507 | Tinkerpop_gremlin_core | 173 |
 
 --------------------
 
@@ -192,6 +192,7 @@ Currently, the repository contains bug data for **298** projects, with a total o
 
 | project_id | bug_count | project_id | bug_count | project_id | bug_count |
 | :--- | :--- | :--- | :--- | :--- | :--- |
+| Tinkerpop_gremlin_core | 173 | Weaver_processor | 2 | Xbean_reflect | 59 |
 | Twill_dcore | 8 | Webbeans_web | 92 | Xmlgraphics | 25 |
 | TypeORM | 168 | Webpack | 152 | Xunit | 155 |
 | Uvicorn | 11 | Wicket_cdi | 18 | Yew | 35 |
@@ -201,7 +202,6 @@ Currently, the repository contains bug data for **298** projects, with a total o
 | Vfs | 309 | Wicket_util | 110 | Zerolog | 20 |
 | Vue2 | 473 | Wink_common | 89 | Zlib | 1 |
 | Vysper_nbxml | 9 | Xbean_naming | 57 |  |  |
-| Weaver_processor | 2 | Xbean_reflect | 59 |  |  |
 
 --------------------
 

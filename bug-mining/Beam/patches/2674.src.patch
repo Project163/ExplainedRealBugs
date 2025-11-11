@@ -1,0 +1,428 @@
+diff --git a/sdks/java/io/amazon-web-services2/src/main/java/org/apache/beam/sdk/io/aws2/dynamodb/DynamoDBIO.java b/sdks/java/io/amazon-web-services2/src/main/java/org/apache/beam/sdk/io/aws2/dynamodb/DynamoDBIO.java
+index c35f90b6a80..299007d9144 100644
+--- a/sdks/java/io/amazon-web-services2/src/main/java/org/apache/beam/sdk/io/aws2/dynamodb/DynamoDBIO.java
++++ b/sdks/java/io/amazon-web-services2/src/main/java/org/apache/beam/sdk/io/aws2/dynamodb/DynamoDBIO.java
+@@ -17,6 +17,9 @@
+  */
+ package org.apache.beam.sdk.io.aws2.dynamodb;
+ 
++import static java.util.stream.Collectors.groupingBy;
++import static java.util.stream.Collectors.mapping;
++import static java.util.stream.Collectors.toList;
+ import static org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Preconditions.checkArgument;
+ 
+ import com.google.auto.value.AutoValue;
+@@ -64,6 +67,7 @@ import software.amazon.awssdk.auth.credentials.AwsCredentialsProvider;
+ import software.amazon.awssdk.services.dynamodb.DynamoDbClient;
+ import software.amazon.awssdk.services.dynamodb.model.AttributeValue;
+ import software.amazon.awssdk.services.dynamodb.model.BatchWriteItemRequest;
++import software.amazon.awssdk.services.dynamodb.model.BatchWriteItemResponse;
+ import software.amazon.awssdk.services.dynamodb.model.DynamoDbException;
+ import software.amazon.awssdk.services.dynamodb.model.ScanRequest;
+ import software.amazon.awssdk.services.dynamodb.model.ScanResponse;
+@@ -468,9 +472,21 @@ public final class DynamoDBIO {
+ 
+     static class WriteFn<T> extends DoFn<T, Void> {
+       @VisibleForTesting
+-      static final String RETRY_ATTEMPT_LOG = "Error writing to DynamoDB. Retry attempt[%d]";
++      static final String RETRY_ERROR_LOG = "Error writing items to DynamoDB [attempts:{}]: {}";
++
++      private static final String RESUME_ERROR_LOG =
++          "Error writing remaining unprocessed items to DynamoDB: {}";
++
++      private static final String ERROR_NO_RETRY =
++          "Error writing to DynamoDB. No attempt made to retry";
++      private static final String ERROR_RETRIES_EXCEEDED =
++          "Error writing to DynamoDB after %d attempt(s). No more attempts allowed";
++      private static final String ERROR_UNPROCESSED_ITEMS =
++          "Error writing to DynamoDB. Unprocessed items remaining";
++
++      private transient FluentBackoff resumeBackoff; // resume from partial failures (unlimited)
++      private transient FluentBackoff retryBackoff; // retry erroneous calls (default: none)
+ 
+-      private transient FluentBackoff retryBackoff; // defaults to no retries
+       private static final Logger LOG = LoggerFactory.getLogger(WriteFn.class);
+       private static final Counter DYNAMO_DB_WRITE_FAILURES =
+           Metrics.counter(WriteFn.class, "DynamoDB_Write_Failures");
+@@ -487,13 +503,17 @@ public final class DynamoDBIO {
+       @Setup
+       public void setup() {
+         client = spec.getDynamoDbClientProvider().getDynamoDbClient();
+-        retryBackoff = FluentBackoff.DEFAULT.withMaxRetries(0); // default to no retrying
+-        if (spec.getRetryConfiguration() != null) {
++        resumeBackoff = FluentBackoff.DEFAULT; // resume from partial failures (unlimited)
++        retryBackoff = FluentBackoff.DEFAULT.withMaxRetries(0); // retry on errors (default: none)
++
++        RetryConfiguration retryConfig = spec.getRetryConfiguration();
++        if (retryConfig != null) {
++          resumeBackoff = resumeBackoff.withInitialBackoff(retryConfig.getInitialDuration());
+           retryBackoff =
+               retryBackoff
+-                  .withMaxRetries(spec.getRetryConfiguration().getMaxAttempts() - 1)
+-                  .withInitialBackoff(spec.getRetryConfiguration().getInitialDuration())
+-                  .withMaxCumulativeBackoff(spec.getRetryConfiguration().getMaxDuration());
++                  .withMaxRetries(retryConfig.getMaxAttempts() - 1)
++                  .withInitialBackoff(retryConfig.getInitialDuration())
++                  .withMaxCumulativeBackoff(retryConfig.getMaxDuration());
+         }
+       }
+ 
+@@ -542,54 +562,64 @@ public final class DynamoDBIO {
+         if (batch.isEmpty()) {
+           return;
+         }
+-
+         try {
+-          // Since each element is a KV<tableName, writeRequest> in the batch, we need to group them
+-          // by tableName
+-          Map<String, List<WriteRequest>> mapTableRequest =
++          // Group values KV<tableName, writeRequest> by tableName
++          // Note: The original order of arrival is lost reading the map entries.
++          Map<String, List<WriteRequest>> writesPerTable =
+               batch.values().stream()
+-                  .collect(
+-                      Collectors.groupingBy(
+-                          KV::getKey, Collectors.mapping(KV::getValue, Collectors.toList())));
+-
+-          BatchWriteItemRequest batchRequest =
+-              BatchWriteItemRequest.builder().requestItems(mapTableRequest).build();
+-
+-          Sleeper sleeper = Sleeper.DEFAULT;
+-          BackOff backoff = retryBackoff.backoff();
+-          int attempt = 0;
+-          while (true) {
+-            attempt++;
+-            try {
+-              client.batchWriteItem(batchRequest);
+-              break;
+-            } catch (Exception ex) {
+-              // Fail right away if there is no retry configuration
+-              if (spec.getRetryConfiguration() == null
+-                  || !spec.getRetryConfiguration().getRetryPredicate().test(ex)) {
+-                DYNAMO_DB_WRITE_FAILURES.inc();
+-                LOG.info(
+-                    "Unable to write batch items {}.", batchRequest.requestItems().entrySet(), ex);
+-                throw new IOException("Error writing to DynamoDB (no attempt made to retry)", ex);
+-              }
+-
+-              if (!BackOffUtils.next(sleeper, backoff)) {
+-                throw new IOException(
+-                    String.format(
+-                        "Error writing to DynamoDB after %d attempt(s). No more attempts allowed",
+-                        attempt),
+-                    ex);
+-              } else {
+-                // Note: this used in test cases to verify behavior
+-                LOG.warn(String.format(RETRY_ATTEMPT_LOG, attempt), ex);
+-              }
+-            }
++                  .collect(groupingBy(KV::getKey, mapping(KV::getValue, toList())));
++
++          // Backoff used to resume from partial failures
++          BackOff resume = resumeBackoff.backoff();
++          do {
++            BatchWriteItemRequest batchRequest =
++                BatchWriteItemRequest.builder().requestItems(writesPerTable).build();
++            // If unprocessed items remain, we have to resume the operation (with backoff)
++            writesPerTable = writeWithRetries(batchRequest).unprocessedItems();
++          } while (!writesPerTable.isEmpty() && BackOffUtils.next(Sleeper.DEFAULT, resume));
++
++          if (!writesPerTable.isEmpty()) {
++            DYNAMO_DB_WRITE_FAILURES.inc();
++            LOG.error(RESUME_ERROR_LOG, writesPerTable);
++            throw new IOException(ERROR_UNPROCESSED_ITEMS);
+           }
+         } finally {
+           batch.clear();
+         }
+       }
+ 
++      /**
++       * Write batch of items to DynamoDB and potentially retry in case of exceptions. Though, in
++       * case of a partial failure, unprocessed items remain but the request succeeds. This has to
++       * be handled by the caller.
++       */
++      private BatchWriteItemResponse writeWithRetries(BatchWriteItemRequest request)
++          throws IOException, InterruptedException {
++        BackOff backoff = retryBackoff.backoff();
++        Exception lastThrown;
++
++        int attempt = 0;
++        do {
++          attempt++;
++          try {
++            return client.batchWriteItem(request);
++          } catch (Exception ex) {
++            lastThrown = ex;
++          }
++        } while (canRetry(lastThrown) && BackOffUtils.next(Sleeper.DEFAULT, backoff));
++
++        DYNAMO_DB_WRITE_FAILURES.inc();
++        LOG.warn(RETRY_ERROR_LOG, attempt, request.requestItems());
++        throw new IOException(
++            canRetry(lastThrown) ? String.format(ERROR_RETRIES_EXCEEDED, attempt) : ERROR_NO_RETRY,
++            lastThrown);
++      }
++
++      private boolean canRetry(Exception ex) {
++        return spec.getRetryConfiguration() != null
++            && spec.getRetryConfiguration().getRetryPredicate().test(ex);
++      }
++
+       @Teardown
+       public void tearDown() {
+         if (client != null) {
+diff --git a/sdks/java/io/amazon-web-services2/src/test/java/org/apache/beam/sdk/io/aws2/dynamodb/DynamoDBIOTest.java b/sdks/java/io/amazon-web-services2/src/test/java/org/apache/beam/sdk/io/aws2/dynamodb/DynamoDBIOTest.java
+index b184c7f0eae..3f44d90f6af 100644
+--- a/sdks/java/io/amazon-web-services2/src/test/java/org/apache/beam/sdk/io/aws2/dynamodb/DynamoDBIOTest.java
++++ b/sdks/java/io/amazon-web-services2/src/test/java/org/apache/beam/sdk/io/aws2/dynamodb/DynamoDBIOTest.java
+@@ -18,8 +18,11 @@
+ package org.apache.beam.sdk.io.aws2.dynamodb;
+ 
+ import static org.apache.beam.sdk.io.aws2.dynamodb.DynamoDBIO.RetryConfiguration.DEFAULT_RETRY_PREDICATE;
++import static org.apache.beam.sdk.io.aws2.dynamodb.DynamoDBIO.Write.WriteFn.RETRY_ERROR_LOG;
+ import static org.junit.Assert.assertEquals;
+ import static org.junit.Assert.fail;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.Mockito.when;
+ 
+ import java.io.IOException;
+ import java.io.Serializable;
+@@ -54,9 +57,11 @@ import org.junit.Test;
+ import org.junit.rules.ExpectedException;
+ import org.mockito.ArgumentCaptor;
+ import org.mockito.Mockito;
++import org.slf4j.helpers.MessageFormatter;
+ import software.amazon.awssdk.services.dynamodb.DynamoDbClient;
+ import software.amazon.awssdk.services.dynamodb.model.AttributeValue;
+ import software.amazon.awssdk.services.dynamodb.model.BatchWriteItemRequest;
++import software.amazon.awssdk.services.dynamodb.model.BatchWriteItemResponse;
+ import software.amazon.awssdk.services.dynamodb.model.DynamoDbException;
+ import software.amazon.awssdk.services.dynamodb.model.PutRequest;
+ import software.amazon.awssdk.services.dynamodb.model.ScanRequest;
+@@ -337,10 +342,8 @@ public class DynamoDBIOTest implements Serializable {
+     try {
+       pipeline.run().waitUntilFinish();
+     } catch (final Pipeline.PipelineExecutionException e) {
+-      // check 3 retries were initiated by inspecting the log before passing on the exception
+-      writeFnLogs.verifyWarn(String.format(DynamoDBIO.Write.WriteFn.RETRY_ATTEMPT_LOG, 1));
+-      writeFnLogs.verifyWarn(String.format(DynamoDBIO.Write.WriteFn.RETRY_ATTEMPT_LOG, 2));
+-      writeFnLogs.verifyWarn(String.format(DynamoDBIO.Write.WriteFn.RETRY_ATTEMPT_LOG, 3));
++      // check 4 retries were initiated by inspecting the log before passing on the exception
++      writeFnLogs.verifyWarn(MessageFormatter.format(RETRY_ERROR_LOG, 4, "").getMessage());
+       throw e.getCause();
+     }
+   }
+@@ -369,6 +372,8 @@ public class DynamoDBIOTest implements Serializable {
+     final List<String> deduplicateKeys = Arrays.asList("hashKey1", "rangeKey2");
+ 
+     DynamoDbClient amazonDynamoDBMock = Mockito.mock(DynamoDbClient.class);
++    when(amazonDynamoDBMock.batchWriteItem(any(BatchWriteItemRequest.class)))
++        .thenReturn(BatchWriteItemResponse.builder().build());
+ 
+     pipeline
+         .apply(Create.of(duplications))
+diff --git a/sdks/java/io/amazon-web-services2/src/test/java/org/apache/beam/sdk/io/aws2/dynamodb/DynamoDBIOWriteTest.java b/sdks/java/io/amazon-web-services2/src/test/java/org/apache/beam/sdk/io/aws2/dynamodb/DynamoDBIOWriteTest.java
+index 94575ecf5fc..1b48373b4b2 100644
+--- a/sdks/java/io/amazon-web-services2/src/test/java/org/apache/beam/sdk/io/aws2/dynamodb/DynamoDBIOWriteTest.java
++++ b/sdks/java/io/amazon-web-services2/src/test/java/org/apache/beam/sdk/io/aws2/dynamodb/DynamoDBIOWriteTest.java
+@@ -20,9 +20,12 @@ package org.apache.beam.sdk.io.aws2.dynamodb;
+ import static java.util.stream.Collectors.toList;
+ import static java.util.stream.IntStream.range;
+ import static java.util.stream.IntStream.rangeClosed;
++import static org.apache.beam.sdk.io.aws2.dynamodb.DynamoDBIO.Write.WriteFn.RETRY_ERROR_LOG;
+ import static org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.Maps.transformValues;
+ import static org.assertj.core.api.Assertions.assertThat;
+ import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.ArgumentMatchers.argThat;
++import static org.mockito.Mockito.inOrder;
+ import static org.mockito.Mockito.times;
+ import static org.mockito.Mockito.verify;
+ import static org.mockito.Mockito.when;
+@@ -35,6 +38,7 @@ import java.util.Map;
+ import java.util.Objects;
+ import java.util.function.Function;
+ import java.util.function.Supplier;
++import java.util.stream.IntStream;
+ import org.apache.beam.sdk.Pipeline;
+ import org.apache.beam.sdk.PipelineResult;
+ import org.apache.beam.sdk.coders.AvroCoder;
+@@ -59,8 +63,11 @@ import org.junit.Test;
+ import org.junit.rules.ExpectedException;
+ import org.junit.runner.RunWith;
+ import org.mockito.ArgumentCaptor;
++import org.mockito.ArgumentMatcher;
++import org.mockito.InOrder;
+ import org.mockito.Mock;
+ import org.mockito.junit.MockitoJUnitRunner;
++import org.slf4j.helpers.MessageFormatter;
+ import software.amazon.awssdk.services.dynamodb.DynamoDbClient;
+ import software.amazon.awssdk.services.dynamodb.model.AttributeValue;
+ import software.amazon.awssdk.services.dynamodb.model.BatchWriteItemRequest;
+@@ -82,7 +89,7 @@ public class DynamoDBIOWriteTest {
+ 
+   @Test
+   public void testWritePutItems() {
+-    List<Item> items = range(0, 100).mapToObj(Item::of).collect(toList());
++    List<Item> items = Item.range(0, 100);
+ 
+     Supplier<List<Item>> capturePuts = captureBatchWrites(client, req -> req.putRequest().item());
+ 
+@@ -102,7 +109,7 @@ public class DynamoDBIOWriteTest {
+ 
+   @Test
+   public void testWritePutItemsWithDuplicates() {
+-    List<Item> items = range(0, 100).mapToObj(Item::of).collect(toList());
++    List<Item> items = Item.range(0, 100);
+ 
+     Supplier<List<Item>> capturePuts = captureBatchWrites(client, req -> req.putRequest().item());
+ 
+@@ -123,7 +130,7 @@ public class DynamoDBIOWriteTest {
+ 
+   @Test
+   public void testWritePutItemsWithDuplicatesByKey() {
+-    List<Item> items = range(0, 100).mapToObj(Item::of).collect(toList());
++    List<Item> items = Item.range(0, 100);
+ 
+     Supplier<List<Item>> capturePuts = captureBatchWrites(client, req -> req.putRequest().item());
+ 
+@@ -145,7 +152,7 @@ public class DynamoDBIOWriteTest {
+ 
+   @Test
+   public void testWriteDeleteItems() {
+-    List<Item> items = range(0, 100).mapToObj(Item::of).collect(toList());
++    List<Item> items = Item.range(0, 100);
+ 
+     Supplier<List<Item>> captureDeletes =
+         captureBatchWrites(client, req -> req.deleteRequest().key());
+@@ -167,7 +174,7 @@ public class DynamoDBIOWriteTest {
+ 
+   @Test
+   public void testWriteDeleteItemsWithDuplicates() {
+-    List<Item> items = range(0, 100).mapToObj(Item::of).collect(toList());
++    List<Item> items = Item.range(0, 100);
+ 
+     Supplier<List<Item>> captureDeletes =
+         captureBatchWrites(client, req -> req.deleteRequest().key());
+@@ -206,7 +213,36 @@ public class DynamoDBIOWriteTest {
+     result.waitUntilFinish();
+ 
+     verify(client, times(4)).batchWriteItem(any(BatchWriteItemRequest.class));
+-    range(1, 4).forEach(i -> writeFnLogs.verifyWarn(String.format(WriteFn.RETRY_ATTEMPT_LOG, i)));
++  }
++
++  @Test
++  public void testWritePutItemsWithPartialSuccess() {
++    List<WriteRequest> writes = putRequests(Item.range(0, 10));
++
++    when(client.batchWriteItem(any(BatchWriteItemRequest.class)))
++        .thenReturn(partialWriteSuccess(writes.subList(4, 10)))
++        .thenReturn(partialWriteSuccess(writes.subList(8, 10)))
++        .thenReturn(BatchWriteItemResponse.builder().build());
++
++    pipeline
++        .apply(Create.of(10)) // number if items to produce
++        .apply(ParDo.of(new GenerateItems())) // 10 items in one bundle
++        .apply(
++            "write",
++            DynamoDBIO.<Item>write()
++                .withWriteRequestMapperFn(putRequestMapper)
++                .withDynamoDbClientProvider(StaticDynamoDBClientProvider.of(client))
++                .withRetryConfiguration(try4Times));
++
++    PipelineResult result = pipeline.run();
++    result.waitUntilFinish();
++
++    verify(client, times(3)).batchWriteItem(any(BatchWriteItemRequest.class));
++
++    InOrder ordered = inOrder(client);
++    ordered.verify(client).batchWriteItem(argThat(matchWritesUnordered(writes)));
++    ordered.verify(client).batchWriteItem(argThat(matchWritesUnordered(writes.subList(4, 10))));
++    ordered.verify(client).batchWriteItem(argThat(matchWritesUnordered(writes.subList(8, 10))));
+   }
+ 
+   @Test
+@@ -230,7 +266,7 @@ public class DynamoDBIOWriteTest {
+       pipeline.run().waitUntilFinish();
+     } catch (final Pipeline.PipelineExecutionException e) {
+       verify(client, times(4)).batchWriteItem(any(BatchWriteItemRequest.class));
+-      range(1, 4).forEach(i -> writeFnLogs.verifyWarn(String.format(WriteFn.RETRY_ATTEMPT_LOG, i)));
++      writeFnLogs.verifyWarn(MessageFormatter.format(RETRY_ERROR_LOG, 4, "").getMessage());
+       throw e.getCause();
+     }
+   }
+@@ -253,6 +289,10 @@ public class DynamoDBIOWriteTest {
+       return new Item(ImmutableMap.copyOf(transformValues(attributes, a -> a.s())));
+     }
+ 
++    static List<Item> range(int startInclusive, int endExclusive) {
++      return IntStream.range(startInclusive, endExclusive).mapToObj(Item::of).collect(toList());
++    }
++
+     Item withEntry(String key, String value) {
+       return new Item(
+           ImmutableMap.<String, String>builder().putAll(entries).put(key, value).build());
+@@ -300,17 +340,41 @@ public class DynamoDBIOWriteTest {
+             .collect(toList());
+   }
+ 
++  private static ArgumentMatcher<BatchWriteItemRequest> matchWritesUnordered(
++      List<WriteRequest> writes) {
++    return (BatchWriteItemRequest req) ->
++        req != null
++            && req.requestItems().get(tableName).size() == writes.size()
++            && req.requestItems().get(tableName).containsAll(writes);
++  }
++
++  private static BatchWriteItemResponse partialWriteSuccess(List<WriteRequest> unprocessed) {
++    return BatchWriteItemResponse.builder()
++        .unprocessedItems(ImmutableMap.of(tableName, unprocessed))
++        .build();
++  }
++
++  private static List<WriteRequest> putRequests(List<Item> items) {
++    return items.stream().map(putRequest).collect(toList());
++  }
++
++  private static Function<Item, WriteRequest> putRequest =
++      item ->
++          WriteRequest.builder()
++              .putRequest(PutRequest.builder().item(item.attributeMap()).build())
++              .build();
++
++  private static Function<Item, WriteRequest> deleteRequest =
++      key ->
++          WriteRequest.builder()
++              .deleteRequest(DeleteRequest.builder().key(key.attributeMap()).build())
++              .build();
++
+   private static SerializableFunction<Item, KV<String, WriteRequest>> putRequestMapper =
+-      item -> {
+-        PutRequest req = PutRequest.builder().item(item.attributeMap()).build();
+-        return KV.of(tableName, WriteRequest.builder().putRequest(req).build());
+-      };
++      item -> KV.of(tableName, putRequest.apply(item));
+ 
+   private static SerializableFunction<Item, KV<String, WriteRequest>> deleteRequestMapper =
+-      key -> {
+-        DeleteRequest req = DeleteRequest.builder().key(key.attributeMap()).build();
+-        return KV.of(tableName, WriteRequest.builder().deleteRequest(req).build());
+-      };
++      key -> KV.of(tableName, deleteRequest.apply(key));
+ 
+   private static RetryConfiguration try4Times =
+       RetryConfiguration.builder()
+@@ -319,6 +383,13 @@ public class DynamoDBIOWriteTest {
+           .setMaxDuration(Duration.standardSeconds(1))
+           .build();
+ 
++  private static class GenerateItems extends DoFn<Integer, Item> {
++    @ProcessElement
++    public void processElement(ProcessContext ctx) {
++      range(0, ctx.element()).forEach(i -> ctx.output(Item.of(i)));
++    }
++  }
++
+   /**
+    * A DoFn that adds N duplicates to a bundle. The original is emitted last and is the only item
+    * kept if deduplicating appropriately.
