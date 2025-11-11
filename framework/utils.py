@@ -74,7 +74,7 @@ def download_report_data(uri, save_to):
 
         if 'api.github.com' in api_uri and os.environ.get('GH_TOKEN'):
             headers['Authorization'] = f"token {os.environ.get('GH_TOKEN')}"
-            print(f"  -> [GitHub] Using token for authentication")
+            # print(f"  -> [GitHub] Using token for authentication")
 
         response = session.get(api_uri, headers=headers, timeout=20)
         response.raise_for_status()

@@ -30,93 +30,181 @@ The primary goal of this project is to build a comprehensive bug repository. It 
 
 ## Bug Repository Overview
 
-Currently, the repository contains bug data for **227** projects, with a total of **44,419** bugs. Below is a summary of the bug counts for each project.
+Currently, the repository contains bug data for **298** projects, with a total of **56,950** bugs. Below is a summary of the bug counts for each project.
 
 <details>
 <summary>Click to expand for a detailed list of all projects</summary>
 
-| Project ID | Bug Count | Project ID | Bug Count | Project ID | Bug Count |
+### 表格 1
+
+| project_id | bug_count | project_id | bug_count | project_id | bug_count |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| ActixWeb | 41 | CakePHP | 336 | Collections | 204 |
-| Akka | 110 | Catch2 | 338 | Compress | 509 |
-| Alacritty | 632 | Cayenne_jgroups | 2 | Configuration | 326 |
-| Assimp | 128 | Cayenne_jms | 2 | Crypto | 90 |
-| Babel | 72 | Cayenne_xmpp | 2 | Csv | 141 |
-| Bazel | 379 | Chalk | 33 | Cypress | 12 |
-| Bcel | 124 | Chi | 24 | D3 | 273 |
-| Bevy | 1050 | Cli | 239 | Daemon | 131 |
-| Black | 268 | Closure | 480 | Dbcp | 196 |
-| Bsf | 11 | Codec | 173 | Dbutils | 30 |
-| Deltaspike_api | 111 | Etcd | 55 | GRPC | 53 |
-| Diesel | 265 | Exec | 50 | Geometry_core | 5 |
-| Digester | 39 | Fastify | 72 | Gitea | 723 |
-| DockerCLI | 21 | Fastlane | 46 | Gorm | 33 |
-| Dosgi_common | 17 | Fiber | 30 | Graph | 10 |
-| Doxia_module_apt | 50 | FileUpload | 85 | Guava | 33 |
-| Electron | 5 | Flume_ngcore | 193 | Hbase_common | 554 |
-| ElectronFiddle | 5 | Fmt | 62 | Helix | 56 |
-| Email | 51 | Forem | 37 | Helm | 136 |
-| Eslint | 694 | Functor | 6 | Hivemall_core | 28 |
-| Homebrew | 138 | JUnit5 | 797 | Jena_core | 202 |
-| HttpClient5 | 143 | JXR | 41 | Jexl | 251 |
-| Httpcomponents_core_h2 | 21 | Jackrabbit_filevault_vault_core | 174 | Johnzon_core | 81 |
-| Httpcomponents_core_httpcore5 | 86 | Jackrabbit_filevault_vault_validation | 42 | Johnzon_jaxrs | 14 |
-| Httpie | 69 | Jackrabbit_oak_core | 1912 | Johnzon_jsonb | 85 |
-| Hyper | 320 | James_project_core | 21 | Johnzon_jsonschema | 4 |
-| IO | 419 | James_project_mailet_standard | 40 | Johnzon_mapper | 120 |
-| Imaging | 143 | James_project_server_container_core | 44 | JxPath | 59 |
-| Incubator_tamaya_api | 13 | Jci_core | 8 | K6 | 282 |
-| Istio | 21 | Jelly_core | 1 | Karaf_main | 142 |
-| Knox_assertion_common | 17 | Maven2_artifact | 76 | Mitmproxy | 502 |
-| Lang | 641 | Maven2_project | 190 | Mockito | 365 |
-| Laravel | 45 | Maven_checkstyle_plugin | 109 | Monolog | 160 |
-| LibGDX | 590 | MetaModel_core | 48 | Mrunit | 50 |
-| Logging | 42 | MetaModel_csv | 11 | Mshared_archiver | 22 |
-| MDeploy | 40 | MetaModel_excel | 8 | Mypy | 662 |
-| MGpg | 27 | MetaModel_jdbc | 37 | Neovim | 97 |
-| MShade | 135 | MetaModel_pojo | 4 | Net | 271 |
-| Math | 671 | MetaModel_salesforce | 4 | Netty | 365 |
-| Math_4j | 423 | Minaftp_api | 18 | Nifi_mock | 72 |
-| NodeFetch | 19 | Pdfbox_pdfbox | 3119 | Pug | 179 |
-| Numbers_angle | 2 | Pest | 6 | Pydantic | 193 |
-| OBSStudio | 86 | PhpFaker | 6 | Pylint | 384 |
-| Oak_commons | 39 | Pillow | 91 | Pytest | 532 |
-| Ognl | 109 | PlayFramework | 190 | Qpid_client | 255 |
-| OkHttp | 30 | Playwright | 87 | Qpidjms_client | 658 |
-| Oozie_client | 118 | Poetry | 49 | Quarkus | 280 |
-| PHPUnit | 967 | Pool | 187 | Rails | 245 |
-| Pandas | 31 | Prettier | 10 | Rat_core | 124 |
-| Pdfbox_fontbox | 453 | Proxy | 5 | Rat_plugin | 93 |
-| Rave_commons | 4 | Rich | 9 | Shiro_web | 53 |
-| Rave_core | 27 | Ripper | 448 | Sidekiq | 358 |
-| Rave_web | 22 | Rocket | 272 | Slim | 81 |
-| Rclone | 1433 | Rollup | 178 | Sling_apiregions | 19 |
-| Rdf_jena | 1 | RspecCore | 285 | Sling_classloader | 35 |
-| Redis | 113 | RxJava | 22 | Sling_cpconverter | 169 |
-| Redux | 51 | Scxml | 123 | Sling_discovery | 15 |
-| Release_plugin | 15 | Sentry_ccommon | 24 | Sling_html | 3 |
-| Reqwest | 106 | Shindig_common | 78 | Sling_log | 55 |
-| Retrofit | 21 | Shiro_core | 98 | Sling_messaging_mail | 5 |
-| Sling_metrics | 8 | Streamlit | 183 | Tika_app | 54 |
-| Sling_osgi | 9 | Struts1_core | 35 | Tika_core | 419 |
-| Sling_scheduler | 31 | SvelteKit | 570 | Tiles_core | 5 |
-| Sling_threads | 25 | Symfony | 38 | Tinkerpop_gremlin_core | 173 |
-| Sling_validation | 18 | Syncthing | 1507 | Twill_dcore | 8 |
-| Sling_webconsole | 1 | Tauri | 632 | TypeORM | 168 |
-| SpringFramework | 5 | Text | 90 | Uvicorn | 11 |
-| Starship | 39 | Tez_common | 72 | Validator | 119 |
-| Storm_client | 176 | ThreeJS | 11 | Vcpkg | 66 |
-| Storybook | 31 | Tika | 1477 | Vfs | 309 |
-| Vue2 | 473 | Wink_common | 89 |  |  |
+| ActiveAdmin | 148 | Babel | 72 | Cayenne_jgroups | 2 |
+| ActixWeb | 41 | Bazel | 379 | Cayenne_jms | 2 |
+| Akka | 110 | Bcel | 124 | Cayenne_xmpp | 2 |
+| Alacritty | 632 | Bevy | 1050 | Chalk | 33 |
+| Alamofire | 14 | Black | 268 | ChartJS | 69 |
+| Alembic | 121 | Bleve | 143 | ChartsSwift | 118 |
+| AssertJ | 577 | Bsf | 11 | Chi | 24 |
+| Assimp | 128 | CakePHP | 336 | Cli | 239 |
+| AutoMapper | 206 | Capybara | 110 | Click | 85 |
+| Axum | 24 | Catch2 | 338 | Closure | 480 |
+
+--------------------
+
+### 表格 2
+
+| project_id | bug_count | project_id | bug_count | project_id | bug_count |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| CodeIgniter | 545 | D3 | 273 | DoctrineORM | 66 |
+| Codec | 173 | Daemon | 131 | Dosgi_common | 17 |
+| Collections | 204 | Dbcp | 196 | Doxia_module_apt | 50 |
+| Compress | 509 | Dbutils | 30 | EFCore | 740 |
+| Configuration | 326 | Deltaspike_api | 111 | Egui | 116 |
+| Crypto | 90 | Devise | 164 | Electron | 5 |
+| Csv | 141 | Diesel | 265 | ElectronFiddle | 5 |
+| Curl | 839 | Digester | 39 | Email | 51 |
+| Cypress | 12 | DockerCLI | 21 | Eslint | 694 |
+| CypressTestingLibrary | 12 | DoctrineDBAL | 50 | Etcd | 55 |
+
+--------------------
+
+### 表格 3
+
+| project_id | bug_count | project_id | bug_count | project_id | bug_count |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| Exec | 50 | Fmt | 62 | GoSwagger | 357 |
+| ExoPlayer | 9 | Forem | 37 | Gofumpt | 76 |
+| Fabric | 13 | Functor | 6 | Goreleaser | 395 |
+| Fastify | 72 | GPerfTools | 2 | Gorm | 33 |
+| Fastlane | 46 | GRPC | 53 | Graph | 10 |
+| Fiber | 30 | Geometry_core | 5 | Guava | 33 |
+| FileUpload | 85 | Gitea | 723 | Gulp | 44 |
+| Flake8 | 101 | Glfw | 376 | Hbase_common | 554 |
+| FluentValidation | 14 | Glm | 1 | Helix | 56 |
+| Flume_ngcore | 193 | GoRedis | 50 | Helm | 136 |
+
+--------------------
+
+### 表格 4
+
+| project_id | bug_count | project_id | bug_count | project_id | bug_count |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| Hivemall_core | 28 | Incubator_tamaya_api | 13 | James_project_server_container_core | 44 |
+| Homebrew | 138 | Istio | 21 | Jci_core | 8 |
+| HttpClient5 | 143 | JUnit5 | 797 | Jelly_core | 1 |
+| Httpcomponents_core_h2 | 21 | JXR | 41 | Jena_core | 202 |
+| Httpcomponents_core_httpcore5 | 86 | Jackrabbit_filevault_vault_core | 174 | JestDom | 10 |
+| Httpie | 69 | Jackrabbit_filevault_vault_validation | 42 | Jexl | 251 |
+| Hyper | 320 | Jackrabbit_oak_core | 1912 | Jinja2 | 82 |
+| IO | 419 | JacksonDatabind | 844 | Johnzon_core | 81 |
+| Iced | 33 | James_project_core | 21 | Johnzon_jaxrs | 14 |
+| Imaging | 143 | James_project_mailet_standard | 40 | Johnzon_jsonb | 85 |
+
+--------------------
+
+### 表格 5
+
+| project_id | bug_count | project_id | bug_count | project_id | bug_count |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| Johnzon_jsonschema | 4 | LeakCanary | 283 | Math | 671 |
+| Johnzon_mapper | 120 | LessJS | 261 | Math_4j | 423 |
+| Jsoup | 427 | LibGDX | 590 | Maven2_artifact | 76 |
+| JxPath | 59 | Libuv | 101 | Maven2_project | 190 |
+| K6 | 282 | Logging | 42 | Maven_checkstyle_plugin | 109 |
+| Karaf_main | 142 | Logrus | 28 | MetaModel_core | 48 |
+| Kingfisher | 3 | LottieAndroid | 332 | MetaModel_csv | 11 |
+| Knox_assertion_common | 17 | MDeploy | 40 | MetaModel_excel | 8 |
+| Lang | 641 | MGpg | 27 | MetaModel_jdbc | 37 |
+| Laravel | 45 | MShade | 135 | MetaModel_pojo | 4 |
+
+--------------------
+
+### 表格 6
+
+| project_id | bug_count | project_id | bug_count | project_id | bug_count |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| MetaModel_salesforce | 4 | Net | 271 | OkHttp | 30 |
+| Minaftp_api | 18 | Netty | 365 | Oozie_client | 118 |
+| Mitmproxy | 502 | NewtonsoftJson | 14 | PHPStan | 17 |
+| Mockito | 365 | NextJS | 85 | PHPUnit | 967 |
+| Monolog | 160 | Nifi_mock | 72 | PM2 | 94 |
+| Mrunit | 50 | NodeFetch | 19 | Pandas | 31 |
+| Mshared_archiver | 22 | Numbers_angle | 2 | Paramiko | 96 |
+| Mypy | 662 | OBSStudio | 86 | Pdfbox_fontbox | 453 |
+| NUnit | 180 | Oak_commons | 39 | Pdfbox_pdfbox | 3119 |
+| Neovim | 97 | Ognl | 109 | Pest | 6 |
+
+--------------------
+
+### 表格 7
+
+| project_id | bug_count | project_id | bug_count | project_id | bug_count |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| PhpFaker | 6 | Psalm | 1282 | Rails | 245 |
+| Pillow | 91 | Pug | 179 | Rand | 54 |
+| PlayFramework | 190 | Pundit | 13 | Rat_core | 124 |
+| Playwright | 87 | PycaCryptography | 182 | Rat_plugin | 93 |
+| Poetry | 49 | Pydantic | 193 | Rave_commons | 4 |
+| Polars | 3 | Pylint | 384 | Rave_core | 27 |
+| Polly | 39 | Pytest | 532 | Rave_web | 22 |
+| Pool | 187 | Qpid_client | 255 | Rclone | 1433 |
+| Prettier | 10 | Qpidjms_client | 658 | Rdf_jena | 1 |
+| Proxy | 5 | Quarkus | 280 | ReactHookForm | 491 |
+
+--------------------
+
+### 表格 8
+
+| project_id | bug_count | project_id | bug_count | project_id | bug_count |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| ReactRouter | 114 | Rollup | 178 | Shindig_common | 78 |
+| Redis | 113 | RspecCore | 285 | Shiro_core | 98 |
+| Redux | 51 | RxJava | 22 | Shiro_web | 53 |
+| ReduxToolkit | 15 | SFML | 74 | Sidekiq | 358 |
+| Release_plugin | 15 | SQLAlchemy | 571 | Slim | 81 |
+| Reqwest | 106 | Sass | 82 | Sling_apiregions | 19 |
+| Retrofit | 21 | Scxml | 123 | Sling_classloader | 35 |
+| Rich | 9 | SeaORM | 6 | Sling_cpconverter | 169 |
+| Ripper | 448 | Sentry_ccommon | 24 | Sling_discovery | 15 |
+| Rocket | 272 | Serilog | 81 | Sling_html | 3 |
+
+--------------------
+
+### 表格 9
+
+| project_id | bug_count | project_id | bug_count | project_id | bug_count |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| Sling_log | 55 | SqlxGo | 28 | Tauri | 632 |
+| Sling_messaging_mail | 5 | SqlxRust | 86 | Testcontainers | 2 |
+| Sling_metrics | 8 | Starship | 39 | Text | 90 |
+| Sling_osgi | 9 | Storm_client | 176 | Tez_common | 72 |
+| Sling_scheduler | 31 | Storybook | 31 | ThreeJS | 11 |
+| Sling_threads | 25 | Streamlit | 183 | Tika | 1477 |
+| Sling_validation | 18 | Struts1_core | 35 | Tika_app | 54 |
+| Sling_webconsole | 1 | SvelteKit | 570 | Tika_core | 419 |
+| Spdlog | 121 | Symfony | 38 | Tiles_core | 5 |
+| SpringFramework | 5 | Syncthing | 1507 | Tinkerpop_gremlin_core | 173 |
+
+--------------------
+
+### 表格 10
+
+| project_id | bug_count | project_id | bug_count | project_id | bug_count |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| Twill_dcore | 8 | Webbeans_web | 92 | Xmlgraphics | 25 |
+| TypeORM | 168 | Webpack | 152 | Xunit | 155 |
+| Uvicorn | 11 | Wicket_cdi | 18 | Yew | 35 |
+| Vagrant | 232 | Wicket_core | 1619 | Yii2 | 929 |
+| Validator | 119 | Wicket_request | 151 | YugabyteDB | 328 |
+| Vcpkg | 66 | Wicket_spring | 35 | Zaproxy | 404 |
+| Vfs | 309 | Wicket_util | 110 | Zerolog | 20 |
+| Vue2 | 473 | Wink_common | 89 | Zlib | 1 |
 | Vysper_nbxml | 9 | Xbean_naming | 57 |  |  |
 | Weaver_processor | 2 | Xbean_reflect | 59 |  |  |
-| Webbeans_web | 92 | Xmlgraphics | 25 |  |  |
-| Webpack | 152 | Yew | 35 |  |  |
-| Wicket_cdi | 18 | Yii2 | 929 |  |  |
-| Wicket_core | 1619 | YugabyteDB | 328 |  |  |
-| Wicket_request | 151 |  |  |  |  |
-| Wicket_spring | 35 |  |  |  |  |
-| Wicket_util | 110 |  |  |  |  |
+
+--------------------
+
 
 </details>
 

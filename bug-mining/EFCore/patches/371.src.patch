@@ -1,0 +1,3634 @@
+diff --git a/src/EFCore.Relational/Query/SqlNullabilityProcessor.cs b/src/EFCore.Relational/Query/SqlNullabilityProcessor.cs
+index 00a0e82d89..37c470860b 100644
+--- a/src/EFCore.Relational/Query/SqlNullabilityProcessor.cs
++++ b/src/EFCore.Relational/Query/SqlNullabilityProcessor.cs
+@@ -699,7 +699,7 @@ protected virtual SqlExpression VisitIn(InExpression inExpression, bool allowOpt
+                     return inExpression;
+ 
+                 case (true, false):
+-                {
++                    NullableItemWithNonNullableProjection:
+                     // If the item is actually null (not just nullable) and the projection is non-nullable, just return false immediately:
+                     // WHERE NULL IN (SELECT NonNullable FROM foo) -> false
+                     if (IsNull(item))
+@@ -714,7 +714,6 @@ protected virtual SqlExpression VisitIn(InExpression inExpression, bool allowOpt
+                     return allowOptimizedExpansion
+                         ? inExpression
+                         : _sqlExpressionFactory.AndAlso(inExpression, _sqlExpressionFactory.IsNotNull(item));
+-                }
+ 
+                 case (false, true):
+                 {
+@@ -727,6 +726,14 @@ protected virtual SqlExpression VisitIn(InExpression inExpression, bool allowOpt
+                         return inExpression;
+                     }
+ 
++                    // If the subquery happens to be a primitive collection (e.g. OPENJSON), pull out the null values from the parameter.
++                    // Since the item is non-nullable, it can never match those null values, and all they do is cause the IN expression
++                    // to return NULL if the item isn't found. So just remove them.
++                    if (TryMakeNonNullable(subquery, out var nonNullableSubquery, out _))
++                    {
++                        return inExpression.Update(item, nonNullableSubquery);
++                    }
++
+                     // On SQL Server, EXISTS isn't less efficient than IN, and the additional COALESCE (and CASE/WHEN which it requires)
+                     // add unneeded clutter (and possibly hurt perf). So allow providers to prefer EXISTS.
+                     if (PreferExistsToInWithCoalesce)
+@@ -738,13 +745,46 @@ protected virtual SqlExpression VisitIn(InExpression inExpression, bool allowOpt
+                 }
+ 
+                 case (true, true):
+-                    TransformToExists:
+-                    // Worst case: both sides are nullable; there's no way to distinguish the item was found or not.
+-                    // We rewrite to an EXISTS subquery where we can generate a precise predicate to check for what we need. Note that this
+-                    // performs (significantly) worse than an IN expression, since it involves a correlated subquery.
++                    // Worst case: both sides are nullable; that means that with IN, there's no way to distinguish between:
++                    // a) The item was NULL and was found (e.g. NULL IN (1, 2, NULL) should yield true), and
++                    // b) The item wasn't found (e.g. 3 IN (1, 2, NULL) should yield false)
++
++                    // As a last resort, we can rewrite to an EXISTS subquery where we can generate a precise predicate to check for what we
++                    // need. This unfortunately performs (significantly) worse than an IN expression, since it involves a correlated
++                    // subquery, and can cause indexes to not get used.
++
++                    // But before doing this, we check whether the subquery represents a simple parameterized collection (e.g. a bare
++                    // OPENJSON call over a parameter in SQL Server), and if it is, rewrite the parameter to remove nulls so we can keep
++                    // using IN.
++                    if (TryMakeNonNullable(subquery, out var nonNullableSubquery2, out var foundNull))
++                    {
++                        inExpression = inExpression.Update(item, nonNullableSubquery2);
++
++                        if (!foundNull.Value)
++                        {
++                            // There weren't any actual nulls inside the parameterized collection - we can jump to the case which handles
++                            // that.
++                            goto NullableItemWithNonNullableProjection;
++                        }
++
++                        // Nulls were found inside the parameterized collection, and removed. If the item is a null constant, just convert
++                        // the whole thing to true.
++                        if (IsNull(item))
++                        {
++                            return _sqlExpressionFactory.Constant(true, inExpression.TypeMapping);
++                        }
++
++                        // Otherwise we now need to compensate for the removed nulls outside, by adding OR item IS NULL.
++                        // Note that this is safe in negated (non-optimized) contexts:
++                        // WHERE item NOT IN ("foo", "bar") AND item IS NOT NULL
++                        // When item is NULL, the item IS NOT NULL clause causes the whole thing to return false. Otherwise that clause
++                        // can be ignored, and we have non-null item IN non-null list-of-values.
++                        return _sqlExpressionFactory.OrElse(inExpression, _sqlExpressionFactory.IsNull(item));
++                    }
+ 
+-                    // We'll need to mutate the subquery to introduce the predicate inside it, but it might be referenced by other places in
+-                    // the tree, so we create a copy to work on.
++                    TransformToExists:
++                    // We unfortunately need to rewrite to EXISTS. We'll need to mutate the subquery to introduce the predicate inside it,
++                    // but it might be referenced by other places in the tree, so we create a copy to work on.
+ 
+                     // No need for a projection with EXISTS, clear it to get SELECT 1
+                     subquery = subquery.Update(
+@@ -1953,6 +1993,133 @@ static bool TryNegate(ExpressionType expressionType, out ExpressionType result)
+         }
+     }
+ 
++    /// <summary>
++    ///     Attempts to convert the given <paramref name="selectExpression" />, which has a nullable projection, to an identical expression
++    ///     which does not have a nullable projection. This is used to extract NULLs out of e.g. the parameter argument of SQL Server
++    ///     OPENJSON, in order to allow a more efficient translation.
++    /// </summary>
++    [EntityFrameworkInternal]
++    protected virtual bool TryMakeNonNullable(
++        SelectExpression selectExpression,
++        [NotNullWhen(true)] out SelectExpression? rewrittenSelectExpression,
++        [NotNullWhen(true)] out bool? foundNull)
++    {
++        if (selectExpression is
++            {
++                Tables: [var collectionTable],
++                GroupBy: [],
++                Having: null,
++                Limit: null,
++                Offset: null,
++                Predicate: null,
++                // Note that a orderings and distinct are OK - they don't interact with our null removal.
++                // We exclude the predicate since it may actually filter out nulls
++                Projection: [{ Expression: ColumnExpression projectedColumn }] projection
++            }
++            && projectedColumn.Table == collectionTable
++            && IsCollectionTable(collectionTable, out var collection)
++            && collection is SqlParameterExpression collectionParameter
++            && ParameterValues[collectionParameter.Name] is IList values)
++        {
++            // We're looking at a parameter beyond its simple nullability, so we can't use the 2nd-level cache for this query.
++            DoNotCache();
++
++            IList? processedValues = null;
++
++            for (var i = 0; i < values.Count; i++)
++            {
++                var value = values[i];
++
++                if (value is null)
++                {
++                    if (processedValues is null)
++                    {
++                        var elementClrType = values.GetType().GetSequenceType();
++                        processedValues = (IList)Activator.CreateInstance(typeof(List<>).MakeGenericType(elementClrType), values.Count)!;
++                        for (var j = 0; j < i; j++)
++                        {
++                            processedValues.Add(values[j]!);
++                        }
++                    }
++
++                    // Skip the value
++                    continue;
++                }
++
++                processedValues?.Add(value);
++            }
++
++            if (processedValues is null)
++            {
++                // No null was found in the parameter's elements - the select expression is already non-nullable.
++                // TODO: We should change the project column to be non-nullable, but it's too closed down for that.
++                rewrittenSelectExpression = selectExpression;
++                foundNull = false;
++                return true;
++            }
++
++            foundNull = true;
++
++            // TODO: We currently only have read-only access to the parameter values in the nullability processor (and in all of the
++            // 2nd-level query pipeline); to need to flow the mutable dictionary in. Note that any modification of parameter values (as
++            // here) must immediately entail DoNotCache().
++            Check.DebugAssert(ParameterValues is Dictionary<string, object?>, "ParameterValues isn't a Dictionary");
++            if (ParameterValues is not Dictionary<string, object?> mutableParameterValues)
++            {
++                rewrittenSelectExpression = null;
++                foundNull = null;
++                return false;
++            }
++
++            var rewrittenParameter = new SqlParameterExpression(
++                collectionParameter.Name + "_without_nulls", collectionParameter.Type, collectionParameter.TypeMapping);
++            mutableParameterValues[rewrittenParameter.Name] = processedValues;
++            var rewrittenCollectionTable = UpdateParameterCollection(collectionTable, rewrittenParameter);
++
++            // We clone the select expression since Update below doesn't create a pure copy, mutating the original as well (because of
++            // TableReferenceExpression). TODO: Remove this after #31327.
++#pragma warning disable EF1001
++            rewrittenSelectExpression = selectExpression.Clone();
++#pragma warning restore EF1001
++
++            rewrittenSelectExpression = rewrittenSelectExpression.Update(
++                projection, // TODO: We should change the project column to be non-nullable, but it's too closed down for that.
++                new[] { rewrittenCollectionTable },
++                selectExpression.Predicate,
++                selectExpression.GroupBy,
++                selectExpression.Having,
++                selectExpression.Orderings,
++                selectExpression.Limit,
++                selectExpression.Offset);
++
++            return true;
++        }
++
++        rewrittenSelectExpression = null;
++        foundNull = null;
++        return false;
++    }
++
++    /// <summary>
++    ///     A provider hook for identifying a <see cref="TableExpressionBase" /> which represents a collection, e.g. OPENJSON on SQL Server.
++    /// </summary>
++    [EntityFrameworkInternal]
++    protected virtual bool IsCollectionTable(TableExpressionBase table, [NotNullWhen(true)] out Expression? collection)
++    {
++        collection = null;
++        return false;
++    }
++
++    /// <summary>
++    ///     Given a <see cref="TableExpressionBase" /> which was previously identified to be a parameterized collection table (e.g.
++    ///     OPENJSON on SQL Server, see <see cref="IsCollectionTable" />), replaces the parameter for that table.
++    /// </summary>
++    [EntityFrameworkInternal]
++    protected virtual TableExpressionBase UpdateParameterCollection(
++        TableExpressionBase table,
++        SqlParameterExpression newCollectionParameter)
++        => throw new InvalidOperationException();
++
+     private SqlExpression ProcessNullNotNull(SqlUnaryExpression sqlUnaryExpression, bool operandNullable)
+     {
+         if (!operandNullable)
+diff --git a/src/EFCore.SqlServer/Query/Internal/SqlServerSqlNullabilityProcessor.cs b/src/EFCore.SqlServer/Query/Internal/SqlServerSqlNullabilityProcessor.cs
+index f63b25939e..1696821a4e 100644
+--- a/src/EFCore.SqlServer/Query/Internal/SqlServerSqlNullabilityProcessor.cs
++++ b/src/EFCore.SqlServer/Query/Internal/SqlServerSqlNullabilityProcessor.cs
+@@ -1,6 +1,8 @@
+ // Licensed to the .NET Foundation under one or more agreements.
+ // The .NET Foundation licenses this file to you under the MIT license.
+ 
++using System.Collections;
++using System.Diagnostics.CodeAnalysis;
+ using Microsoft.EntityFrameworkCore.Query.SqlExpressions;
+ 
+ namespace Microsoft.EntityFrameworkCore.SqlServer.Query.Internal;
+@@ -113,4 +115,36 @@ SqlServerAggregateFunctionExpression aggregateFunctionExpression
+     /// </summary>
+     protected override bool PreferExistsToInWithCoalesce
+         => true;
++
++#pragma warning disable EF1001
++    /// <summary>
++    ///     This is an internal API that supports the Entity Framework Core infrastructure and not subject to
++    ///     the same compatibility standards as public APIs. It may be changed or removed without notice in
++    ///     any release. You should only use it directly in your code with extreme caution and knowing that
++    ///     doing so can result in application failures when updating to a new Entity Framework Core release.
++    /// </summary>
++    protected override bool IsCollectionTable(TableExpressionBase table, [NotNullWhen(true)] out Expression? collection)
++    {
++        if (table is SqlServerOpenJsonExpression { Arguments: [var argument] })
++        {
++            collection = argument;
++            return true;
++        }
++
++        return base.IsCollectionTable(table, out collection);
++    }
++
++    /// <summary>
++    ///     This is an internal API that supports the Entity Framework Core infrastructure and not subject to
++    ///     the same compatibility standards as public APIs. It may be changed or removed without notice in
++    ///     any release. You should only use it directly in your code with extreme caution and knowing that
++    ///     doing so can result in application failures when updating to a new Entity Framework Core release.
++    /// </summary>
++    protected override TableExpressionBase UpdateParameterCollection(
++        TableExpressionBase table,
++        SqlParameterExpression newCollectionParameter)
++        => table is SqlServerOpenJsonExpression { Arguments: [SqlParameterExpression] } openJsonExpression
++            ? openJsonExpression.Update(newCollectionParameter, path: null)
++            : base.UpdateParameterCollection(table, newCollectionParameter);
++#pragma warning restore EF1001
+ }
+diff --git a/src/EFCore.Sqlite.Core/Query/Internal/SqliteSqlNullabilityProcessor.cs b/src/EFCore.Sqlite.Core/Query/Internal/SqliteSqlNullabilityProcessor.cs
+index 9385ab8246..24129e5624 100644
+--- a/src/EFCore.Sqlite.Core/Query/Internal/SqliteSqlNullabilityProcessor.cs
++++ b/src/EFCore.Sqlite.Core/Query/Internal/SqliteSqlNullabilityProcessor.cs
+@@ -1,6 +1,7 @@
+ ﻿// Licensed to the .NET Foundation under one or more agreements.
+ // The .NET Foundation licenses this file to you under the MIT license.
+ 
++using System.Diagnostics.CodeAnalysis;
+ using Microsoft.EntityFrameworkCore.Query.SqlExpressions;
+ using Microsoft.EntityFrameworkCore.Sqlite.Query.SqlExpressions.Internal;
+ 
+@@ -83,4 +84,36 @@ public class SqliteSqlNullabilityProcessor : SqlNullabilityProcessor
+ 
+         return regexpExpression.Update(match, pattern);
+     }
++
++#pragma warning disable EF1001
++    /// <summary>
++    ///     This is an internal API that supports the Entity Framework Core infrastructure and not subject to
++    ///     the same compatibility standards as public APIs. It may be changed or removed without notice in
++    ///     any release. You should only use it directly in your code with extreme caution and knowing that
++    ///     doing so can result in application failures when updating to a new Entity Framework Core release.
++    /// </summary>
++    protected override bool IsCollectionTable(TableExpressionBase table, [NotNullWhen(true)] out Expression? collection)
++    {
++        if (table is TableValuedFunctionExpression { Name: "json_each", Schema: null, IsBuiltIn: true, Arguments: [var argument] })
++        {
++            collection = argument;
++            return true;
++        }
++
++        return base.IsCollectionTable(table, out collection);
++    }
++
++    /// <summary>
++    ///     This is an internal API that supports the Entity Framework Core infrastructure and not subject to
++    ///     the same compatibility standards as public APIs. It may be changed or removed without notice in
++    ///     any release. You should only use it directly in your code with extreme caution and knowing that
++    ///     doing so can result in application failures when updating to a new Entity Framework Core release.
++    /// </summary>
++    protected override TableExpressionBase UpdateParameterCollection(
++        TableExpressionBase table,
++        SqlParameterExpression newCollectionParameter)
++        => table is TableValuedFunctionExpression { Arguments: [SqlParameterExpression] } jsonEachExpression
++            ? jsonEachExpression.Update(new[] { newCollectionParameter })
++            : base.UpdateParameterCollection(table, newCollectionParameter);
++#pragma warning restore EF1001
+ }
+diff --git a/test/EFCore.Relational.Specification.Tests/Query/NullSemanticsQueryTestBase.cs b/test/EFCore.Relational.Specification.Tests/Query/NullSemanticsQueryTestBase.cs
+index bf72511815..90c1f3b7cc 100644
+--- a/test/EFCore.Relational.Specification.Tests/Query/NullSemanticsQueryTestBase.cs
++++ b/test/EFCore.Relational.Specification.Tests/Query/NullSemanticsQueryTestBase.cs
+@@ -1244,6 +1244,8 @@ public virtual async Task Null_semantics_contains_nullable_item_with_nullable_su
+ 
+     #endregion Contains with subquery
+ 
++    // For more tests on Contains with parameterized collections, see PrimitiveCollectionsqueryTestBase
++
+     #region Contains with inline collection
+ 
+     [ConditionalTheory]
+@@ -1260,7 +1262,7 @@ public virtual async Task Null_semantics_contains_with_non_nullable_item_and_inl
+ 
+     [ConditionalTheory]
+     [MemberData(nameof(IsAsyncData))]
+-    public virtual async Task Null_semantics_contains_with_non_nullable_item_and_inline_non_nullable_values_with_null(bool async)
++    public virtual async Task Null_semantics_contains_with_non_nullable_item_and_inline_values_with_null(bool async)
+     {
+         await AssertQueryScalar(
+             async, ss => ss.Set<NullSemanticsEntity1>()
+@@ -1272,7 +1274,7 @@ public virtual async Task Null_semantics_contains_with_non_nullable_item_and_inl
+ 
+     [ConditionalTheory]
+     [MemberData(nameof(IsAsyncData))]
+-    public virtual async Task Null_semantics_contains_with_non_nullable_item_and_inline_nullable_values(bool async)
++    public virtual async Task Null_semantics_contains_with_non_nullable_item_and_inline_values_with_nullable_column(bool async)
+     {
+         await AssertQueryScalar(
+             async, ss => ss.Set<NullSemanticsEntity1>()
+@@ -1284,7 +1286,7 @@ public virtual async Task Null_semantics_contains_with_non_nullable_item_and_inl
+ 
+     [ConditionalTheory]
+     [MemberData(nameof(IsAsyncData))]
+-    public virtual async Task Null_semantics_contains_with_non_nullable_item_and_inline_nullable_values_with_null(bool async)
++    public virtual async Task Null_semantics_contains_with_non_nullable_item_and_inline_values_with_nullable_column_and_null(bool async)
+     {
+         await AssertQueryScalar(
+             async, ss => ss.Set<NullSemanticsEntity1>()
+@@ -1308,7 +1310,7 @@ public virtual async Task Null_semantics_contains_with_nullable_item_and_inline_
+ 
+     [ConditionalTheory]
+     [MemberData(nameof(IsAsyncData))]
+-    public virtual async Task Null_semantics_contains_with_nullable_item_and_inline_non_nullable_values_with_null(bool async)
++    public virtual async Task Null_semantics_contains_with_nullable_item_and_inline_values_with_null(bool async)
+     {
+         await AssertQueryScalar(
+             async, ss => ss.Set<NullSemanticsEntity1>()
+@@ -1320,7 +1322,7 @@ public virtual async Task Null_semantics_contains_with_nullable_item_and_inline_
+ 
+     [ConditionalTheory]
+     [MemberData(nameof(IsAsyncData))]
+-    public virtual async Task Null_semantics_contains_with_nullable_item_and_inline_nullable_values(bool async)
++    public virtual async Task Null_semantics_contains_with_nullable_item_and_inline_values_with_nullable_column(bool async)
+     {
+         await AssertQueryScalar(
+             async, ss => ss.Set<NullSemanticsEntity1>()
+@@ -1332,7 +1334,7 @@ public virtual async Task Null_semantics_contains_with_nullable_item_and_inline_
+ 
+     [ConditionalTheory]
+     [MemberData(nameof(IsAsyncData))]
+-    public virtual async Task Null_semantics_contains_with_nullable_item_and_inline_nullable_values_with_null(bool async)
++    public virtual async Task Null_semantics_contains_with_nullable_item_and_values_with_nullable_column_and_null(bool async)
+     {
+         await AssertQueryScalar(
+             async, ss => ss.Set<NullSemanticsEntity1>()
+diff --git a/test/EFCore.Specification.Tests/Query/PrimitiveCollectionsQueryTestBase.cs b/test/EFCore.Specification.Tests/Query/PrimitiveCollectionsQueryTestBase.cs
+index e56c546194..cbbf5c2a89 100644
+--- a/test/EFCore.Specification.Tests/Query/PrimitiveCollectionsQueryTestBase.cs
++++ b/test/EFCore.Specification.Tests/Query/PrimitiveCollectionsQueryTestBase.cs
+@@ -203,59 +203,118 @@ public virtual Task Parameter_collection_Count(bool async)
+ 
+     [ConditionalTheory]
+     [MemberData(nameof(IsAsyncData))]
+-    public virtual Task Parameter_collection_of_ints_Contains(bool async)
++    public virtual async Task Parameter_collection_of_ints_Contains_int(bool async)
+     {
+         var ints = new[] { 10, 999 };
+ 
+-        return AssertQuery(
++        await AssertQuery(
+             async,
+             ss => ss.Set<PrimitiveCollectionsEntity>().Where(c => ints.Contains(c.Int)));
++        await AssertQuery(
++            async,
++            ss => ss.Set<PrimitiveCollectionsEntity>().Where(c => !ints.Contains(c.Int)));
++    }
++
++    [ConditionalTheory]
++    [MemberData(nameof(IsAsyncData))]
++    public virtual async Task Parameter_collection_of_ints_Contains_nullable_int(bool async)
++    {
++        var ints = new int?[] { 10, 999 };
++
++        await AssertQuery(
++            async,
++            ss => ss.Set<PrimitiveCollectionsEntity>().Where(c => ints.Contains(c.NullableInt)));
++        await AssertQuery(
++            async,
++            ss => ss.Set<PrimitiveCollectionsEntity>().Where(c => !ints.Contains(c.NullableInt)));
+     }
+ 
+     [ConditionalTheory]
+     [MemberData(nameof(IsAsyncData))]
+-    public virtual Task Parameter_collection_of_nullable_ints_Contains_int(bool async)
++    public virtual async Task Parameter_collection_of_nullable_ints_Contains_int(bool async)
+     {
+         var nullableInts = new int?[] { 10, 999 };
+ 
+-        return AssertQuery(
++        await AssertQuery(
+             async,
+             ss => ss.Set<PrimitiveCollectionsEntity>().Where(c => nullableInts.Contains(c.Int)));
++        await AssertQuery(
++            async,
++            ss => ss.Set<PrimitiveCollectionsEntity>().Where(c => !nullableInts.Contains(c.Int)));
+     }
+ 
+     [ConditionalTheory]
+     [MemberData(nameof(IsAsyncData))]
+-    public virtual Task Parameter_collection_of_nullable_ints_Contains_nullable_int(bool async)
++    public virtual async Task Parameter_collection_of_nullable_ints_Contains_nullable_int(bool async)
+     {
+         var nullableInts = new int?[] { null, 999 };
+ 
+-        return AssertQuery(
++        await AssertQuery(
+             async,
+             ss => ss.Set<PrimitiveCollectionsEntity>().Where(c => nullableInts.Contains(c.NullableInt)));
++        await AssertQuery(
++            async,
++            ss => ss.Set<PrimitiveCollectionsEntity>().Where(c => !nullableInts.Contains(c.NullableInt)));
+     }
+ 
+     [ConditionalTheory]
+     [MemberData(nameof(IsAsyncData))]
+-    public virtual Task Parameter_collection_of_strings_Contains_non_nullable_string(bool async)
++    public virtual async Task Parameter_collection_of_strings_Contains_string(bool async)
+     {
+         var strings = new[] { "10", "999" };
+ 
+-        return AssertQuery(
++        await AssertQuery(
++            async,
++            ss => ss.Set<PrimitiveCollectionsEntity>().Where(c => strings.Contains(c.String)));
++        await AssertQuery(
++            async,
++            ss => ss.Set<PrimitiveCollectionsEntity>().Where(c => !strings.Contains(c.String)));
++    }
++
++    [ConditionalTheory]
++    [MemberData(nameof(IsAsyncData))]
++    public virtual async Task Parameter_collection_of_strings_Contains_nullable_string(bool async)
++    {
++        var strings = new[] { "10", "999" };
++
++        await AssertQuery(
++            async,
++            ss => ss.Set<PrimitiveCollectionsEntity>().Where(c => strings.Contains(c.NullableString)));
++        await AssertQuery(
++            async,
++            ss => ss.Set<PrimitiveCollectionsEntity>().Where(c => !strings.Contains(c.NullableString)));
++    }
++
++    [ConditionalTheory]
++    [MemberData(nameof(IsAsyncData))]
++    public virtual async Task Parameter_collection_of_nullable_strings_Contains_string(bool async)
++    {
++        var strings = new[] { "10", null };
++
++        await AssertQuery(
+             async,
+             ss => ss.Set<PrimitiveCollectionsEntity>().Where(c => strings.Contains(c.String)));
++        await AssertQuery(
++            async,
++            ss => ss.Set<PrimitiveCollectionsEntity>().Where(c => !strings.Contains(c.String)));
+     }
+ 
+     [ConditionalTheory]
+     [MemberData(nameof(IsAsyncData))]
+-    public virtual Task Parameter_collection_of_strings_Contains_nullable_string(bool async)
++    public virtual async Task Parameter_collection_of_nullable_strings_Contains_nullable_string(bool async)
+     {
+         var strings = new[] { "999", null };
+ 
+-        return AssertQuery(
++        await AssertQuery(
+             async,
+             ss => ss.Set<PrimitiveCollectionsEntity>().Where(c => strings.Contains(c.NullableString)));
++        await AssertQuery(
++            async,
++            ss => ss.Set<PrimitiveCollectionsEntity>().Where(c => !strings.Contains(c.NullableString)));
+     }
+ 
++    // See more nullability-related tests in NullSemanticsQueryTestBase
++
+     [ConditionalTheory]
+     [MemberData(nameof(IsAsyncData))]
+     public virtual Task Parameter_collection_of_DateTimes_Contains(bool async)
+diff --git a/test/EFCore.SqlServer.FunctionalTests/Query/ComplexNavigationsCollectionsQuerySqlServerTest.cs b/test/EFCore.SqlServer.FunctionalTests/Query/ComplexNavigationsCollectionsQuerySqlServerTest.cs
+index 16856bddb9..3140be10e7 100644
+--- a/test/EFCore.SqlServer.FunctionalTests/Query/ComplexNavigationsCollectionsQuerySqlServerTest.cs
++++ b/test/EFCore.SqlServer.FunctionalTests/Query/ComplexNavigationsCollectionsQuerySqlServerTest.cs
+@@ -1223,10 +1223,10 @@ SELECT CASE
+ FROM [LevelOne] AS [l]
+ LEFT JOIN [LevelTwo] AS [l0] ON [l].[Id] = [l0].[Level1_Required_Id]
+ LEFT JOIN [LevelThree] AS [l1] ON [l0].[Id] = [l1].[OneToMany_Required_Inverse3Id]
+-WHERE EXISTS (
+-    SELECT 1
++WHERE [l].[Name] IN (
++    SELECT [v].[value]
+     FROM OPENJSON(@__validIds_0) WITH ([value] nvarchar(max) '$') AS [v]
+-    WHERE [v].[value] = [l].[Name] OR ([v].[value] IS NULL AND [l].[Name] IS NULL))
++)
+ ORDER BY [l].[Id], [l0].[Id]
+ """);
+     }
+@@ -2336,19 +2336,19 @@ public override async Task Collection_projection_over_GroupBy_over_parameter(boo
+ FROM (
+     SELECT [l].[Date]
+     FROM [LevelOne] AS [l]
+-    WHERE EXISTS (
+-        SELECT 1
++    WHERE [l].[Name] IN (
++        SELECT [v].[value]
+         FROM OPENJSON(@__validIds_0) WITH ([value] nvarchar(max) '$') AS [v]
+-        WHERE [v].[value] = [l].[Name] OR ([v].[value] IS NULL AND [l].[Name] IS NULL))
++    )
+     GROUP BY [l].[Date]
+ ) AS [t]
+ LEFT JOIN (
+     SELECT [l0].[Id], [l0].[Date]
+     FROM [LevelOne] AS [l0]
+-    WHERE EXISTS (
+-        SELECT 1
++    WHERE [l0].[Name] IN (
++        SELECT [v0].[value]
+         FROM OPENJSON(@__validIds_0) WITH ([value] nvarchar(max) '$') AS [v0]
+-        WHERE [v0].[value] = [l0].[Name] OR ([v0].[value] IS NULL AND [l0].[Name] IS NULL))
++    )
+ ) AS [t0] ON [t].[Date] = [t0].[Date]
+ ORDER BY [t].[Date]
+ """);
+diff --git a/test/EFCore.SqlServer.FunctionalTests/Query/ComplexNavigationsCollectionsSharedTypeQuerySqlServerTest.cs b/test/EFCore.SqlServer.FunctionalTests/Query/ComplexNavigationsCollectionsSharedTypeQuerySqlServerTest.cs
+index 5a378336dc..d4b57543b6 100644
+--- a/test/EFCore.SqlServer.FunctionalTests/Query/ComplexNavigationsCollectionsSharedTypeQuerySqlServerTest.cs
++++ b/test/EFCore.SqlServer.FunctionalTests/Query/ComplexNavigationsCollectionsSharedTypeQuerySqlServerTest.cs
+@@ -2874,10 +2874,10 @@ SELECT CASE
+ ) AS [t1] ON CASE
+     WHEN [t0].[OneToOne_Required_PK_Date] IS NOT NULL AND [t0].[Level1_Required_Id] IS NOT NULL AND [t0].[OneToMany_Required_Inverse2Id] IS NOT NULL THEN [t0].[Id0]
+ END = [t1].[OneToMany_Required_Inverse3Id]
+-WHERE EXISTS (
+-    SELECT 1
++WHERE [l].[Name] IN (
++    SELECT [v].[value]
+     FROM OPENJSON(@__validIds_0) WITH ([value] nvarchar(max) '$') AS [v]
+-    WHERE [v].[value] = [l].[Name] OR ([v].[value] IS NULL AND [l].[Name] IS NULL))
++)
+ ORDER BY [l].[Id], [t0].[Id], [t0].[Id0]
+ """);
+     }
+@@ -3020,19 +3020,19 @@ public override async Task Collection_projection_over_GroupBy_over_parameter(boo
+ FROM (
+     SELECT [l].[Date]
+     FROM [Level1] AS [l]
+-    WHERE EXISTS (
+-        SELECT 1
++    WHERE [l].[Name] IN (
++        SELECT [v].[value]
+         FROM OPENJSON(@__validIds_0) WITH ([value] nvarchar(max) '$') AS [v]
+-        WHERE [v].[value] = [l].[Name] OR ([v].[value] IS NULL AND [l].[Name] IS NULL))
++    )
+     GROUP BY [l].[Date]
+ ) AS [t]
+ LEFT JOIN (
+     SELECT [l0].[Id], [l0].[Date]
+     FROM [Level1] AS [l0]
+-    WHERE EXISTS (
+-        SELECT 1
++    WHERE [l0].[Name] IN (
++        SELECT [v0].[value]
+         FROM OPENJSON(@__validIds_0) WITH ([value] nvarchar(max) '$') AS [v0]
+-        WHERE [v0].[value] = [l0].[Name] OR ([v0].[value] IS NULL AND [l0].[Name] IS NULL))
++    )
+ ) AS [t0] ON [t].[Date] = [t0].[Date]
+ ORDER BY [t].[Date]
+ """);
+diff --git a/test/EFCore.SqlServer.FunctionalTests/Query/ComplexNavigationsCollectionsSplitQuerySqlServerTest.cs b/test/EFCore.SqlServer.FunctionalTests/Query/ComplexNavigationsCollectionsSplitQuerySqlServerTest.cs
+index e0ed399b07..d566fd0f75 100644
+--- a/test/EFCore.SqlServer.FunctionalTests/Query/ComplexNavigationsCollectionsSplitQuerySqlServerTest.cs
++++ b/test/EFCore.SqlServer.FunctionalTests/Query/ComplexNavigationsCollectionsSplitQuerySqlServerTest.cs
+@@ -3195,10 +3195,10 @@ SELECT CASE
+ END, [l].[Id], [l0].[Id]
+ FROM [LevelOne] AS [l]
+ LEFT JOIN [LevelTwo] AS [l0] ON [l].[Id] = [l0].[Level1_Required_Id]
+-WHERE EXISTS (
+-    SELECT 1
++WHERE [l].[Name] IN (
++    SELECT [v].[value]
+     FROM OPENJSON(@__validIds_0) WITH ([value] nvarchar(max) '$') AS [v]
+-    WHERE [v].[value] = [l].[Name] OR ([v].[value] IS NULL AND [l].[Name] IS NULL))
++)
+ ORDER BY [l].[Id], [l0].[Id]
+ """,
+             //
+@@ -3209,10 +3209,10 @@ SELECT 1
+ FROM [LevelOne] AS [l]
+ LEFT JOIN [LevelTwo] AS [l0] ON [l].[Id] = [l0].[Level1_Required_Id]
+ INNER JOIN [LevelThree] AS [l1] ON [l0].[Id] = [l1].[OneToMany_Required_Inverse3Id]
+-WHERE EXISTS (
+-    SELECT 1
++WHERE [l].[Name] IN (
++    SELECT [v].[value]
+     FROM OPENJSON(@__validIds_0) WITH ([value] nvarchar(max) '$') AS [v]
+-    WHERE [v].[value] = [l].[Name] OR ([v].[value] IS NULL AND [l].[Name] IS NULL))
++)
+ ORDER BY [l].[Id], [l0].[Id]
+ """);
+     }
+@@ -3748,10 +3748,10 @@ public override async Task Collection_projection_over_GroupBy_over_parameter(boo
+ 
+ SELECT [l].[Date]
+ FROM [LevelOne] AS [l]
+-WHERE EXISTS (
+-    SELECT 1
++WHERE [l].[Name] IN (
++    SELECT [v].[value]
+     FROM OPENJSON(@__validIds_0) WITH ([value] nvarchar(max) '$') AS [v]
+-    WHERE [v].[value] = [l].[Name] OR ([v].[value] IS NULL AND [l].[Name] IS NULL))
++)
+ GROUP BY [l].[Date]
+ ORDER BY [l].[Date]
+ """,
+@@ -3763,19 +3763,19 @@ SELECT 1
+ FROM (
+     SELECT [l].[Date]
+     FROM [LevelOne] AS [l]
+-    WHERE EXISTS (
+-        SELECT 1
++    WHERE [l].[Name] IN (
++        SELECT [v].[value]
+         FROM OPENJSON(@__validIds_0) WITH ([value] nvarchar(max) '$') AS [v]
+-        WHERE [v].[value] = [l].[Name] OR ([v].[value] IS NULL AND [l].[Name] IS NULL))
++    )
+     GROUP BY [l].[Date]
+ ) AS [t]
+ INNER JOIN (
+     SELECT [l0].[Id], [l0].[Date]
+     FROM [LevelOne] AS [l0]
+-    WHERE EXISTS (
+-        SELECT 1
++    WHERE [l0].[Name] IN (
++        SELECT [v0].[value]
+         FROM OPENJSON(@__validIds_0) WITH ([value] nvarchar(max) '$') AS [v0]
+-        WHERE [v0].[value] = [l0].[Name] OR ([v0].[value] IS NULL AND [l0].[Name] IS NULL))
++    )
+ ) AS [t0] ON [t].[Date] = [t0].[Date]
+ ORDER BY [t].[Date]
+ """);
+diff --git a/test/EFCore.SqlServer.FunctionalTests/Query/ComplexNavigationsQuerySqlServerTest.cs b/test/EFCore.SqlServer.FunctionalTests/Query/ComplexNavigationsQuerySqlServerTest.cs
+index 0be826f004..c9467ce49e 100644
+--- a/test/EFCore.SqlServer.FunctionalTests/Query/ComplexNavigationsQuerySqlServerTest.cs
++++ b/test/EFCore.SqlServer.FunctionalTests/Query/ComplexNavigationsQuerySqlServerTest.cs
+@@ -3086,10 +3086,10 @@ public override async Task Accessing_optional_property_inside_result_operator_su
+ SELECT [l].[Id], [l].[Date], [l].[Name], [l].[OneToMany_Optional_Self_Inverse1Id], [l].[OneToMany_Required_Self_Inverse1Id], [l].[OneToOne_Optional_Self1Id]
+ FROM [LevelOne] AS [l]
+ LEFT JOIN [LevelTwo] AS [l0] ON [l].[Id] = [l0].[Level1_Optional_Id]
+-WHERE NOT EXISTS (
+-    SELECT 1
++WHERE [l0].[Name] NOT IN (
++    SELECT [n].[value]
+     FROM OPENJSON(@__names_0) WITH ([value] nvarchar(max) '$') AS [n]
+-    WHERE [n].[value] = [l0].[Name] OR ([n].[value] IS NULL AND [l0].[Name] IS NULL))
++) OR [l0].[Name] IS NULL
+ """);
+     }
+ 
+diff --git a/test/EFCore.SqlServer.FunctionalTests/Query/ComplexNavigationsSharedTypeQuerySqlServerTest.cs b/test/EFCore.SqlServer.FunctionalTests/Query/ComplexNavigationsSharedTypeQuerySqlServerTest.cs
+index 780481f580..04cdfbd18f 100644
+--- a/test/EFCore.SqlServer.FunctionalTests/Query/ComplexNavigationsSharedTypeQuerySqlServerTest.cs
++++ b/test/EFCore.SqlServer.FunctionalTests/Query/ComplexNavigationsSharedTypeQuerySqlServerTest.cs
+@@ -5433,10 +5433,10 @@ public override async Task Accessing_optional_property_inside_result_operator_su
+     FROM [Level1] AS [l0]
+     WHERE [l0].[OneToOne_Required_PK_Date] IS NOT NULL AND [l0].[Level1_Required_Id] IS NOT NULL AND [l0].[OneToMany_Required_Inverse2Id] IS NOT NULL
+ ) AS [t] ON [l].[Id] = [t].[Level1_Optional_Id]
+-WHERE NOT EXISTS (
+-    SELECT 1
++WHERE [t].[Level2_Name] NOT IN (
++    SELECT [n].[value]
+     FROM OPENJSON(@__names_0) WITH ([value] nvarchar(max) '$') AS [n]
+-    WHERE [n].[value] = [t].[Level2_Name] OR ([n].[value] IS NULL AND [t].[Level2_Name] IS NULL))
++) OR [t].[Level2_Name] IS NULL
+ """);
+     }
+ 
+diff --git a/test/EFCore.SqlServer.FunctionalTests/Query/GearsOfWarQuerySqlServerTest.cs b/test/EFCore.SqlServer.FunctionalTests/Query/GearsOfWarQuerySqlServerTest.cs
+index be5e6f263a..36e2312270 100644
+--- a/test/EFCore.SqlServer.FunctionalTests/Query/GearsOfWarQuerySqlServerTest.cs
++++ b/test/EFCore.SqlServer.FunctionalTests/Query/GearsOfWarQuerySqlServerTest.cs
+@@ -214,10 +214,10 @@ public override async Task Include_where_list_contains_navigation(bool async)
+ SELECT [g].[Nickname], [g].[SquadId], [g].[AssignedCityName], [g].[CityOfBirthName], [g].[Discriminator], [g].[FullName], [g].[HasSoulPatch], [g].[LeaderNickname], [g].[LeaderSquadId], [g].[Rank], [t].[Id], [t].[GearNickName], [t].[GearSquadId], [t].[IssueDate], [t].[Note]
+ FROM [Gears] AS [g]
+ LEFT JOIN [Tags] AS [t] ON [g].[Nickname] = [t].[GearNickName] AND [g].[SquadId] = [t].[GearSquadId]
+-WHERE [t].[Id] IS NOT NULL AND EXISTS (
+-    SELECT 1
++WHERE [t].[Id] IS NOT NULL AND [t].[Id] IN (
++    SELECT [t0].[value]
+     FROM OPENJSON(@__tags_0) WITH ([value] uniqueidentifier '$') AS [t0]
+-    WHERE [t0].[value] = [t].[Id] OR ([t0].[value] IS NULL AND [t].[Id] IS NULL))
++)
+ """);
+     }
+ 
+@@ -238,10 +238,10 @@ public override async Task Include_where_list_contains_navigation2(bool async)
+ FROM [Gears] AS [g]
+ INNER JOIN [Cities] AS [c] ON [g].[CityOfBirthName] = [c].[Name]
+ LEFT JOIN [Tags] AS [t] ON [g].[Nickname] = [t].[GearNickName] AND [g].[SquadId] = [t].[GearSquadId]
+-WHERE [c].[Location] IS NOT NULL AND EXISTS (
+-    SELECT 1
++WHERE [c].[Location] IS NOT NULL AND [t].[Id] IN (
++    SELECT [t0].[value]
+     FROM OPENJSON(@__tags_0) WITH ([value] uniqueidentifier '$') AS [t0]
+-    WHERE [t0].[value] = [t].[Id] OR ([t0].[value] IS NULL AND [t].[Id] IS NULL))
++)
+ """);
+     }
+ 
+@@ -261,10 +261,10 @@ public override async Task Navigation_accessed_twice_outside_and_inside_subquery
+ SELECT [g].[Nickname], [g].[SquadId], [g].[AssignedCityName], [g].[CityOfBirthName], [g].[Discriminator], [g].[FullName], [g].[HasSoulPatch], [g].[LeaderNickname], [g].[LeaderSquadId], [g].[Rank]
+ FROM [Gears] AS [g]
+ LEFT JOIN [Tags] AS [t] ON [g].[Nickname] = [t].[GearNickName] AND [g].[SquadId] = [t].[GearSquadId]
+-WHERE [t].[Id] IS NOT NULL AND EXISTS (
+-    SELECT 1
++WHERE [t].[Id] IS NOT NULL AND [t].[Id] IN (
++    SELECT [t0].[value]
+     FROM OPENJSON(@__tags_0) WITH ([value] uniqueidentifier '$') AS [t0]
+-    WHERE [t0].[value] = [t].[Id] OR ([t0].[value] IS NULL AND [t].[Id] IS NULL))
++)
+ """);
+     }
+ 
+@@ -2102,10 +2102,10 @@ public override async Task Non_unicode_string_literals_in_contains_is_used_for_n
+ 
+ SELECT [c].[Name], [c].[Location], [c].[Nation]
+ FROM [Cities] AS [c]
+-WHERE EXISTS (
+-    SELECT 1
++WHERE [c].[Location] IN (
++    SELECT [c0].[value]
+     FROM OPENJSON(@__cities_0) WITH ([value] varchar(100) '$') AS [c0]
+-    WHERE [c0].[value] = [c].[Location] OR ([c0].[value] IS NULL AND [c].[Location] IS NULL))
++)
+ """);
+     }
+ 
+@@ -3626,15 +3626,15 @@ public override async Task Contains_on_nullable_array_produces_correct_sql(bool
+ 
+         AssertSql(
+             """
+-@__cities_0='["Ephyra",null]' (Size = 4000)
++@__cities_0_without_nulls='["Ephyra"]' (Size = 4000)
+ 
+ SELECT [g].[Nickname], [g].[SquadId], [g].[AssignedCityName], [g].[CityOfBirthName], [g].[Discriminator], [g].[FullName], [g].[HasSoulPatch], [g].[LeaderNickname], [g].[LeaderSquadId], [g].[Rank]
+ FROM [Gears] AS [g]
+ LEFT JOIN [Cities] AS [c] ON [g].[AssignedCityName] = [c].[Name]
+-WHERE [g].[SquadId] < 2 AND EXISTS (
+-    SELECT 1
+-    FROM OPENJSON(@__cities_0) WITH ([value] nvarchar(450) '$') AS [c0]
+-    WHERE [c0].[value] = [c].[Name] OR ([c0].[value] IS NULL AND [c].[Name] IS NULL))
++WHERE [g].[SquadId] < 2 AND ([c].[Name] IN (
++    SELECT [c0].[value]
++    FROM OPENJSON(@__cities_0_without_nulls) AS [c0]
++) OR [c].[Name] IS NULL)
+ """);
+     }
+ 
+@@ -5922,10 +5922,10 @@ public override async Task Correlated_collection_with_complex_order_by_funcletiz
+ FROM [Gears] AS [g]
+ LEFT JOIN [Weapons] AS [w] ON [g].[FullName] = [w].[OwnerFullName]
+ ORDER BY CASE
+-    WHEN EXISTS (
+-        SELECT 1
++    WHEN [g].[Nickname] IN (
++        SELECT [n].[value]
+         FROM OPENJSON(@__nicknames_0) WITH ([value] nvarchar(450) '$') AS [n]
+-        WHERE [n].[value] = [g].[Nickname]) THEN CAST(1 AS bit)
++    ) THEN CAST(1 AS bit)
+     ELSE CAST(0 AS bit)
+ END DESC, [g].[Nickname], [g].[SquadId]
+ """);
+@@ -8140,15 +8140,15 @@ public override async Task Enum_array_contains(bool async)
+ 
+         AssertSql(
+             """
+-@__types_0='[null,1]' (Size = 4000)
++@__types_0_without_nulls='[1]' (Size = 4000)
+ 
+ SELECT [w].[Id], [w].[AmmunitionType], [w].[IsAutomatic], [w].[Name], [w].[OwnerFullName], [w].[SynergyWithId]
+ FROM [Weapons] AS [w]
+ LEFT JOIN [Weapons] AS [w0] ON [w].[SynergyWithId] = [w0].[Id]
+-WHERE [w0].[Id] IS NOT NULL AND EXISTS (
+-    SELECT 1
+-    FROM OPENJSON(@__types_0) WITH ([value] int '$') AS [t]
+-    WHERE [t].[value] = [w0].[AmmunitionType] OR ([t].[value] IS NULL AND [w0].[AmmunitionType] IS NULL))
++WHERE [w0].[Id] IS NOT NULL AND ([w0].[AmmunitionType] IN (
++    SELECT [t].[value]
++    FROM OPENJSON(@__types_0_without_nulls) AS [t]
++) OR [w0].[AmmunitionType] IS NULL)
+ """);
+     }
+ 
+@@ -10181,18 +10181,14 @@ public override async Task Nav_expansion_with_member_pushdown_inside_Contains_ar
+ 
+ SELECT [g].[Nickname], [g].[SquadId], [g].[AssignedCityName], [g].[CityOfBirthName], [g].[Discriminator], [g].[FullName], [g].[HasSoulPatch], [g].[LeaderNickname], [g].[LeaderSquadId], [g].[Rank]
+ FROM [Gears] AS [g]
+-WHERE EXISTS (
+-    SELECT 1
++WHERE (
++    SELECT TOP(1) [w].[Name]
++    FROM [Weapons] AS [w]
++    WHERE [g].[FullName] = [w].[OwnerFullName]
++    ORDER BY [w].[Id]) IN (
++    SELECT [w0].[value]
+     FROM OPENJSON(@__weapons_0) WITH ([value] nvarchar(max) '$') AS [w0]
+-    WHERE [w0].[value] = (
+-        SELECT TOP(1) [w].[Name]
+-        FROM [Weapons] AS [w]
+-        WHERE [g].[FullName] = [w].[OwnerFullName]
+-        ORDER BY [w].[Id]) OR ([w0].[value] IS NULL AND (
+-        SELECT TOP(1) [w].[Name]
+-        FROM [Weapons] AS [w]
+-        WHERE [g].[FullName] = [w].[OwnerFullName]
+-        ORDER BY [w].[Id]) IS NULL))
++)
+ """);
+     }
+ 
+@@ -10377,7 +10373,7 @@ public override async Task Nested_contains_with_enum(bool async)
+         await base.Nested_contains_with_enum(async);
+ 
+         AssertSql(
+-"""
++            """
+ @__ranks_1='[1]' (Size = 4000)
+ @__key_2='5f221fb9-66f4-442a-92c9-d97ed5989cc7'
+ @__keys_0='["0a47bcb7-a1cb-4345-8944-c58f82d6aac7","5f221fb9-66f4-442a-92c9-d97ed5989cc7"]' (Size = 4000)
+@@ -10395,8 +10391,8 @@ ELSE @__key_2
+     FROM OPENJSON(@__keys_0) WITH ([value] uniqueidentifier '$') AS [k]
+ )
+ """,
+-                //
+-                """
++            //
++            """
+ @__ammoTypes_1='[1]' (Size = 4000)
+ @__key_2='5f221fb9-66f4-442a-92c9-d97ed5989cc7'
+ @__keys_0='["0a47bcb7-a1cb-4345-8944-c58f82d6aac7","5f221fb9-66f4-442a-92c9-d97ed5989cc7"]' (Size = 4000)
+@@ -10404,10 +10400,10 @@ ELSE @__key_2
+ SELECT [w].[Id], [w].[AmmunitionType], [w].[IsAutomatic], [w].[Name], [w].[OwnerFullName], [w].[SynergyWithId]
+ FROM [Weapons] AS [w]
+ WHERE CASE
+-    WHEN EXISTS (
+-        SELECT 1
++    WHEN [w].[AmmunitionType] IN (
++        SELECT [a].[value]
+         FROM OPENJSON(@__ammoTypes_1) WITH ([value] int '$') AS [a]
+-        WHERE [a].[value] = [w].[AmmunitionType] OR ([a].[value] IS NULL AND [w].[AmmunitionType] IS NULL)) THEN @__key_2
++    ) THEN @__key_2
+     ELSE @__key_2
+ END IN (
+     SELECT [k].[value]
+diff --git a/test/EFCore.SqlServer.FunctionalTests/Query/NorthwindAggregateOperatorsQuerySqlServerTest.cs b/test/EFCore.SqlServer.FunctionalTests/Query/NorthwindAggregateOperatorsQuerySqlServerTest.cs
+index f292a077e5..404b481368 100644
+--- a/test/EFCore.SqlServer.FunctionalTests/Query/NorthwindAggregateOperatorsQuerySqlServerTest.cs
++++ b/test/EFCore.SqlServer.FunctionalTests/Query/NorthwindAggregateOperatorsQuerySqlServerTest.cs
+@@ -1585,10 +1585,10 @@ public override async Task Contains_with_subquery_and_local_array_closure(bool a
+ WHERE EXISTS (
+     SELECT 1
+     FROM [Customers] AS [c0]
+-    WHERE EXISTS (
+-        SELECT 1
++    WHERE [c0].[City] IN (
++        SELECT [i].[value]
+         FROM OPENJSON(@__ids_0) WITH ([value] nvarchar(15) '$') AS [i]
+-        WHERE [i].[value] = [c0].[City] OR ([i].[value] IS NULL AND [c0].[City] IS NULL)) AND [c0].[CustomerID] = [c].[CustomerID])
++    ) AND [c0].[CustomerID] = [c].[CustomerID])
+ """,
+             //
+             """
+@@ -1599,10 +1599,10 @@ SELECT 1
+ WHERE EXISTS (
+     SELECT 1
+     FROM [Customers] AS [c0]
+-    WHERE EXISTS (
+-        SELECT 1
++    WHERE [c0].[City] IN (
++        SELECT [i].[value]
+         FROM OPENJSON(@__ids_0) WITH ([value] nvarchar(15) '$') AS [i]
+-        WHERE [i].[value] = [c0].[City] OR ([i].[value] IS NULL AND [c0].[City] IS NULL)) AND [c0].[CustomerID] = [c].[CustomerID])
++    ) AND [c0].[CustomerID] = [c].[CustomerID])
+ """);
+     }
+ 
+@@ -2076,10 +2076,10 @@ public override async Task Contains_with_local_collection_false(bool async)
+ 
+ SELECT [c].[CustomerID], [c].[Address], [c].[City], [c].[CompanyName], [c].[ContactName], [c].[ContactTitle], [c].[Country], [c].[Fax], [c].[Phone], [c].[PostalCode], [c].[Region]
+ FROM [Customers] AS [c]
+-WHERE NOT EXISTS (
+-    SELECT 1
++WHERE [c].[CustomerID] NOT IN (
++    SELECT [i].[value]
+     FROM OPENJSON(@__ids_0) WITH ([value] nchar(5) '$') AS [i]
+-    WHERE [i].[value] = [c].[CustomerID])
++)
+ """);
+     }
+ 
+@@ -2683,10 +2683,10 @@ public override async Task Where_subquery_all_not_equals_operator(bool async)
+ 
+ SELECT [c].[CustomerID], [c].[Address], [c].[City], [c].[CompanyName], [c].[ContactName], [c].[ContactTitle], [c].[Country], [c].[Fax], [c].[Phone], [c].[PostalCode], [c].[Region]
+ FROM [Customers] AS [c]
+-WHERE NOT EXISTS (
+-    SELECT 1
++WHERE [c].[CustomerID] NOT IN (
++    SELECT [i].[value]
+     FROM OPENJSON(@__ids_0) WITH ([value] nchar(5) '$') AS [i]
+-    WHERE [i].[value] = [c].[CustomerID])
++)
+ """);
+     }
+ 
+@@ -2712,10 +2712,10 @@ public override async Task Where_subquery_all_not_equals_static(bool async)
+ 
+ SELECT [c].[CustomerID], [c].[Address], [c].[City], [c].[CompanyName], [c].[ContactName], [c].[ContactTitle], [c].[Country], [c].[Fax], [c].[Phone], [c].[PostalCode], [c].[Region]
+ FROM [Customers] AS [c]
+-WHERE NOT EXISTS (
+-    SELECT 1
++WHERE [c].[CustomerID] NOT IN (
++    SELECT [i].[value]
+     FROM OPENJSON(@__ids_0) WITH ([value] nchar(5) '$') AS [i]
+-    WHERE [i].[value] = [c].[CustomerID])
++)
+ """);
+     }
+ 
+@@ -2729,10 +2729,10 @@ public override async Task Where_subquery_where_all(bool async)
+ 
+ SELECT [c].[CustomerID], [c].[Address], [c].[City], [c].[CompanyName], [c].[ContactName], [c].[ContactTitle], [c].[Country], [c].[Fax], [c].[Phone], [c].[PostalCode], [c].[Region]
+ FROM [Customers] AS [c]
+-WHERE [c].[City] = N'México D.F.' AND NOT EXISTS (
+-    SELECT 1
++WHERE [c].[City] = N'México D.F.' AND [c].[CustomerID] NOT IN (
++    SELECT [i].[value]
+     FROM OPENJSON(@__ids_0) WITH ([value] nchar(5) '$') AS [i]
+-    WHERE [i].[value] = [c].[CustomerID])
++)
+ """,
+             //
+             """
+@@ -2740,10 +2740,10 @@ SELECT 1
+ 
+ SELECT [c].[CustomerID], [c].[Address], [c].[City], [c].[CompanyName], [c].[ContactName], [c].[ContactTitle], [c].[Country], [c].[Fax], [c].[Phone], [c].[PostalCode], [c].[Region]
+ FROM [Customers] AS [c]
+-WHERE [c].[City] = N'México D.F.' AND NOT EXISTS (
+-    SELECT 1
++WHERE [c].[City] = N'México D.F.' AND [c].[CustomerID] NOT IN (
++    SELECT [i].[value]
+     FROM OPENJSON(@__ids_0) WITH ([value] nchar(5) '$') AS [i]
+-    WHERE [i].[value] = [c].[CustomerID])
++)
+ """);
+     }
+ 
+diff --git a/test/EFCore.SqlServer.FunctionalTests/Query/NorthwindEFPropertyIncludeQuerySqlServerTest.cs b/test/EFCore.SqlServer.FunctionalTests/Query/NorthwindEFPropertyIncludeQuerySqlServerTest.cs
+index f4996803e2..c6d8bd20fd 100644
+--- a/test/EFCore.SqlServer.FunctionalTests/Query/NorthwindEFPropertyIncludeQuerySqlServerTest.cs
++++ b/test/EFCore.SqlServer.FunctionalTests/Query/NorthwindEFPropertyIncludeQuerySqlServerTest.cs
+@@ -621,19 +621,19 @@ public override async Task Include_collection_OrderBy_list_does_not_contains(boo
+ SELECT [t].[CustomerID], [t].[Address], [t].[City], [t].[CompanyName], [t].[ContactName], [t].[ContactTitle], [t].[Country], [t].[Fax], [t].[Phone], [t].[PostalCode], [t].[Region], [o].[OrderID], [o].[CustomerID], [o].[EmployeeID], [o].[OrderDate]
+ FROM (
+     SELECT [c].[CustomerID], [c].[Address], [c].[City], [c].[CompanyName], [c].[ContactName], [c].[ContactTitle], [c].[Country], [c].[Fax], [c].[Phone], [c].[PostalCode], [c].[Region], CASE
+-        WHEN NOT EXISTS (
+-            SELECT 1
++        WHEN [c].[CustomerID] NOT IN (
++            SELECT [l].[value]
+             FROM OPENJSON(@__list_0) WITH ([value] nchar(5) '$') AS [l]
+-            WHERE [l].[value] = [c].[CustomerID]) THEN CAST(1 AS bit)
++        ) THEN CAST(1 AS bit)
+         ELSE CAST(0 AS bit)
+     END AS [c]
+     FROM [Customers] AS [c]
+     WHERE [c].[CustomerID] LIKE N'A%'
+     ORDER BY CASE
+-        WHEN NOT EXISTS (
+-            SELECT 1
++        WHEN [c].[CustomerID] NOT IN (
++            SELECT [l].[value]
+             FROM OPENJSON(@__list_0) WITH ([value] nchar(5) '$') AS [l]
+-            WHERE [l].[value] = [c].[CustomerID]) THEN CAST(1 AS bit)
++        ) THEN CAST(1 AS bit)
+         ELSE CAST(0 AS bit)
+     END
+     OFFSET @__p_1 ROWS
+@@ -969,19 +969,19 @@ public override async Task Include_collection_OrderBy_empty_list_contains(bool a
+ SELECT [t].[CustomerID], [t].[Address], [t].[City], [t].[CompanyName], [t].[ContactName], [t].[ContactTitle], [t].[Country], [t].[Fax], [t].[Phone], [t].[PostalCode], [t].[Region], [o].[OrderID], [o].[CustomerID], [o].[EmployeeID], [o].[OrderDate]
+ FROM (
+     SELECT [c].[CustomerID], [c].[Address], [c].[City], [c].[CompanyName], [c].[ContactName], [c].[ContactTitle], [c].[Country], [c].[Fax], [c].[Phone], [c].[PostalCode], [c].[Region], CASE
+-        WHEN EXISTS (
+-            SELECT 1
++        WHEN [c].[CustomerID] IN (
++            SELECT [l].[value]
+             FROM OPENJSON(@__list_0) WITH ([value] nchar(5) '$') AS [l]
+-            WHERE [l].[value] = [c].[CustomerID]) THEN CAST(1 AS bit)
++        ) THEN CAST(1 AS bit)
+         ELSE CAST(0 AS bit)
+     END AS [c]
+     FROM [Customers] AS [c]
+     WHERE [c].[CustomerID] LIKE N'A%'
+     ORDER BY CASE
+-        WHEN EXISTS (
+-            SELECT 1
++        WHEN [c].[CustomerID] IN (
++            SELECT [l].[value]
+             FROM OPENJSON(@__list_0) WITH ([value] nchar(5) '$') AS [l]
+-            WHERE [l].[value] = [c].[CustomerID]) THEN CAST(1 AS bit)
++        ) THEN CAST(1 AS bit)
+         ELSE CAST(0 AS bit)
+     END
+     OFFSET @__p_1 ROWS
+@@ -1365,19 +1365,19 @@ public override async Task Include_collection_OrderBy_list_contains(bool async)
+ SELECT [t].[CustomerID], [t].[Address], [t].[City], [t].[CompanyName], [t].[ContactName], [t].[ContactTitle], [t].[Country], [t].[Fax], [t].[Phone], [t].[PostalCode], [t].[Region], [o].[OrderID], [o].[CustomerID], [o].[EmployeeID], [o].[OrderDate]
+ FROM (
+     SELECT [c].[CustomerID], [c].[Address], [c].[City], [c].[CompanyName], [c].[ContactName], [c].[ContactTitle], [c].[Country], [c].[Fax], [c].[Phone], [c].[PostalCode], [c].[Region], CASE
+-        WHEN EXISTS (
+-            SELECT 1
++        WHEN [c].[CustomerID] IN (
++            SELECT [l].[value]
+             FROM OPENJSON(@__list_0) WITH ([value] nchar(5) '$') AS [l]
+-            WHERE [l].[value] = [c].[CustomerID]) THEN CAST(1 AS bit)
++        ) THEN CAST(1 AS bit)
+         ELSE CAST(0 AS bit)
+     END AS [c]
+     FROM [Customers] AS [c]
+     WHERE [c].[CustomerID] LIKE N'A%'
+     ORDER BY CASE
+-        WHEN EXISTS (
+-            SELECT 1
++        WHEN [c].[CustomerID] IN (
++            SELECT [l].[value]
+             FROM OPENJSON(@__list_0) WITH ([value] nchar(5) '$') AS [l]
+-            WHERE [l].[value] = [c].[CustomerID]) THEN CAST(1 AS bit)
++        ) THEN CAST(1 AS bit)
+         ELSE CAST(0 AS bit)
+     END
+     OFFSET @__p_1 ROWS
+@@ -1844,19 +1844,19 @@ public override async Task Include_collection_OrderBy_empty_list_does_not_contai
+ SELECT [t].[CustomerID], [t].[Address], [t].[City], [t].[CompanyName], [t].[ContactName], [t].[ContactTitle], [t].[Country], [t].[Fax], [t].[Phone], [t].[PostalCode], [t].[Region], [o].[OrderID], [o].[CustomerID], [o].[EmployeeID], [o].[OrderDate]
+ FROM (
+     SELECT [c].[CustomerID], [c].[Address], [c].[City], [c].[CompanyName], [c].[ContactName], [c].[ContactTitle], [c].[Country], [c].[Fax], [c].[Phone], [c].[PostalCode], [c].[Region], CASE
+-        WHEN NOT EXISTS (
+-            SELECT 1
++        WHEN [c].[CustomerID] NOT IN (
++            SELECT [l].[value]
+             FROM OPENJSON(@__list_0) WITH ([value] nchar(5) '$') AS [l]
+-            WHERE [l].[value] = [c].[CustomerID]) THEN CAST(1 AS bit)
++        ) THEN CAST(1 AS bit)
+         ELSE CAST(0 AS bit)
+     END AS [c]
+     FROM [Customers] AS [c]
+     WHERE [c].[CustomerID] LIKE N'A%'
+     ORDER BY CASE
+-        WHEN NOT EXISTS (
+-            SELECT 1
++        WHEN [c].[CustomerID] NOT IN (
++            SELECT [l].[value]
+             FROM OPENJSON(@__list_0) WITH ([value] nchar(5) '$') AS [l]
+-            WHERE [l].[value] = [c].[CustomerID]) THEN CAST(1 AS bit)
++        ) THEN CAST(1 AS bit)
+         ELSE CAST(0 AS bit)
+     END
+     OFFSET @__p_1 ROWS
+diff --git a/test/EFCore.SqlServer.FunctionalTests/Query/NorthwindIncludeNoTrackingQuerySqlServerTest.cs b/test/EFCore.SqlServer.FunctionalTests/Query/NorthwindIncludeNoTrackingQuerySqlServerTest.cs
+index d1e415dfd5..149e191859 100644
+--- a/test/EFCore.SqlServer.FunctionalTests/Query/NorthwindIncludeNoTrackingQuerySqlServerTest.cs
++++ b/test/EFCore.SqlServer.FunctionalTests/Query/NorthwindIncludeNoTrackingQuerySqlServerTest.cs
+@@ -175,19 +175,19 @@ public override async Task Include_collection_OrderBy_list_does_not_contains(boo
+ SELECT [t].[CustomerID], [t].[Address], [t].[City], [t].[CompanyName], [t].[ContactName], [t].[ContactTitle], [t].[Country], [t].[Fax], [t].[Phone], [t].[PostalCode], [t].[Region], [o].[OrderID], [o].[CustomerID], [o].[EmployeeID], [o].[OrderDate]
+ FROM (
+     SELECT [c].[CustomerID], [c].[Address], [c].[City], [c].[CompanyName], [c].[ContactName], [c].[ContactTitle], [c].[Country], [c].[Fax], [c].[Phone], [c].[PostalCode], [c].[Region], CASE
+-        WHEN NOT EXISTS (
+-            SELECT 1
++        WHEN [c].[CustomerID] NOT IN (
++            SELECT [l].[value]
+             FROM OPENJSON(@__list_0) WITH ([value] nchar(5) '$') AS [l]
+-            WHERE [l].[value] = [c].[CustomerID]) THEN CAST(1 AS bit)
++        ) THEN CAST(1 AS bit)
+         ELSE CAST(0 AS bit)
+     END AS [c]
+     FROM [Customers] AS [c]
+     WHERE [c].[CustomerID] LIKE N'A%'
+     ORDER BY CASE
+-        WHEN NOT EXISTS (
+-            SELECT 1
++        WHEN [c].[CustomerID] NOT IN (
++            SELECT [l].[value]
+             FROM OPENJSON(@__list_0) WITH ([value] nchar(5) '$') AS [l]
+-            WHERE [l].[value] = [c].[CustomerID]) THEN CAST(1 AS bit)
++        ) THEN CAST(1 AS bit)
+         ELSE CAST(0 AS bit)
+     END
+     OFFSET @__p_1 ROWS
+@@ -457,19 +457,19 @@ public override async Task Include_collection_OrderBy_list_contains(bool async)
+ SELECT [t].[CustomerID], [t].[Address], [t].[City], [t].[CompanyName], [t].[ContactName], [t].[ContactTitle], [t].[Country], [t].[Fax], [t].[Phone], [t].[PostalCode], [t].[Region], [o].[OrderID], [o].[CustomerID], [o].[EmployeeID], [o].[OrderDate]
+ FROM (
+     SELECT [c].[CustomerID], [c].[Address], [c].[City], [c].[CompanyName], [c].[ContactName], [c].[ContactTitle], [c].[Country], [c].[Fax], [c].[Phone], [c].[PostalCode], [c].[Region], CASE
+-        WHEN EXISTS (
+-            SELECT 1
++        WHEN [c].[CustomerID] IN (
++            SELECT [l].[value]
+             FROM OPENJSON(@__list_0) WITH ([value] nchar(5) '$') AS [l]
+-            WHERE [l].[value] = [c].[CustomerID]) THEN CAST(1 AS bit)
++        ) THEN CAST(1 AS bit)
+         ELSE CAST(0 AS bit)
+     END AS [c]
+     FROM [Customers] AS [c]
+     WHERE [c].[CustomerID] LIKE N'A%'
+     ORDER BY CASE
+-        WHEN EXISTS (
+-            SELECT 1
++        WHEN [c].[CustomerID] IN (
++            SELECT [l].[value]
+             FROM OPENJSON(@__list_0) WITH ([value] nchar(5) '$') AS [l]
+-            WHERE [l].[value] = [c].[CustomerID]) THEN CAST(1 AS bit)
++        ) THEN CAST(1 AS bit)
+         ELSE CAST(0 AS bit)
+     END
+     OFFSET @__p_1 ROWS
+@@ -2058,19 +2058,19 @@ public override async Task Include_collection_OrderBy_empty_list_contains(bool a
+ SELECT [t].[CustomerID], [t].[Address], [t].[City], [t].[CompanyName], [t].[ContactName], [t].[ContactTitle], [t].[Country], [t].[Fax], [t].[Phone], [t].[PostalCode], [t].[Region], [o].[OrderID], [o].[CustomerID], [o].[EmployeeID], [o].[OrderDate]
+ FROM (
+     SELECT [c].[CustomerID], [c].[Address], [c].[City], [c].[CompanyName], [c].[ContactName], [c].[ContactTitle], [c].[Country], [c].[Fax], [c].[Phone], [c].[PostalCode], [c].[Region], CASE
+-        WHEN EXISTS (
+-            SELECT 1
++        WHEN [c].[CustomerID] IN (
++            SELECT [l].[value]
+             FROM OPENJSON(@__list_0) WITH ([value] nchar(5) '$') AS [l]
+-            WHERE [l].[value] = [c].[CustomerID]) THEN CAST(1 AS bit)
++        ) THEN CAST(1 AS bit)
+         ELSE CAST(0 AS bit)
+     END AS [c]
+     FROM [Customers] AS [c]
+     WHERE [c].[CustomerID] LIKE N'A%'
+     ORDER BY CASE
+-        WHEN EXISTS (
+-            SELECT 1
++        WHEN [c].[CustomerID] IN (
++            SELECT [l].[value]
+             FROM OPENJSON(@__list_0) WITH ([value] nchar(5) '$') AS [l]
+-            WHERE [l].[value] = [c].[CustomerID]) THEN CAST(1 AS bit)
++        ) THEN CAST(1 AS bit)
+         ELSE CAST(0 AS bit)
+     END
+     OFFSET @__p_1 ROWS
+@@ -2092,19 +2092,19 @@ public override async Task Include_collection_OrderBy_empty_list_does_not_contai
+ SELECT [t].[CustomerID], [t].[Address], [t].[City], [t].[CompanyName], [t].[ContactName], [t].[ContactTitle], [t].[Country], [t].[Fax], [t].[Phone], [t].[PostalCode], [t].[Region], [o].[OrderID], [o].[CustomerID], [o].[EmployeeID], [o].[OrderDate]
+ FROM (
+     SELECT [c].[CustomerID], [c].[Address], [c].[City], [c].[CompanyName], [c].[ContactName], [c].[ContactTitle], [c].[Country], [c].[Fax], [c].[Phone], [c].[PostalCode], [c].[Region], CASE
+-        WHEN NOT EXISTS (
+-            SELECT 1
++        WHEN [c].[CustomerID] NOT IN (
++            SELECT [l].[value]
+             FROM OPENJSON(@__list_0) WITH ([value] nchar(5) '$') AS [l]
+-            WHERE [l].[value] = [c].[CustomerID]) THEN CAST(1 AS bit)
++        ) THEN CAST(1 AS bit)
+         ELSE CAST(0 AS bit)
+     END AS [c]
+     FROM [Customers] AS [c]
+     WHERE [c].[CustomerID] LIKE N'A%'
+     ORDER BY CASE
+-        WHEN NOT EXISTS (
+-            SELECT 1
++        WHEN [c].[CustomerID] NOT IN (
++            SELECT [l].[value]
+             FROM OPENJSON(@__list_0) WITH ([value] nchar(5) '$') AS [l]
+-            WHERE [l].[value] = [c].[CustomerID]) THEN CAST(1 AS bit)
++        ) THEN CAST(1 AS bit)
+         ELSE CAST(0 AS bit)
+     END
+     OFFSET @__p_1 ROWS
+diff --git a/test/EFCore.SqlServer.FunctionalTests/Query/NorthwindIncludeQuerySqlServerTest.cs b/test/EFCore.SqlServer.FunctionalTests/Query/NorthwindIncludeQuerySqlServerTest.cs
+index 46d0cdb238..619f591287 100644
+--- a/test/EFCore.SqlServer.FunctionalTests/Query/NorthwindIncludeQuerySqlServerTest.cs
++++ b/test/EFCore.SqlServer.FunctionalTests/Query/NorthwindIncludeQuerySqlServerTest.cs
+@@ -1508,19 +1508,19 @@ public override async Task Include_collection_OrderBy_empty_list_contains(bool a
+ SELECT [t].[CustomerID], [t].[Address], [t].[City], [t].[CompanyName], [t].[ContactName], [t].[ContactTitle], [t].[Country], [t].[Fax], [t].[Phone], [t].[PostalCode], [t].[Region], [o].[OrderID], [o].[CustomerID], [o].[EmployeeID], [o].[OrderDate]
+ FROM (
+     SELECT [c].[CustomerID], [c].[Address], [c].[City], [c].[CompanyName], [c].[ContactName], [c].[ContactTitle], [c].[Country], [c].[Fax], [c].[Phone], [c].[PostalCode], [c].[Region], CASE
+-        WHEN EXISTS (
+-            SELECT 1
++        WHEN [c].[CustomerID] IN (
++            SELECT [l].[value]
+             FROM OPENJSON(@__list_0) WITH ([value] nchar(5) '$') AS [l]
+-            WHERE [l].[value] = [c].[CustomerID]) THEN CAST(1 AS bit)
++        ) THEN CAST(1 AS bit)
+         ELSE CAST(0 AS bit)
+     END AS [c]
+     FROM [Customers] AS [c]
+     WHERE [c].[CustomerID] LIKE N'A%'
+     ORDER BY CASE
+-        WHEN EXISTS (
+-            SELECT 1
++        WHEN [c].[CustomerID] IN (
++            SELECT [l].[value]
+             FROM OPENJSON(@__list_0) WITH ([value] nchar(5) '$') AS [l]
+-            WHERE [l].[value] = [c].[CustomerID]) THEN CAST(1 AS bit)
++        ) THEN CAST(1 AS bit)
+         ELSE CAST(0 AS bit)
+     END
+     OFFSET @__p_1 ROWS
+@@ -1542,19 +1542,19 @@ public override async Task Include_collection_OrderBy_empty_list_does_not_contai
+ SELECT [t].[CustomerID], [t].[Address], [t].[City], [t].[CompanyName], [t].[ContactName], [t].[ContactTitle], [t].[Country], [t].[Fax], [t].[Phone], [t].[PostalCode], [t].[Region], [o].[OrderID], [o].[CustomerID], [o].[EmployeeID], [o].[OrderDate]
+ FROM (
+     SELECT [c].[CustomerID], [c].[Address], [c].[City], [c].[CompanyName], [c].[ContactName], [c].[ContactTitle], [c].[Country], [c].[Fax], [c].[Phone], [c].[PostalCode], [c].[Region], CASE
+-        WHEN NOT EXISTS (
+-            SELECT 1
++        WHEN [c].[CustomerID] NOT IN (
++            SELECT [l].[value]
+             FROM OPENJSON(@__list_0) WITH ([value] nchar(5) '$') AS [l]
+-            WHERE [l].[value] = [c].[CustomerID]) THEN CAST(1 AS bit)
++        ) THEN CAST(1 AS bit)
+         ELSE CAST(0 AS bit)
+     END AS [c]
+     FROM [Customers] AS [c]
+     WHERE [c].[CustomerID] LIKE N'A%'
+     ORDER BY CASE
+-        WHEN NOT EXISTS (
+-            SELECT 1
++        WHEN [c].[CustomerID] NOT IN (
++            SELECT [l].[value]
+             FROM OPENJSON(@__list_0) WITH ([value] nchar(5) '$') AS [l]
+-            WHERE [l].[value] = [c].[CustomerID]) THEN CAST(1 AS bit)
++        ) THEN CAST(1 AS bit)
+         ELSE CAST(0 AS bit)
+     END
+     OFFSET @__p_1 ROWS
+@@ -1576,19 +1576,19 @@ public override async Task Include_collection_OrderBy_list_contains(bool async)
+ SELECT [t].[CustomerID], [t].[Address], [t].[City], [t].[CompanyName], [t].[ContactName], [t].[ContactTitle], [t].[Country], [t].[Fax], [t].[Phone], [t].[PostalCode], [t].[Region], [o].[OrderID], [o].[CustomerID], [o].[EmployeeID], [o].[OrderDate]
+ FROM (
+     SELECT [c].[CustomerID], [c].[Address], [c].[City], [c].[CompanyName], [c].[ContactName], [c].[ContactTitle], [c].[Country], [c].[Fax], [c].[Phone], [c].[PostalCode], [c].[Region], CASE
+-        WHEN EXISTS (
+-            SELECT 1
++        WHEN [c].[CustomerID] IN (
++            SELECT [l].[value]
+             FROM OPENJSON(@__list_0) WITH ([value] nchar(5) '$') AS [l]
+-            WHERE [l].[value] = [c].[CustomerID]) THEN CAST(1 AS bit)
++        ) THEN CAST(1 AS bit)
+         ELSE CAST(0 AS bit)
+     END AS [c]
+     FROM [Customers] AS [c]
+     WHERE [c].[CustomerID] LIKE N'A%'
+     ORDER BY CASE
+-        WHEN EXISTS (
+-            SELECT 1
++        WHEN [c].[CustomerID] IN (
++            SELECT [l].[value]
+             FROM OPENJSON(@__list_0) WITH ([value] nchar(5) '$') AS [l]
+-            WHERE [l].[value] = [c].[CustomerID]) THEN CAST(1 AS bit)
++        ) THEN CAST(1 AS bit)
+         ELSE CAST(0 AS bit)
+     END
+     OFFSET @__p_1 ROWS
+@@ -1610,19 +1610,19 @@ public override async Task Include_collection_OrderBy_list_does_not_contains(boo
+ SELECT [t].[CustomerID], [t].[Address], [t].[City], [t].[CompanyName], [t].[ContactName], [t].[ContactTitle], [t].[Country], [t].[Fax], [t].[Phone], [t].[PostalCode], [t].[Region], [o].[OrderID], [o].[CustomerID], [o].[EmployeeID], [o].[OrderDate]
+ FROM (
+     SELECT [c].[CustomerID], [c].[Address], [c].[City], [c].[CompanyName], [c].[ContactName], [c].[ContactTitle], [c].[Country], [c].[Fax], [c].[Phone], [c].[PostalCode], [c].[Region], CASE
+-        WHEN NOT EXISTS (
+-            SELECT 1
++        WHEN [c].[CustomerID] NOT IN (
++            SELECT [l].[value]
+             FROM OPENJSON(@__list_0) WITH ([value] nchar(5) '$') AS [l]
+-            WHERE [l].[value] = [c].[CustomerID]) THEN CAST(1 AS bit)
++        ) THEN CAST(1 AS bit)
+         ELSE CAST(0 AS bit)
+     END AS [c]
+     FROM [Customers] AS [c]
+     WHERE [c].[CustomerID] LIKE N'A%'
+     ORDER BY CASE
+-        WHEN NOT EXISTS (
+-            SELECT 1
++        WHEN [c].[CustomerID] NOT IN (
++            SELECT [l].[value]
+             FROM OPENJSON(@__list_0) WITH ([value] nchar(5) '$') AS [l]
+-            WHERE [l].[value] = [c].[CustomerID]) THEN CAST(1 AS bit)
++        ) THEN CAST(1 AS bit)
+         ELSE CAST(0 AS bit)
+     END
+     OFFSET @__p_1 ROWS
+diff --git a/test/EFCore.SqlServer.FunctionalTests/Query/NorthwindMiscellaneousQuerySqlServerTest.cs b/test/EFCore.SqlServer.FunctionalTests/Query/NorthwindMiscellaneousQuerySqlServerTest.cs
+index d447e5a3bb..7098c6d2fc 100644
+--- a/test/EFCore.SqlServer.FunctionalTests/Query/NorthwindMiscellaneousQuerySqlServerTest.cs
++++ b/test/EFCore.SqlServer.FunctionalTests/Query/NorthwindMiscellaneousQuerySqlServerTest.cs
+@@ -5087,10 +5087,10 @@ public override async Task OrderBy_empty_list_contains(bool async)
+ SELECT [c].[CustomerID], [c].[Address], [c].[City], [c].[CompanyName], [c].[ContactName], [c].[ContactTitle], [c].[Country], [c].[Fax], [c].[Phone], [c].[PostalCode], [c].[Region]
+ FROM [Customers] AS [c]
+ ORDER BY CASE
+-    WHEN EXISTS (
+-        SELECT 1
++    WHEN [c].[CustomerID] IN (
++        SELECT [l].[value]
+         FROM OPENJSON(@__list_0) WITH ([value] nchar(5) '$') AS [l]
+-        WHERE [l].[value] = [c].[CustomerID]) THEN CAST(1 AS bit)
++    ) THEN CAST(1 AS bit)
+     ELSE CAST(0 AS bit)
+ END
+ """);
+@@ -5107,10 +5107,10 @@ public override async Task OrderBy_empty_list_does_not_contains(bool async)
+ SELECT [c].[CustomerID], [c].[Address], [c].[City], [c].[CompanyName], [c].[ContactName], [c].[ContactTitle], [c].[Country], [c].[Fax], [c].[Phone], [c].[PostalCode], [c].[Region]
+ FROM [Customers] AS [c]
+ ORDER BY CASE
+-    WHEN NOT EXISTS (
+-        SELECT 1
++    WHEN [c].[CustomerID] NOT IN (
++        SELECT [l].[value]
+         FROM OPENJSON(@__list_0) WITH ([value] nchar(5) '$') AS [l]
+-        WHERE [l].[value] = [c].[CustomerID]) THEN CAST(1 AS bit)
++    ) THEN CAST(1 AS bit)
+     ELSE CAST(0 AS bit)
+ END
+ """);
+diff --git a/test/EFCore.SqlServer.FunctionalTests/Query/NorthwindSplitIncludeNoTrackingQuerySqlServerTest.cs b/test/EFCore.SqlServer.FunctionalTests/Query/NorthwindSplitIncludeNoTrackingQuerySqlServerTest.cs
+index 220c4e52f5..d9502a7b27 100644
+--- a/test/EFCore.SqlServer.FunctionalTests/Query/NorthwindSplitIncludeNoTrackingQuerySqlServerTest.cs
++++ b/test/EFCore.SqlServer.FunctionalTests/Query/NorthwindSplitIncludeNoTrackingQuerySqlServerTest.cs
+@@ -113,10 +113,10 @@ public override async Task Include_collection_OrderBy_list_does_not_contains(boo
+ FROM [Customers] AS [c]
+ WHERE [c].[CustomerID] LIKE N'A%'
+ ORDER BY CASE
+-    WHEN NOT EXISTS (
+-        SELECT 1
++    WHEN [c].[CustomerID] NOT IN (
++        SELECT [l].[value]
+         FROM OPENJSON(@__list_0) WITH ([value] nchar(5) '$') AS [l]
+-        WHERE [l].[value] = [c].[CustomerID]) THEN CAST(1 AS bit)
++    ) THEN CAST(1 AS bit)
+     ELSE CAST(0 AS bit)
+ END, [c].[CustomerID]
+ OFFSET @__p_1 ROWS
+@@ -129,19 +129,19 @@ ELSE CAST(0 AS bit)
+ SELECT [o].[OrderID], [o].[CustomerID], [o].[EmployeeID], [o].[OrderDate], [t].[CustomerID]
+ FROM (
+     SELECT [c].[CustomerID], CASE
+-        WHEN NOT EXISTS (
+-            SELECT 1
++        WHEN [c].[CustomerID] NOT IN (
++            SELECT [l].[value]
+             FROM OPENJSON(@__list_0) WITH ([value] nchar(5) '$') AS [l]
+-            WHERE [l].[value] = [c].[CustomerID]) THEN CAST(1 AS bit)
++        ) THEN CAST(1 AS bit)
+         ELSE CAST(0 AS bit)
+     END AS [c]
+     FROM [Customers] AS [c]
+     WHERE [c].[CustomerID] LIKE N'A%'
+     ORDER BY CASE
+-        WHEN NOT EXISTS (
+-            SELECT 1
++        WHEN [c].[CustomerID] NOT IN (
++            SELECT [l].[value]
+             FROM OPENJSON(@__list_0) WITH ([value] nchar(5) '$') AS [l]
+-            WHERE [l].[value] = [c].[CustomerID]) THEN CAST(1 AS bit)
++        ) THEN CAST(1 AS bit)
+         ELSE CAST(0 AS bit)
+     END
+     OFFSET @__p_1 ROWS
+@@ -1110,10 +1110,10 @@ public override async Task Include_collection_OrderBy_list_contains(bool async)
+ FROM [Customers] AS [c]
+ WHERE [c].[CustomerID] LIKE N'A%'
+ ORDER BY CASE
+-    WHEN EXISTS (
+-        SELECT 1
++    WHEN [c].[CustomerID] IN (
++        SELECT [l].[value]
+         FROM OPENJSON(@__list_0) WITH ([value] nchar(5) '$') AS [l]
+-        WHERE [l].[value] = [c].[CustomerID]) THEN CAST(1 AS bit)
++    ) THEN CAST(1 AS bit)
+     ELSE CAST(0 AS bit)
+ END, [c].[CustomerID]
+ OFFSET @__p_1 ROWS
+@@ -1126,19 +1126,19 @@ ELSE CAST(0 AS bit)
+ SELECT [o].[OrderID], [o].[CustomerID], [o].[EmployeeID], [o].[OrderDate], [t].[CustomerID]
+ FROM (
+     SELECT [c].[CustomerID], CASE
+-        WHEN EXISTS (
+-            SELECT 1
++        WHEN [c].[CustomerID] IN (
++            SELECT [l].[value]
+             FROM OPENJSON(@__list_0) WITH ([value] nchar(5) '$') AS [l]
+-            WHERE [l].[value] = [c].[CustomerID]) THEN CAST(1 AS bit)
++        ) THEN CAST(1 AS bit)
+         ELSE CAST(0 AS bit)
+     END AS [c]
+     FROM [Customers] AS [c]
+     WHERE [c].[CustomerID] LIKE N'A%'
+     ORDER BY CASE
+-        WHEN EXISTS (
+-            SELECT 1
++        WHEN [c].[CustomerID] IN (
++            SELECT [l].[value]
+             FROM OPENJSON(@__list_0) WITH ([value] nchar(5) '$') AS [l]
+-            WHERE [l].[value] = [c].[CustomerID]) THEN CAST(1 AS bit)
++        ) THEN CAST(1 AS bit)
+         ELSE CAST(0 AS bit)
+     END
+     OFFSET @__p_1 ROWS
+@@ -1557,10 +1557,10 @@ public override async Task Include_collection_OrderBy_empty_list_contains(bool a
+ FROM [Customers] AS [c]
+ WHERE [c].[CustomerID] LIKE N'A%'
+ ORDER BY CASE
+-    WHEN EXISTS (
+-        SELECT 1
++    WHEN [c].[CustomerID] IN (
++        SELECT [l].[value]
+         FROM OPENJSON(@__list_0) WITH ([value] nchar(5) '$') AS [l]
+-        WHERE [l].[value] = [c].[CustomerID]) THEN CAST(1 AS bit)
++    ) THEN CAST(1 AS bit)
+     ELSE CAST(0 AS bit)
+ END, [c].[CustomerID]
+ OFFSET @__p_1 ROWS
+@@ -1573,19 +1573,19 @@ ELSE CAST(0 AS bit)
+ SELECT [o].[OrderID], [o].[CustomerID], [o].[EmployeeID], [o].[OrderDate], [t].[CustomerID]
+ FROM (
+     SELECT [c].[CustomerID], CASE
+-        WHEN EXISTS (
+-            SELECT 1
++        WHEN [c].[CustomerID] IN (
++            SELECT [l].[value]
+             FROM OPENJSON(@__list_0) WITH ([value] nchar(5) '$') AS [l]
+-            WHERE [l].[value] = [c].[CustomerID]) THEN CAST(1 AS bit)
++        ) THEN CAST(1 AS bit)
+         ELSE CAST(0 AS bit)
+     END AS [c]
+     FROM [Customers] AS [c]
+     WHERE [c].[CustomerID] LIKE N'A%'
+     ORDER BY CASE
+-        WHEN EXISTS (
+-            SELECT 1
++        WHEN [c].[CustomerID] IN (
++            SELECT [l].[value]
+             FROM OPENJSON(@__list_0) WITH ([value] nchar(5) '$') AS [l]
+-            WHERE [l].[value] = [c].[CustomerID]) THEN CAST(1 AS bit)
++        ) THEN CAST(1 AS bit)
+         ELSE CAST(0 AS bit)
+     END
+     OFFSET @__p_1 ROWS
+@@ -1736,10 +1736,10 @@ public override async Task Include_collection_OrderBy_empty_list_does_not_contai
+ FROM [Customers] AS [c]
+ WHERE [c].[CustomerID] LIKE N'A%'
+ ORDER BY CASE
+-    WHEN NOT EXISTS (
+-        SELECT 1
++    WHEN [c].[CustomerID] NOT IN (
++        SELECT [l].[value]
+         FROM OPENJSON(@__list_0) WITH ([value] nchar(5) '$') AS [l]
+-        WHERE [l].[value] = [c].[CustomerID]) THEN CAST(1 AS bit)
++    ) THEN CAST(1 AS bit)
+     ELSE CAST(0 AS bit)
+ END, [c].[CustomerID]
+ OFFSET @__p_1 ROWS
+@@ -1752,19 +1752,19 @@ ELSE CAST(0 AS bit)
+ SELECT [o].[OrderID], [o].[CustomerID], [o].[EmployeeID], [o].[OrderDate], [t].[CustomerID]
+ FROM (
+     SELECT [c].[CustomerID], CASE
+-        WHEN NOT EXISTS (
+-            SELECT 1
++        WHEN [c].[CustomerID] NOT IN (
++            SELECT [l].[value]
+             FROM OPENJSON(@__list_0) WITH ([value] nchar(5) '$') AS [l]
+-            WHERE [l].[value] = [c].[CustomerID]) THEN CAST(1 AS bit)
++        ) THEN CAST(1 AS bit)
+         ELSE CAST(0 AS bit)
+     END AS [c]
+     FROM [Customers] AS [c]
+     WHERE [c].[CustomerID] LIKE N'A%'
+     ORDER BY CASE
+-        WHEN NOT EXISTS (
+-            SELECT 1
++        WHEN [c].[CustomerID] NOT IN (
++            SELECT [l].[value]
+             FROM OPENJSON(@__list_0) WITH ([value] nchar(5) '$') AS [l]
+-            WHERE [l].[value] = [c].[CustomerID]) THEN CAST(1 AS bit)
++        ) THEN CAST(1 AS bit)
+         ELSE CAST(0 AS bit)
+     END
+     OFFSET @__p_1 ROWS
+diff --git a/test/EFCore.SqlServer.FunctionalTests/Query/NorthwindSplitIncludeQuerySqlServerTest.cs b/test/EFCore.SqlServer.FunctionalTests/Query/NorthwindSplitIncludeQuerySqlServerTest.cs
+index 154b6f215c..3e8d28a6a3 100644
+--- a/test/EFCore.SqlServer.FunctionalTests/Query/NorthwindSplitIncludeQuerySqlServerTest.cs
++++ b/test/EFCore.SqlServer.FunctionalTests/Query/NorthwindSplitIncludeQuerySqlServerTest.cs
+@@ -2052,10 +2052,10 @@ public override async Task Include_collection_OrderBy_empty_list_contains(bool a
+ FROM [Customers] AS [c]
+ WHERE [c].[CustomerID] LIKE N'A%'
+ ORDER BY CASE
+-    WHEN EXISTS (
+-        SELECT 1
++    WHEN [c].[CustomerID] IN (
++        SELECT [l].[value]
+         FROM OPENJSON(@__list_0) WITH ([value] nchar(5) '$') AS [l]
+-        WHERE [l].[value] = [c].[CustomerID]) THEN CAST(1 AS bit)
++    ) THEN CAST(1 AS bit)
+     ELSE CAST(0 AS bit)
+ END, [c].[CustomerID]
+ OFFSET @__p_1 ROWS
+@@ -2068,19 +2068,19 @@ ELSE CAST(0 AS bit)
+ SELECT [o].[OrderID], [o].[CustomerID], [o].[EmployeeID], [o].[OrderDate], [t].[CustomerID]
+ FROM (
+     SELECT [c].[CustomerID], CASE
+-        WHEN EXISTS (
+-            SELECT 1
++        WHEN [c].[CustomerID] IN (
++            SELECT [l].[value]
+             FROM OPENJSON(@__list_0) WITH ([value] nchar(5) '$') AS [l]
+-            WHERE [l].[value] = [c].[CustomerID]) THEN CAST(1 AS bit)
++        ) THEN CAST(1 AS bit)
+         ELSE CAST(0 AS bit)
+     END AS [c]
+     FROM [Customers] AS [c]
+     WHERE [c].[CustomerID] LIKE N'A%'
+     ORDER BY CASE
+-        WHEN EXISTS (
+-            SELECT 1
++        WHEN [c].[CustomerID] IN (
++            SELECT [l].[value]
+             FROM OPENJSON(@__list_0) WITH ([value] nchar(5) '$') AS [l]
+-            WHERE [l].[value] = [c].[CustomerID]) THEN CAST(1 AS bit)
++        ) THEN CAST(1 AS bit)
+         ELSE CAST(0 AS bit)
+     END
+     OFFSET @__p_1 ROWS
+@@ -2103,10 +2103,10 @@ public override async Task Include_collection_OrderBy_empty_list_does_not_contai
+ FROM [Customers] AS [c]
+ WHERE [c].[CustomerID] LIKE N'A%'
+ ORDER BY CASE
+-    WHEN NOT EXISTS (
+-        SELECT 1
++    WHEN [c].[CustomerID] NOT IN (
++        SELECT [l].[value]
+         FROM OPENJSON(@__list_0) WITH ([value] nchar(5) '$') AS [l]
+-        WHERE [l].[value] = [c].[CustomerID]) THEN CAST(1 AS bit)
++    ) THEN CAST(1 AS bit)
+     ELSE CAST(0 AS bit)
+ END, [c].[CustomerID]
+ OFFSET @__p_1 ROWS
+@@ -2119,19 +2119,19 @@ ELSE CAST(0 AS bit)
+ SELECT [o].[OrderID], [o].[CustomerID], [o].[EmployeeID], [o].[OrderDate], [t].[CustomerID]
+ FROM (
+     SELECT [c].[CustomerID], CASE
+-        WHEN NOT EXISTS (
+-            SELECT 1
++        WHEN [c].[CustomerID] NOT IN (
++            SELECT [l].[value]
+             FROM OPENJSON(@__list_0) WITH ([value] nchar(5) '$') AS [l]
+-            WHERE [l].[value] = [c].[CustomerID]) THEN CAST(1 AS bit)
++        ) THEN CAST(1 AS bit)
+         ELSE CAST(0 AS bit)
+     END AS [c]
+     FROM [Customers] AS [c]
+     WHERE [c].[CustomerID] LIKE N'A%'
+     ORDER BY CASE
+-        WHEN NOT EXISTS (
+-            SELECT 1
++        WHEN [c].[CustomerID] NOT IN (
++            SELECT [l].[value]
+             FROM OPENJSON(@__list_0) WITH ([value] nchar(5) '$') AS [l]
+-            WHERE [l].[value] = [c].[CustomerID]) THEN CAST(1 AS bit)
++        ) THEN CAST(1 AS bit)
+         ELSE CAST(0 AS bit)
+     END
+     OFFSET @__p_1 ROWS
+@@ -2154,10 +2154,10 @@ public override async Task Include_collection_OrderBy_list_contains(bool async)
+ FROM [Customers] AS [c]
+ WHERE [c].[CustomerID] LIKE N'A%'
+ ORDER BY CASE
+-    WHEN EXISTS (
+-        SELECT 1
++    WHEN [c].[CustomerID] IN (
++        SELECT [l].[value]
+         FROM OPENJSON(@__list_0) WITH ([value] nchar(5) '$') AS [l]
+-        WHERE [l].[value] = [c].[CustomerID]) THEN CAST(1 AS bit)
++    ) THEN CAST(1 AS bit)
+     ELSE CAST(0 AS bit)
+ END, [c].[CustomerID]
+ OFFSET @__p_1 ROWS
+@@ -2170,19 +2170,19 @@ ELSE CAST(0 AS bit)
+ SELECT [o].[OrderID], [o].[CustomerID], [o].[EmployeeID], [o].[OrderDate], [t].[CustomerID]
+ FROM (
+     SELECT [c].[CustomerID], CASE
+-        WHEN EXISTS (
+-            SELECT 1
++        WHEN [c].[CustomerID] IN (
++            SELECT [l].[value]
+             FROM OPENJSON(@__list_0) WITH ([value] nchar(5) '$') AS [l]
+-            WHERE [l].[value] = [c].[CustomerID]) THEN CAST(1 AS bit)
++        ) THEN CAST(1 AS bit)
+         ELSE CAST(0 AS bit)
+     END AS [c]
+     FROM [Customers] AS [c]
+     WHERE [c].[CustomerID] LIKE N'A%'
+     ORDER BY CASE
+-        WHEN EXISTS (
+-            SELECT 1
++        WHEN [c].[CustomerID] IN (
++            SELECT [l].[value]
+             FROM OPENJSON(@__list_0) WITH ([value] nchar(5) '$') AS [l]
+-            WHERE [l].[value] = [c].[CustomerID]) THEN CAST(1 AS bit)
++        ) THEN CAST(1 AS bit)
+         ELSE CAST(0 AS bit)
+     END
+     OFFSET @__p_1 ROWS
+@@ -2205,10 +2205,10 @@ public override async Task Include_collection_OrderBy_list_does_not_contains(boo
+ FROM [Customers] AS [c]
+ WHERE [c].[CustomerID] LIKE N'A%'
+ ORDER BY CASE
+-    WHEN NOT EXISTS (
+-        SELECT 1
++    WHEN [c].[CustomerID] NOT IN (
++        SELECT [l].[value]
+         FROM OPENJSON(@__list_0) WITH ([value] nchar(5) '$') AS [l]
+-        WHERE [l].[value] = [c].[CustomerID]) THEN CAST(1 AS bit)
++    ) THEN CAST(1 AS bit)
+     ELSE CAST(0 AS bit)
+ END, [c].[CustomerID]
+ OFFSET @__p_1 ROWS
+@@ -2221,19 +2221,19 @@ ELSE CAST(0 AS bit)
+ SELECT [o].[OrderID], [o].[CustomerID], [o].[EmployeeID], [o].[OrderDate], [t].[CustomerID]
+ FROM (
+     SELECT [c].[CustomerID], CASE
+-        WHEN NOT EXISTS (
+-            SELECT 1
++        WHEN [c].[CustomerID] NOT IN (
++            SELECT [l].[value]
+             FROM OPENJSON(@__list_0) WITH ([value] nchar(5) '$') AS [l]
+-            WHERE [l].[value] = [c].[CustomerID]) THEN CAST(1 AS bit)
++        ) THEN CAST(1 AS bit)
+         ELSE CAST(0 AS bit)
+     END AS [c]
+     FROM [Customers] AS [c]
+     WHERE [c].[CustomerID] LIKE N'A%'
+     ORDER BY CASE
+-        WHEN NOT EXISTS (
+-            SELECT 1
++        WHEN [c].[CustomerID] NOT IN (
++            SELECT [l].[value]
+             FROM OPENJSON(@__list_0) WITH ([value] nchar(5) '$') AS [l]
+-            WHERE [l].[value] = [c].[CustomerID]) THEN CAST(1 AS bit)
++        ) THEN CAST(1 AS bit)
+         ELSE CAST(0 AS bit)
+     END
+     OFFSET @__p_1 ROWS
+diff --git a/test/EFCore.SqlServer.FunctionalTests/Query/NorthwindStringIncludeQuerySqlServerTest.cs b/test/EFCore.SqlServer.FunctionalTests/Query/NorthwindStringIncludeQuerySqlServerTest.cs
+index bf37ce156d..7b9d53602d 100644
+--- a/test/EFCore.SqlServer.FunctionalTests/Query/NorthwindStringIncludeQuerySqlServerTest.cs
++++ b/test/EFCore.SqlServer.FunctionalTests/Query/NorthwindStringIncludeQuerySqlServerTest.cs
+@@ -621,19 +621,19 @@ public override async Task Include_collection_OrderBy_list_does_not_contains(boo
+ SELECT [t].[CustomerID], [t].[Address], [t].[City], [t].[CompanyName], [t].[ContactName], [t].[ContactTitle], [t].[Country], [t].[Fax], [t].[Phone], [t].[PostalCode], [t].[Region], [o].[OrderID], [o].[CustomerID], [o].[EmployeeID], [o].[OrderDate]
+ FROM (
+     SELECT [c].[CustomerID], [c].[Address], [c].[City], [c].[CompanyName], [c].[ContactName], [c].[ContactTitle], [c].[Country], [c].[Fax], [c].[Phone], [c].[PostalCode], [c].[Region], CASE
+-        WHEN NOT EXISTS (
+-            SELECT 1
++        WHEN [c].[CustomerID] NOT IN (
++            SELECT [l].[value]
+             FROM OPENJSON(@__list_0) WITH ([value] nchar(5) '$') AS [l]
+-            WHERE [l].[value] = [c].[CustomerID]) THEN CAST(1 AS bit)
++        ) THEN CAST(1 AS bit)
+         ELSE CAST(0 AS bit)
+     END AS [c]
+     FROM [Customers] AS [c]
+     WHERE [c].[CustomerID] LIKE N'A%'
+     ORDER BY CASE
+-        WHEN NOT EXISTS (
+-            SELECT 1
++        WHEN [c].[CustomerID] NOT IN (
++            SELECT [l].[value]
+             FROM OPENJSON(@__list_0) WITH ([value] nchar(5) '$') AS [l]
+-            WHERE [l].[value] = [c].[CustomerID]) THEN CAST(1 AS bit)
++        ) THEN CAST(1 AS bit)
+         ELSE CAST(0 AS bit)
+     END
+     OFFSET @__p_1 ROWS
+@@ -969,19 +969,19 @@ public override async Task Include_collection_OrderBy_empty_list_contains(bool a
+ SELECT [t].[CustomerID], [t].[Address], [t].[City], [t].[CompanyName], [t].[ContactName], [t].[ContactTitle], [t].[Country], [t].[Fax], [t].[Phone], [t].[PostalCode], [t].[Region], [o].[OrderID], [o].[CustomerID], [o].[EmployeeID], [o].[OrderDate]
+ FROM (
+     SELECT [c].[CustomerID], [c].[Address], [c].[City], [c].[CompanyName], [c].[ContactName], [c].[ContactTitle], [c].[Country], [c].[Fax], [c].[Phone], [c].[PostalCode], [c].[Region], CASE
+-        WHEN EXISTS (
+-            SELECT 1
++        WHEN [c].[CustomerID] IN (
++            SELECT [l].[value]
+             FROM OPENJSON(@__list_0) WITH ([value] nchar(5) '$') AS [l]
+-            WHERE [l].[value] = [c].[CustomerID]) THEN CAST(1 AS bit)
++        ) THEN CAST(1 AS bit)
+         ELSE CAST(0 AS bit)
+     END AS [c]
+     FROM [Customers] AS [c]
+     WHERE [c].[CustomerID] LIKE N'A%'
+     ORDER BY CASE
+-        WHEN EXISTS (
+-            SELECT 1
++        WHEN [c].[CustomerID] IN (
++            SELECT [l].[value]
+             FROM OPENJSON(@__list_0) WITH ([value] nchar(5) '$') AS [l]
+-            WHERE [l].[value] = [c].[CustomerID]) THEN CAST(1 AS bit)
++        ) THEN CAST(1 AS bit)
+         ELSE CAST(0 AS bit)
+     END
+     OFFSET @__p_1 ROWS
+@@ -1365,19 +1365,19 @@ public override async Task Include_collection_OrderBy_list_contains(bool async)
+ SELECT [t].[CustomerID], [t].[Address], [t].[City], [t].[CompanyName], [t].[ContactName], [t].[ContactTitle], [t].[Country], [t].[Fax], [t].[Phone], [t].[PostalCode], [t].[Region], [o].[OrderID], [o].[CustomerID], [o].[EmployeeID], [o].[OrderDate]
+ FROM (
+     SELECT [c].[CustomerID], [c].[Address], [c].[City], [c].[CompanyName], [c].[ContactName], [c].[ContactTitle], [c].[Country], [c].[Fax], [c].[Phone], [c].[PostalCode], [c].[Region], CASE
+-        WHEN EXISTS (
+-            SELECT 1
++        WHEN [c].[CustomerID] IN (
++            SELECT [l].[value]
+             FROM OPENJSON(@__list_0) WITH ([value] nchar(5) '$') AS [l]
+-            WHERE [l].[value] = [c].[CustomerID]) THEN CAST(1 AS bit)
++        ) THEN CAST(1 AS bit)
+         ELSE CAST(0 AS bit)
+     END AS [c]
+     FROM [Customers] AS [c]
+     WHERE [c].[CustomerID] LIKE N'A%'
+     ORDER BY CASE
+-        WHEN EXISTS (
+-            SELECT 1
++        WHEN [c].[CustomerID] IN (
++            SELECT [l].[value]
+             FROM OPENJSON(@__list_0) WITH ([value] nchar(5) '$') AS [l]
+-            WHERE [l].[value] = [c].[CustomerID]) THEN CAST(1 AS bit)
++        ) THEN CAST(1 AS bit)
+         ELSE CAST(0 AS bit)
+     END
+     OFFSET @__p_1 ROWS
+@@ -1844,19 +1844,19 @@ public override async Task Include_collection_OrderBy_empty_list_does_not_contai
+ SELECT [t].[CustomerID], [t].[Address], [t].[City], [t].[CompanyName], [t].[ContactName], [t].[ContactTitle], [t].[Country], [t].[Fax], [t].[Phone], [t].[PostalCode], [t].[Region], [o].[OrderID], [o].[CustomerID], [o].[EmployeeID], [o].[OrderDate]
+ FROM (
+     SELECT [c].[CustomerID], [c].[Address], [c].[City], [c].[CompanyName], [c].[ContactName], [c].[ContactTitle], [c].[Country], [c].[Fax], [c].[Phone], [c].[PostalCode], [c].[Region], CASE
+-        WHEN NOT EXISTS (
+-            SELECT 1
++        WHEN [c].[CustomerID] NOT IN (
++            SELECT [l].[value]
+             FROM OPENJSON(@__list_0) WITH ([value] nchar(5) '$') AS [l]
+-            WHERE [l].[value] = [c].[CustomerID]) THEN CAST(1 AS bit)
++        ) THEN CAST(1 AS bit)
+         ELSE CAST(0 AS bit)
+     END AS [c]
+     FROM [Customers] AS [c]
+     WHERE [c].[CustomerID] LIKE N'A%'
+     ORDER BY CASE
+-        WHEN NOT EXISTS (
+-            SELECT 1
++        WHEN [c].[CustomerID] NOT IN (
++            SELECT [l].[value]
+             FROM OPENJSON(@__list_0) WITH ([value] nchar(5) '$') AS [l]
+-            WHERE [l].[value] = [c].[CustomerID]) THEN CAST(1 AS bit)
++        ) THEN CAST(1 AS bit)
+         ELSE CAST(0 AS bit)
+     END
+     OFFSET @__p_1 ROWS
+diff --git a/test/EFCore.SqlServer.FunctionalTests/Query/NorthwindWhereQuerySqlServerTest.cs b/test/EFCore.SqlServer.FunctionalTests/Query/NorthwindWhereQuerySqlServerTest.cs
+index f6292e63a9..b24fd99dec 100644
+--- a/test/EFCore.SqlServer.FunctionalTests/Query/NorthwindWhereQuerySqlServerTest.cs
++++ b/test/EFCore.SqlServer.FunctionalTests/Query/NorthwindWhereQuerySqlServerTest.cs
+@@ -2074,10 +2074,10 @@ public override async Task Generic_Ilist_contains_translates_to_server(bool asyn
+ 
+ SELECT [c].[CustomerID], [c].[Address], [c].[City], [c].[CompanyName], [c].[ContactName], [c].[ContactTitle], [c].[Country], [c].[Fax], [c].[Phone], [c].[PostalCode], [c].[Region]
+ FROM [Customers] AS [c]
+-WHERE EXISTS (
+-    SELECT 1
++WHERE [c].[City] IN (
++    SELECT [c0].[value]
+     FROM OPENJSON(@__cities_0) WITH ([value] nvarchar(15) '$') AS [c0]
+-    WHERE [c0].[value] = [c].[City] OR ([c0].[value] IS NULL AND [c].[City] IS NULL))
++)
+ """);
+     }
+ 
+diff --git a/test/EFCore.SqlServer.FunctionalTests/Query/NullSemanticsQuerySqlServerTest.cs b/test/EFCore.SqlServer.FunctionalTests/Query/NullSemanticsQuerySqlServerTest.cs
+index a5399295e2..bc2b877ed8 100644
+--- a/test/EFCore.SqlServer.FunctionalTests/Query/NullSemanticsQuerySqlServerTest.cs
++++ b/test/EFCore.SqlServer.FunctionalTests/Query/NullSemanticsQuerySqlServerTest.cs
+@@ -910,14 +910,14 @@ public override async Task Contains_with_local_array_closure_with_null(bool asyn
+ 
+         AssertSql(
+             """
+-@__ids_0='["Foo",null]' (Size = 4000)
++@__ids_0_without_nulls='["Foo"]' (Size = 4000)
+ 
+ SELECT [e].[Id]
+ FROM [Entities1] AS [e]
+-WHERE EXISTS (
+-    SELECT 1
+-    FROM OPENJSON(@__ids_0) WITH ([value] nvarchar(max) '$') AS [i]
+-    WHERE [i].[value] = [e].[NullableStringA] OR ([i].[value] IS NULL AND [e].[NullableStringA] IS NULL))
++WHERE [e].[NullableStringA] IN (
++    SELECT [i].[value]
++    FROM OPENJSON(@__ids_0_without_nulls) AS [i]
++) OR [e].[NullableStringA] IS NULL
+ """);
+     }
+ 
+@@ -927,14 +927,14 @@ public override async Task Contains_with_local_array_closure_false_with_null(boo
+ 
+         AssertSql(
+             """
+-@__ids_0='["Foo",null]' (Size = 4000)
++@__ids_0_without_nulls='["Foo"]' (Size = 4000)
+ 
+ SELECT [e].[Id]
+ FROM [Entities1] AS [e]
+-WHERE NOT EXISTS (
+-    SELECT 1
+-    FROM OPENJSON(@__ids_0) WITH ([value] nvarchar(max) '$') AS [i]
+-    WHERE [i].[value] = [e].[NullableStringA] OR ([i].[value] IS NULL AND [e].[NullableStringA] IS NULL))
++WHERE [e].[NullableStringA] NOT IN (
++    SELECT [i].[value]
++    FROM OPENJSON(@__ids_0_without_nulls) AS [i]
++) AND [e].[NullableStringA] IS NOT NULL
+ """);
+     }
+ 
+@@ -948,10 +948,10 @@ public override async Task Contains_with_local_nullable_array_closure_negated(bo
+ 
+ SELECT [e].[Id]
+ FROM [Entities1] AS [e]
+-WHERE NOT EXISTS (
+-    SELECT 1
++WHERE [e].[NullableStringA] NOT IN (
++    SELECT [i].[value]
+     FROM OPENJSON(@__ids_0) WITH ([value] nvarchar(max) '$') AS [i]
+-    WHERE [i].[value] = [e].[NullableStringA] OR ([i].[value] IS NULL AND [e].[NullableStringA] IS NULL))
++) OR [e].[NullableStringA] IS NULL
+ """);
+     }
+ 
+@@ -961,14 +961,14 @@ public override async Task Contains_with_local_array_closure_with_multiple_nulls
+ 
+         AssertSql(
+             """
+-@__ids_0='[null,"Foo",null,null]' (Size = 4000)
++@__ids_0_without_nulls='["Foo"]' (Size = 4000)
+ 
+ SELECT [e].[Id]
+ FROM [Entities1] AS [e]
+-WHERE EXISTS (
+-    SELECT 1
+-    FROM OPENJSON(@__ids_0) WITH ([value] nvarchar(max) '$') AS [i]
+-    WHERE [i].[value] = [e].[NullableStringA] OR ([i].[value] IS NULL AND [e].[NullableStringA] IS NULL))
++WHERE [e].[NullableStringA] IN (
++    SELECT [i].[value]
++    FROM OPENJSON(@__ids_0_without_nulls) AS [i]
++) OR [e].[NullableStringA] IS NULL
+ """);
+     }
+ 
+@@ -1783,10 +1783,10 @@ public override async Task Null_semantics_contains(bool async)
+ 
+ SELECT [e].[Id]
+ FROM [Entities1] AS [e]
+-WHERE EXISTS (
+-    SELECT 1
++WHERE [e].[NullableIntA] IN (
++    SELECT [i].[value]
+     FROM OPENJSON(@__ids_0) WITH ([value] int '$') AS [i]
+-    WHERE [i].[value] = [e].[NullableIntA] OR ([i].[value] IS NULL AND [e].[NullableIntA] IS NULL))
++)
+ """,
+             //
+             """
+@@ -1794,32 +1794,32 @@ SELECT 1
+ 
+ SELECT [e].[Id]
+ FROM [Entities1] AS [e]
+-WHERE NOT EXISTS (
+-    SELECT 1
++WHERE [e].[NullableIntA] NOT IN (
++    SELECT [i].[value]
+     FROM OPENJSON(@__ids_0) WITH ([value] int '$') AS [i]
+-    WHERE [i].[value] = [e].[NullableIntA] OR ([i].[value] IS NULL AND [e].[NullableIntA] IS NULL))
++) OR [e].[NullableIntA] IS NULL
+ """,
+             //
+             """
+-@__ids2_0='[1,2,null]' (Size = 4000)
++@__ids2_0_without_nulls='[1,2]' (Size = 4000)
+ 
+ SELECT [e].[Id]
+ FROM [Entities1] AS [e]
+-WHERE EXISTS (
+-    SELECT 1
+-    FROM OPENJSON(@__ids2_0) WITH ([value] int '$') AS [i]
+-    WHERE [i].[value] = [e].[NullableIntA] OR ([i].[value] IS NULL AND [e].[NullableIntA] IS NULL))
++WHERE [e].[NullableIntA] IN (
++    SELECT [i].[value]
++    FROM OPENJSON(@__ids2_0_without_nulls) AS [i]
++) OR [e].[NullableIntA] IS NULL
+ """,
+             //
+             """
+-@__ids2_0='[1,2,null]' (Size = 4000)
++@__ids2_0_without_nulls='[1,2]' (Size = 4000)
+ 
+ SELECT [e].[Id]
+ FROM [Entities1] AS [e]
+-WHERE NOT EXISTS (
+-    SELECT 1
+-    FROM OPENJSON(@__ids2_0) WITH ([value] int '$') AS [i]
+-    WHERE [i].[value] = [e].[NullableIntA] OR ([i].[value] IS NULL AND [e].[NullableIntA] IS NULL))
++WHERE [e].[NullableIntA] NOT IN (
++    SELECT [i].[value]
++    FROM OPENJSON(@__ids2_0_without_nulls) AS [i]
++) AND [e].[NullableIntA] IS NOT NULL
+ """,
+             //
+             """
+@@ -1857,10 +1857,10 @@ public override async Task Null_semantics_contains_array_with_no_values(bool asy
+ 
+ SELECT [e].[Id]
+ FROM [Entities1] AS [e]
+-WHERE EXISTS (
+-    SELECT 1
++WHERE [e].[NullableIntA] IN (
++    SELECT [i].[value]
+     FROM OPENJSON(@__ids_0) WITH ([value] int '$') AS [i]
+-    WHERE [i].[value] = [e].[NullableIntA] OR ([i].[value] IS NULL AND [e].[NullableIntA] IS NULL))
++)
+ """,
+             //
+             """
+@@ -1868,32 +1868,32 @@ SELECT 1
+ 
+ SELECT [e].[Id]
+ FROM [Entities1] AS [e]
+-WHERE NOT EXISTS (
+-    SELECT 1
++WHERE [e].[NullableIntA] NOT IN (
++    SELECT [i].[value]
+     FROM OPENJSON(@__ids_0) WITH ([value] int '$') AS [i]
+-    WHERE [i].[value] = [e].[NullableIntA] OR ([i].[value] IS NULL AND [e].[NullableIntA] IS NULL))
++) OR [e].[NullableIntA] IS NULL
+ """,
+             //
+             """
+-@__ids2_0='[null]' (Size = 4000)
++@__ids2_0_without_nulls='[]' (Size = 4000)
+ 
+ SELECT [e].[Id]
+ FROM [Entities1] AS [e]
+-WHERE EXISTS (
+-    SELECT 1
+-    FROM OPENJSON(@__ids2_0) WITH ([value] int '$') AS [i]
+-    WHERE [i].[value] = [e].[NullableIntA] OR ([i].[value] IS NULL AND [e].[NullableIntA] IS NULL))
++WHERE [e].[NullableIntA] IN (
++    SELECT [i].[value]
++    FROM OPENJSON(@__ids2_0_without_nulls) AS [i]
++) OR [e].[NullableIntA] IS NULL
+ """,
+             //
+             """
+-@__ids2_0='[null]' (Size = 4000)
++@__ids2_0_without_nulls='[]' (Size = 4000)
+ 
+ SELECT [e].[Id]
+ FROM [Entities1] AS [e]
+-WHERE NOT EXISTS (
+-    SELECT 1
+-    FROM OPENJSON(@__ids2_0) WITH ([value] int '$') AS [i]
+-    WHERE [i].[value] = [e].[NullableIntA] OR ([i].[value] IS NULL AND [e].[NullableIntA] IS NULL))
++WHERE [e].[NullableIntA] NOT IN (
++    SELECT [i].[value]
++    FROM OPENJSON(@__ids2_0_without_nulls) AS [i]
++) AND [e].[NullableIntA] IS NOT NULL
+ """,
+             //
+             """
+@@ -2036,9 +2036,9 @@ public override async Task Null_semantics_contains_with_non_nullable_item_and_in
+ """);
+     }
+ 
+-    public override async Task Null_semantics_contains_with_non_nullable_item_and_inline_non_nullable_values_with_null(bool async)
++    public override async Task Null_semantics_contains_with_non_nullable_item_and_inline_values_with_null(bool async)
+     {
+-        await base.Null_semantics_contains_with_non_nullable_item_and_inline_non_nullable_values_with_null(async);
++        await base.Null_semantics_contains_with_non_nullable_item_and_inline_values_with_null(async);
+ 
+         AssertSql(
+             """
+@@ -2054,9 +2054,9 @@ public override async Task Null_semantics_contains_with_non_nullable_item_and_in
+ """);
+     }
+ 
+-    public override async Task Null_semantics_contains_with_non_nullable_item_and_inline_nullable_values(bool async)
++    public override async Task Null_semantics_contains_with_non_nullable_item_and_inline_values_with_nullable_column(bool async)
+     {
+-        await base.Null_semantics_contains_with_non_nullable_item_and_inline_nullable_values(async);
++        await base.Null_semantics_contains_with_non_nullable_item_and_inline_values_with_nullable_column(async);
+ 
+         AssertSql(
+             """
+@@ -2072,9 +2072,9 @@ public override async Task Null_semantics_contains_with_non_nullable_item_and_in
+ """);
+     }
+ 
+-    public override async Task Null_semantics_contains_with_non_nullable_item_and_inline_nullable_values_with_null(bool async)
++    public override async Task Null_semantics_contains_with_non_nullable_item_and_inline_values_with_nullable_column_and_null(bool async)
+     {
+-        await base.Null_semantics_contains_with_non_nullable_item_and_inline_nullable_values_with_null(async);
++        await base.Null_semantics_contains_with_non_nullable_item_and_inline_values_with_nullable_column_and_null(async);
+ 
+         AssertSql(
+             """
+@@ -2108,9 +2108,9 @@ public override async Task Null_semantics_contains_with_nullable_item_and_inline
+ """);
+     }
+ 
+-    public override async Task Null_semantics_contains_with_nullable_item_and_inline_non_nullable_values_with_null(bool async)
++    public override async Task Null_semantics_contains_with_nullable_item_and_inline_values_with_null(bool async)
+     {
+-        await base.Null_semantics_contains_with_nullable_item_and_inline_non_nullable_values_with_null(async);
++        await base.Null_semantics_contains_with_nullable_item_and_inline_values_with_null(async);
+ 
+         AssertSql(
+             """
+@@ -2126,9 +2126,9 @@ public override async Task Null_semantics_contains_with_nullable_item_and_inline
+ """);
+     }
+ 
+-    public override async Task Null_semantics_contains_with_nullable_item_and_inline_nullable_values(bool async)
++    public override async Task Null_semantics_contains_with_nullable_item_and_inline_values_with_nullable_column(bool async)
+     {
+-        await base.Null_semantics_contains_with_nullable_item_and_inline_nullable_values(async);
++        await base.Null_semantics_contains_with_nullable_item_and_inline_values_with_nullable_column(async);
+ 
+         AssertSql(
+             """
+@@ -2144,9 +2144,9 @@ public override async Task Null_semantics_contains_with_nullable_item_and_inline
+ """);
+     }
+ 
+-    public override async Task Null_semantics_contains_with_nullable_item_and_inline_nullable_values_with_null(bool async)
++    public override async Task Null_semantics_contains_with_nullable_item_and_values_with_nullable_column_and_null(bool async)
+     {
+-        await base.Null_semantics_contains_with_nullable_item_and_inline_nullable_values_with_null(async);
++        await base.Null_semantics_contains_with_nullable_item_and_values_with_nullable_column_and_null(async);
+ 
+         AssertSql(
+             """
+@@ -2264,14 +2264,14 @@ public override async Task Null_semantics_contains_non_nullable_item_with_values
+ """,
+             //
+             """
+-@__ids_0='[1,2,null]' (Size = 4000)
++@__ids_0_without_nulls='[1,2]' (Size = 4000)
+ 
+ SELECT [e].[Id]
+ FROM [Entities1] AS [e]
+-WHERE NOT EXISTS (
+-    SELECT 1
+-    FROM OPENJSON(@__ids_0) WITH ([value] int '$') AS [i]
+-    WHERE [i].[value] = [e].[IntA])
++WHERE [e].[IntA] NOT IN (
++    SELECT [i].[value]
++    FROM OPENJSON(@__ids_0_without_nulls) AS [i]
++)
+ """,
+             //
+             """
+@@ -2290,10 +2290,10 @@ SELECT 1
+ 
+ SELECT [e].[Id]
+ FROM [Entities1] AS [e]
+-WHERE NOT EXISTS (
+-    SELECT 1
++WHERE [e].[IntA] NOT IN (
++    SELECT [i].[value]
+     FROM OPENJSON(@__ids2_0) WITH ([value] int '$') AS [i]
+-    WHERE [i].[value] = [e].[IntA])
++)
+ """,
+             //
+             """
+@@ -2312,10 +2312,10 @@ SELECT 1
+ 
+ SELECT [e].[Id]
+ FROM [Entities1] AS [e]
+-WHERE NOT EXISTS (
+-    SELECT 1
++WHERE [e].[IntA] NOT IN (
++    SELECT [i].[value]
+     FROM OPENJSON(@__ids3_0) WITH ([value] int '$') AS [i]
+-    WHERE [i].[value] = [e].[IntA])
++)
+ """,
+             //
+             """
+@@ -2330,14 +2330,14 @@ SELECT 1
+ """,
+             //
+             """
+-@__ids4_0='[null]' (Size = 4000)
++@__ids4_0_without_nulls='[]' (Size = 4000)
+ 
+ SELECT [e].[Id]
+ FROM [Entities1] AS [e]
+-WHERE NOT EXISTS (
+-    SELECT 1
+-    FROM OPENJSON(@__ids4_0) WITH ([value] int '$') AS [i]
+-    WHERE [i].[value] = [e].[IntA])
++WHERE [e].[IntA] NOT IN (
++    SELECT [i].[value]
++    FROM OPENJSON(@__ids4_0_without_nulls) AS [i]
++)
+ """);
+     }
+ 
+diff --git a/test/EFCore.SqlServer.FunctionalTests/Query/PrimitiveCollectionsQueryOldSqlServerTest.cs b/test/EFCore.SqlServer.FunctionalTests/Query/PrimitiveCollectionsQueryOldSqlServerTest.cs
+index 2b66504877..65721ff787 100644
+--- a/test/EFCore.SqlServer.FunctionalTests/Query/PrimitiveCollectionsQueryOldSqlServerTest.cs
++++ b/test/EFCore.SqlServer.FunctionalTests/Query/PrimitiveCollectionsQueryOldSqlServerTest.cs
+@@ -301,15 +301,39 @@ SELECT MAX([v].[Value])
+     public override Task Parameter_collection_Count(bool async)
+         => AssertCompatibilityLevelTooLow(() => base.Parameter_collection_Count(async));
+ 
+-    public override async Task Parameter_collection_of_ints_Contains(bool async)
++    public override async Task Parameter_collection_of_ints_Contains_int(bool async)
+     {
+-        await base.Parameter_collection_of_ints_Contains(async);
++        await base.Parameter_collection_of_ints_Contains_int(async);
+ 
+         AssertSql(
+             """
+ SELECT [p].[Id], [p].[Bool], [p].[Bools], [p].[DateTime], [p].[DateTimes], [p].[Enum], [p].[Enums], [p].[Int], [p].[Ints], [p].[NullableInt], [p].[NullableInts], [p].[NullableString], [p].[NullableStrings], [p].[String], [p].[Strings]
+ FROM [PrimitiveCollectionsEntity] AS [p]
+ WHERE [p].[Int] IN (10, 999)
++""",
++            //
++            """
++SELECT [p].[Id], [p].[Bool], [p].[Bools], [p].[DateTime], [p].[DateTimes], [p].[Enum], [p].[Enums], [p].[Int], [p].[Ints], [p].[NullableInt], [p].[NullableInts], [p].[NullableString], [p].[NullableStrings], [p].[String], [p].[Strings]
++FROM [PrimitiveCollectionsEntity] AS [p]
++WHERE [p].[Int] NOT IN (10, 999)
++""");
++    }
++
++    public override async Task Parameter_collection_of_ints_Contains_nullable_int(bool async)
++    {
++        await base.Parameter_collection_of_ints_Contains_nullable_int(async);
++
++        AssertSql(
++            """
++SELECT [p].[Id], [p].[Bool], [p].[Bools], [p].[DateTime], [p].[DateTimes], [p].[Enum], [p].[Enums], [p].[Int], [p].[Ints], [p].[NullableInt], [p].[NullableInts], [p].[NullableString], [p].[NullableStrings], [p].[String], [p].[Strings]
++FROM [PrimitiveCollectionsEntity] AS [p]
++WHERE [p].[NullableInt] IN (10, 999)
++""",
++            //
++            """
++SELECT [p].[Id], [p].[Bool], [p].[Bools], [p].[DateTime], [p].[DateTimes], [p].[Enum], [p].[Enums], [p].[Int], [p].[Ints], [p].[NullableInt], [p].[NullableInts], [p].[NullableString], [p].[NullableStrings], [p].[String], [p].[Strings]
++FROM [PrimitiveCollectionsEntity] AS [p]
++WHERE [p].[NullableInt] NOT IN (10, 999) OR [p].[NullableInt] IS NULL
+ """);
+     }
+ 
+@@ -322,6 +346,12 @@ public override async Task Parameter_collection_of_nullable_ints_Contains_int(bo
+ SELECT [p].[Id], [p].[Bool], [p].[Bools], [p].[DateTime], [p].[DateTimes], [p].[Enum], [p].[Enums], [p].[Int], [p].[Ints], [p].[NullableInt], [p].[NullableInts], [p].[NullableString], [p].[NullableStrings], [p].[String], [p].[Strings]
+ FROM [PrimitiveCollectionsEntity] AS [p]
+ WHERE [p].[Int] IN (10, 999)
++""",
++            //
++            """
++SELECT [p].[Id], [p].[Bool], [p].[Bools], [p].[DateTime], [p].[DateTimes], [p].[Enum], [p].[Enums], [p].[Int], [p].[Ints], [p].[NullableInt], [p].[NullableInts], [p].[NullableString], [p].[NullableStrings], [p].[String], [p].[Strings]
++FROM [PrimitiveCollectionsEntity] AS [p]
++WHERE [p].[Int] NOT IN (10, 999)
+ """);
+     }
+ 
+@@ -334,18 +364,30 @@ public override async Task Parameter_collection_of_nullable_ints_Contains_nullab
+ SELECT [p].[Id], [p].[Bool], [p].[Bools], [p].[DateTime], [p].[DateTimes], [p].[Enum], [p].[Enums], [p].[Int], [p].[Ints], [p].[NullableInt], [p].[NullableInts], [p].[NullableString], [p].[NullableStrings], [p].[String], [p].[Strings]
+ FROM [PrimitiveCollectionsEntity] AS [p]
+ WHERE [p].[NullableInt] IS NULL OR [p].[NullableInt] = 999
++""",
++            //
++            """
++SELECT [p].[Id], [p].[Bool], [p].[Bools], [p].[DateTime], [p].[DateTimes], [p].[Enum], [p].[Enums], [p].[Int], [p].[Ints], [p].[NullableInt], [p].[NullableInts], [p].[NullableString], [p].[NullableStrings], [p].[String], [p].[Strings]
++FROM [PrimitiveCollectionsEntity] AS [p]
++WHERE [p].[NullableInt] IS NOT NULL AND [p].[NullableInt] <> 999
+ """);
+     }
+ 
+-    public override async Task Parameter_collection_of_strings_Contains_non_nullable_string(bool async)
++    public override async Task Parameter_collection_of_strings_Contains_string(bool async)
+     {
+-        await base.Parameter_collection_of_strings_Contains_non_nullable_string(async);
++        await base.Parameter_collection_of_strings_Contains_string(async);
+ 
+         AssertSql(
+             """
+ SELECT [p].[Id], [p].[Bool], [p].[Bools], [p].[DateTime], [p].[DateTimes], [p].[Enum], [p].[Enums], [p].[Int], [p].[Ints], [p].[NullableInt], [p].[NullableInts], [p].[NullableString], [p].[NullableStrings], [p].[String], [p].[Strings]
+ FROM [PrimitiveCollectionsEntity] AS [p]
+ WHERE [p].[String] IN (N'10', N'999')
++""",
++            //
++            """
++SELECT [p].[Id], [p].[Bool], [p].[Bools], [p].[DateTime], [p].[DateTimes], [p].[Enum], [p].[Enums], [p].[Int], [p].[Ints], [p].[NullableInt], [p].[NullableInts], [p].[NullableString], [p].[NullableStrings], [p].[String], [p].[Strings]
++FROM [PrimitiveCollectionsEntity] AS [p]
++WHERE [p].[String] NOT IN (N'10', N'999')
+ """);
+     }
+ 
+@@ -357,7 +399,49 @@ public override async Task Parameter_collection_of_strings_Contains_nullable_str
+             """
+ SELECT [p].[Id], [p].[Bool], [p].[Bools], [p].[DateTime], [p].[DateTimes], [p].[Enum], [p].[Enums], [p].[Int], [p].[Ints], [p].[NullableInt], [p].[NullableInts], [p].[NullableString], [p].[NullableStrings], [p].[String], [p].[Strings]
+ FROM [PrimitiveCollectionsEntity] AS [p]
++WHERE [p].[NullableString] IN (N'10', N'999')
++""",
++            //
++            """
++SELECT [p].[Id], [p].[Bool], [p].[Bools], [p].[DateTime], [p].[DateTimes], [p].[Enum], [p].[Enums], [p].[Int], [p].[Ints], [p].[NullableInt], [p].[NullableInts], [p].[NullableString], [p].[NullableStrings], [p].[String], [p].[Strings]
++FROM [PrimitiveCollectionsEntity] AS [p]
++WHERE [p].[NullableString] NOT IN (N'10', N'999') OR [p].[NullableString] IS NULL
++""");
++    }
++
++    public override async Task Parameter_collection_of_nullable_strings_Contains_string(bool async)
++    {
++        await base.Parameter_collection_of_nullable_strings_Contains_string(async);
++
++        AssertSql(
++            """
++SELECT [p].[Id], [p].[Bool], [p].[Bools], [p].[DateTime], [p].[DateTimes], [p].[Enum], [p].[Enums], [p].[Int], [p].[Ints], [p].[NullableInt], [p].[NullableInts], [p].[NullableString], [p].[NullableStrings], [p].[String], [p].[Strings]
++FROM [PrimitiveCollectionsEntity] AS [p]
++WHERE [p].[String] = N'10'
++""",
++            //
++            """
++SELECT [p].[Id], [p].[Bool], [p].[Bools], [p].[DateTime], [p].[DateTimes], [p].[Enum], [p].[Enums], [p].[Int], [p].[Ints], [p].[NullableInt], [p].[NullableInts], [p].[NullableString], [p].[NullableStrings], [p].[String], [p].[Strings]
++FROM [PrimitiveCollectionsEntity] AS [p]
++WHERE [p].[String] <> N'10'
++""");
++    }
++
++    public override async Task Parameter_collection_of_nullable_strings_Contains_nullable_string(bool async)
++    {
++        await base.Parameter_collection_of_nullable_strings_Contains_nullable_string(async);
++
++        AssertSql(
++            """
++SELECT [p].[Id], [p].[Bool], [p].[Bools], [p].[DateTime], [p].[DateTimes], [p].[Enum], [p].[Enums], [p].[Int], [p].[Ints], [p].[NullableInt], [p].[NullableInts], [p].[NullableString], [p].[NullableStrings], [p].[String], [p].[Strings]
++FROM [PrimitiveCollectionsEntity] AS [p]
+ WHERE [p].[NullableString] IS NULL OR [p].[NullableString] = N'999'
++""",
++            //
++            """
++SELECT [p].[Id], [p].[Bool], [p].[Bools], [p].[DateTime], [p].[DateTimes], [p].[Enum], [p].[Enums], [p].[Int], [p].[Ints], [p].[NullableInt], [p].[NullableInts], [p].[NullableString], [p].[NullableStrings], [p].[String], [p].[Strings]
++FROM [PrimitiveCollectionsEntity] AS [p]
++WHERE [p].[NullableString] IS NOT NULL AND [p].[NullableString] <> N'999'
+ """);
+     }
+ 
+diff --git a/test/EFCore.SqlServer.FunctionalTests/Query/PrimitiveCollectionsQuerySqlServerTest.cs b/test/EFCore.SqlServer.FunctionalTests/Query/PrimitiveCollectionsQuerySqlServerTest.cs
+index d19a3ae1d2..6501e17b11 100644
+--- a/test/EFCore.SqlServer.FunctionalTests/Query/PrimitiveCollectionsQuerySqlServerTest.cs
++++ b/test/EFCore.SqlServer.FunctionalTests/Query/PrimitiveCollectionsQuerySqlServerTest.cs
+@@ -303,9 +303,9 @@ SELECT COUNT(*)
+ """);
+     }
+ 
+-    public override async Task Parameter_collection_of_ints_Contains(bool async)
++    public override async Task Parameter_collection_of_ints_Contains_int(bool async)
+     {
+-        await base.Parameter_collection_of_ints_Contains(async);
++        await base.Parameter_collection_of_ints_Contains_int(async);
+ 
+         AssertSql(
+             """
+@@ -317,6 +317,45 @@ public override async Task Parameter_collection_of_ints_Contains(bool async)
+     SELECT [i].[value]
+     FROM OPENJSON(@__ints_0) WITH ([value] int '$') AS [i]
+ )
++""",
++            //
++            """
++@__ints_0='[10,999]' (Size = 4000)
++
++SELECT [p].[Id], [p].[Bool], [p].[Bools], [p].[DateTime], [p].[DateTimes], [p].[Enum], [p].[Enums], [p].[Int], [p].[Ints], [p].[NullableInt], [p].[NullableInts], [p].[NullableString], [p].[NullableStrings], [p].[String], [p].[Strings]
++FROM [PrimitiveCollectionsEntity] AS [p]
++WHERE [p].[Int] NOT IN (
++    SELECT [i].[value]
++    FROM OPENJSON(@__ints_0) WITH ([value] int '$') AS [i]
++)
++""");
++    }
++
++    public override async Task Parameter_collection_of_ints_Contains_nullable_int(bool async)
++    {
++        await base.Parameter_collection_of_ints_Contains_nullable_int(async);
++
++        AssertSql(
++            """
++@__ints_0='[10,999]' (Size = 4000)
++
++SELECT [p].[Id], [p].[Bool], [p].[Bools], [p].[DateTime], [p].[DateTimes], [p].[Enum], [p].[Enums], [p].[Int], [p].[Ints], [p].[NullableInt], [p].[NullableInts], [p].[NullableString], [p].[NullableStrings], [p].[String], [p].[Strings]
++FROM [PrimitiveCollectionsEntity] AS [p]
++WHERE [p].[NullableInt] IN (
++    SELECT [i].[value]
++    FROM OPENJSON(@__ints_0) WITH ([value] int '$') AS [i]
++)
++""",
++            //
++            """
++@__ints_0='[10,999]' (Size = 4000)
++
++SELECT [p].[Id], [p].[Bool], [p].[Bools], [p].[DateTime], [p].[DateTimes], [p].[Enum], [p].[Enums], [p].[Int], [p].[Ints], [p].[NullableInt], [p].[NullableInts], [p].[NullableString], [p].[NullableStrings], [p].[String], [p].[Strings]
++FROM [PrimitiveCollectionsEntity] AS [p]
++WHERE [p].[NullableInt] NOT IN (
++    SELECT [i].[value]
++    FROM OPENJSON(@__ints_0) WITH ([value] int '$') AS [i]
++) OR [p].[NullableInt] IS NULL
+ """);
+     }
+ 
+@@ -334,6 +373,17 @@ public override async Task Parameter_collection_of_nullable_ints_Contains_int(bo
+     SELECT [n].[value]
+     FROM OPENJSON(@__nullableInts_0) WITH ([value] int '$') AS [n]
+ )
++""",
++            //
++            """
++@__nullableInts_0='[10,999]' (Size = 4000)
++
++SELECT [p].[Id], [p].[Bool], [p].[Bools], [p].[DateTime], [p].[DateTimes], [p].[Enum], [p].[Enums], [p].[Int], [p].[Ints], [p].[NullableInt], [p].[NullableInts], [p].[NullableString], [p].[NullableStrings], [p].[String], [p].[Strings]
++FROM [PrimitiveCollectionsEntity] AS [p]
++WHERE [p].[Int] NOT IN (
++    SELECT [n].[value]
++    FROM OPENJSON(@__nullableInts_0) WITH ([value] int '$') AS [n]
++)
+ """);
+     }
+ 
+@@ -343,20 +393,31 @@ public override async Task Parameter_collection_of_nullable_ints_Contains_nullab
+ 
+         AssertSql(
+             """
+-@__nullableInts_0='[null,999]' (Size = 4000)
++@__nullableInts_0_without_nulls='[999]' (Size = 4000)
+ 
+ SELECT [p].[Id], [p].[Bool], [p].[Bools], [p].[DateTime], [p].[DateTimes], [p].[Enum], [p].[Enums], [p].[Int], [p].[Ints], [p].[NullableInt], [p].[NullableInts], [p].[NullableString], [p].[NullableStrings], [p].[String], [p].[Strings]
+ FROM [PrimitiveCollectionsEntity] AS [p]
+-WHERE EXISTS (
+-    SELECT 1
+-    FROM OPENJSON(@__nullableInts_0) WITH ([value] int '$') AS [n]
+-    WHERE [n].[value] = [p].[NullableInt] OR ([n].[value] IS NULL AND [p].[NullableInt] IS NULL))
++WHERE [p].[NullableInt] IN (
++    SELECT [n].[value]
++    FROM OPENJSON(@__nullableInts_0_without_nulls) AS [n]
++) OR [p].[NullableInt] IS NULL
++""",
++            //
++            """
++@__nullableInts_0_without_nulls='[999]' (Size = 4000)
++
++SELECT [p].[Id], [p].[Bool], [p].[Bools], [p].[DateTime], [p].[DateTimes], [p].[Enum], [p].[Enums], [p].[Int], [p].[Ints], [p].[NullableInt], [p].[NullableInts], [p].[NullableString], [p].[NullableStrings], [p].[String], [p].[Strings]
++FROM [PrimitiveCollectionsEntity] AS [p]
++WHERE [p].[NullableInt] NOT IN (
++    SELECT [n].[value]
++    FROM OPENJSON(@__nullableInts_0_without_nulls) AS [n]
++) AND [p].[NullableInt] IS NOT NULL
+ """);
+     }
+ 
+-    public override async Task Parameter_collection_of_strings_Contains_non_nullable_string(bool async)
++    public override async Task Parameter_collection_of_strings_Contains_string(bool async)
+     {
+-        await base.Parameter_collection_of_strings_Contains_non_nullable_string(async);
++        await base.Parameter_collection_of_strings_Contains_string(async);
+ 
+         AssertSql(
+             """
+@@ -368,6 +429,17 @@ public override async Task Parameter_collection_of_strings_Contains_non_nullable
+     SELECT [s].[value]
+     FROM OPENJSON(@__strings_0) WITH ([value] nvarchar(max) '$') AS [s]
+ )
++""",
++            //
++            """
++@__strings_0='["10","999"]' (Size = 4000)
++
++SELECT [p].[Id], [p].[Bool], [p].[Bools], [p].[DateTime], [p].[DateTimes], [p].[Enum], [p].[Enums], [p].[Int], [p].[Ints], [p].[NullableInt], [p].[NullableInts], [p].[NullableString], [p].[NullableStrings], [p].[String], [p].[Strings]
++FROM [PrimitiveCollectionsEntity] AS [p]
++WHERE [p].[String] NOT IN (
++    SELECT [s].[value]
++    FROM OPENJSON(@__strings_0) WITH ([value] nvarchar(max) '$') AS [s]
++)
+ """);
+     }
+ 
+@@ -377,14 +449,81 @@ public override async Task Parameter_collection_of_strings_Contains_nullable_str
+ 
+         AssertSql(
+             """
+-@__strings_0='["999",null]' (Size = 4000)
++@__strings_0='["10","999"]' (Size = 4000)
+ 
+ SELECT [p].[Id], [p].[Bool], [p].[Bools], [p].[DateTime], [p].[DateTimes], [p].[Enum], [p].[Enums], [p].[Int], [p].[Ints], [p].[NullableInt], [p].[NullableInts], [p].[NullableString], [p].[NullableStrings], [p].[String], [p].[Strings]
+ FROM [PrimitiveCollectionsEntity] AS [p]
+-WHERE EXISTS (
+-    SELECT 1
++WHERE [p].[NullableString] IN (
++    SELECT [s].[value]
++    FROM OPENJSON(@__strings_0) WITH ([value] nvarchar(max) '$') AS [s]
++)
++""",
++            //
++            """
++@__strings_0='["10","999"]' (Size = 4000)
++
++SELECT [p].[Id], [p].[Bool], [p].[Bools], [p].[DateTime], [p].[DateTimes], [p].[Enum], [p].[Enums], [p].[Int], [p].[Ints], [p].[NullableInt], [p].[NullableInts], [p].[NullableString], [p].[NullableStrings], [p].[String], [p].[Strings]
++FROM [PrimitiveCollectionsEntity] AS [p]
++WHERE [p].[NullableString] NOT IN (
++    SELECT [s].[value]
+     FROM OPENJSON(@__strings_0) WITH ([value] nvarchar(max) '$') AS [s]
+-    WHERE [s].[value] = [p].[NullableString] OR ([s].[value] IS NULL AND [p].[NullableString] IS NULL))
++) OR [p].[NullableString] IS NULL
++""");
++    }
++
++    public override async Task Parameter_collection_of_nullable_strings_Contains_string(bool async)
++    {
++        await base.Parameter_collection_of_nullable_strings_Contains_string(async);
++
++        AssertSql(
++            """
++@__strings_0='["10",null]' (Size = 4000)
++
++SELECT [p].[Id], [p].[Bool], [p].[Bools], [p].[DateTime], [p].[DateTimes], [p].[Enum], [p].[Enums], [p].[Int], [p].[Ints], [p].[NullableInt], [p].[NullableInts], [p].[NullableString], [p].[NullableStrings], [p].[String], [p].[Strings]
++FROM [PrimitiveCollectionsEntity] AS [p]
++WHERE [p].[String] IN (
++    SELECT [s].[value]
++    FROM OPENJSON(@__strings_0) WITH ([value] nvarchar(max) '$') AS [s]
++)
++""",
++            //
++            """
++@__strings_0_without_nulls='["10"]' (Size = 4000)
++
++SELECT [p].[Id], [p].[Bool], [p].[Bools], [p].[DateTime], [p].[DateTimes], [p].[Enum], [p].[Enums], [p].[Int], [p].[Ints], [p].[NullableInt], [p].[NullableInts], [p].[NullableString], [p].[NullableStrings], [p].[String], [p].[Strings]
++FROM [PrimitiveCollectionsEntity] AS [p]
++WHERE [p].[String] NOT IN (
++    SELECT [s].[value]
++    FROM OPENJSON(@__strings_0_without_nulls) AS [s]
++)
++""");
++    }
++
++    public override async Task Parameter_collection_of_nullable_strings_Contains_nullable_string(bool async)
++    {
++        await base.Parameter_collection_of_nullable_strings_Contains_nullable_string(async);
++
++        AssertSql(
++            """
++@__strings_0_without_nulls='["999"]' (Size = 4000)
++
++SELECT [p].[Id], [p].[Bool], [p].[Bools], [p].[DateTime], [p].[DateTimes], [p].[Enum], [p].[Enums], [p].[Int], [p].[Ints], [p].[NullableInt], [p].[NullableInts], [p].[NullableString], [p].[NullableStrings], [p].[String], [p].[Strings]
++FROM [PrimitiveCollectionsEntity] AS [p]
++WHERE [p].[NullableString] IN (
++    SELECT [s].[value]
++    FROM OPENJSON(@__strings_0_without_nulls) AS [s]
++) OR [p].[NullableString] IS NULL
++""",
++            //
++            """
++@__strings_0_without_nulls='["999"]' (Size = 4000)
++
++SELECT [p].[Id], [p].[Bool], [p].[Bools], [p].[DateTime], [p].[DateTimes], [p].[Enum], [p].[Enums], [p].[Int], [p].[Ints], [p].[NullableInt], [p].[NullableInts], [p].[NullableString], [p].[NullableStrings], [p].[String], [p].[Strings]
++FROM [PrimitiveCollectionsEntity] AS [p]
++WHERE [p].[NullableString] NOT IN (
++    SELECT [s].[value]
++    FROM OPENJSON(@__strings_0_without_nulls) AS [s]
++) AND [p].[NullableString] IS NOT NULL
+ """);
+     }
+ 
+diff --git a/test/EFCore.SqlServer.FunctionalTests/Query/TPCGearsOfWarQuerySqlServerTest.cs b/test/EFCore.SqlServer.FunctionalTests/Query/TPCGearsOfWarQuerySqlServerTest.cs
+index 794ddc2331..ea469ea8d6 100644
+--- a/test/EFCore.SqlServer.FunctionalTests/Query/TPCGearsOfWarQuerySqlServerTest.cs
++++ b/test/EFCore.SqlServer.FunctionalTests/Query/TPCGearsOfWarQuerySqlServerTest.cs
+@@ -314,10 +314,10 @@ UNION ALL
+     FROM [Officers] AS [o]
+ ) AS [t]
+ LEFT JOIN [Tags] AS [t0] ON [t].[Nickname] = [t0].[GearNickName] AND [t].[SquadId] = [t0].[GearSquadId]
+-WHERE [t0].[Id] IS NOT NULL AND EXISTS (
+-    SELECT 1
++WHERE [t0].[Id] IS NOT NULL AND [t0].[Id] IN (
++    SELECT [t1].[value]
+     FROM OPENJSON(@__tags_0) WITH ([value] uniqueidentifier '$') AS [t1]
+-    WHERE [t1].[value] = [t0].[Id] OR ([t1].[value] IS NULL AND [t0].[Id] IS NULL))
++)
+ """);
+     }
+ 
+@@ -344,10 +344,10 @@ UNION ALL
+ ) AS [t]
+ INNER JOIN [Cities] AS [c] ON [t].[CityOfBirthName] = [c].[Name]
+ LEFT JOIN [Tags] AS [t0] ON [t].[Nickname] = [t0].[GearNickName] AND [t].[SquadId] = [t0].[GearSquadId]
+-WHERE [c].[Location] IS NOT NULL AND EXISTS (
+-    SELECT 1
++WHERE [c].[Location] IS NOT NULL AND [t0].[Id] IN (
++    SELECT [t1].[value]
+     FROM OPENJSON(@__tags_0) WITH ([value] uniqueidentifier '$') AS [t1]
+-    WHERE [t1].[value] = [t0].[Id] OR ([t1].[value] IS NULL AND [t0].[Id] IS NULL))
++)
+ """);
+     }
+ 
+@@ -373,10 +373,10 @@ UNION ALL
+     FROM [Officers] AS [o]
+ ) AS [t]
+ LEFT JOIN [Tags] AS [t0] ON [t].[Nickname] = [t0].[GearNickName] AND [t].[SquadId] = [t0].[GearSquadId]
+-WHERE [t0].[Id] IS NOT NULL AND EXISTS (
+-    SELECT 1
++WHERE [t0].[Id] IS NOT NULL AND [t0].[Id] IN (
++    SELECT [t1].[value]
+     FROM OPENJSON(@__tags_0) WITH ([value] uniqueidentifier '$') AS [t1]
+-    WHERE [t1].[value] = [t0].[Id] OR ([t1].[value] IS NULL AND [t0].[Id] IS NULL))
++)
+ """);
+     }
+ 
+@@ -2924,10 +2924,10 @@ public override async Task Non_unicode_string_literals_in_contains_is_used_for_n
+ 
+ SELECT [c].[Name], [c].[Location], [c].[Nation]
+ FROM [Cities] AS [c]
+-WHERE EXISTS (
+-    SELECT 1
++WHERE [c].[Location] IN (
++    SELECT [c0].[value]
+     FROM OPENJSON(@__cities_0) WITH ([value] varchar(100) '$') AS [c0]
+-    WHERE [c0].[value] = [c].[Location] OR ([c0].[value] IS NULL AND [c].[Location] IS NULL))
++)
+ """);
+     }
+ 
+@@ -4792,7 +4792,7 @@ public override async Task Contains_on_nullable_array_produces_correct_sql(bool
+ 
+         AssertSql(
+             """
+-@__cities_0='["Ephyra",null]' (Size = 4000)
++@__cities_0_without_nulls='["Ephyra"]' (Size = 4000)
+ 
+ SELECT [t].[Nickname], [t].[SquadId], [t].[AssignedCityName], [t].[CityOfBirthName], [t].[FullName], [t].[HasSoulPatch], [t].[LeaderNickname], [t].[LeaderSquadId], [t].[Rank], [t].[Discriminator]
+ FROM (
+@@ -4803,10 +4803,10 @@ UNION ALL
+     FROM [Officers] AS [o]
+ ) AS [t]
+ LEFT JOIN [Cities] AS [c] ON [t].[AssignedCityName] = [c].[Name]
+-WHERE [t].[SquadId] < 2 AND EXISTS (
+-    SELECT 1
+-    FROM OPENJSON(@__cities_0) WITH ([value] nvarchar(450) '$') AS [c0]
+-    WHERE [c0].[value] = [c].[Name] OR ([c0].[value] IS NULL AND [c].[Name] IS NULL))
++WHERE [t].[SquadId] < 2 AND ([c].[Name] IN (
++    SELECT [c0].[value]
++    FROM OPENJSON(@__cities_0_without_nulls) AS [c0]
++) OR [c].[Name] IS NULL)
+ """);
+     }
+ 
+@@ -8079,10 +8079,10 @@ UNION ALL
+ ) AS [t]
+ LEFT JOIN [Weapons] AS [w] ON [t].[FullName] = [w].[OwnerFullName]
+ ORDER BY CASE
+-    WHEN EXISTS (
+-        SELECT 1
++    WHEN [t].[Nickname] IN (
++        SELECT [n].[value]
+         FROM OPENJSON(@__nicknames_0) WITH ([value] nvarchar(450) '$') AS [n]
+-        WHERE [n].[value] = [t].[Nickname]) THEN CAST(1 AS bit)
++    ) THEN CAST(1 AS bit)
+     ELSE CAST(0 AS bit)
+ END DESC, [t].[Nickname], [t].[SquadId]
+ """);
+@@ -10851,15 +10851,15 @@ public override async Task Enum_array_contains(bool async)
+ 
+         AssertSql(
+             """
+-@__types_0='[null,1]' (Size = 4000)
++@__types_0_without_nulls='[1]' (Size = 4000)
+ 
+ SELECT [w].[Id], [w].[AmmunitionType], [w].[IsAutomatic], [w].[Name], [w].[OwnerFullName], [w].[SynergyWithId]
+ FROM [Weapons] AS [w]
+ LEFT JOIN [Weapons] AS [w0] ON [w].[SynergyWithId] = [w0].[Id]
+-WHERE [w0].[Id] IS NOT NULL AND EXISTS (
+-    SELECT 1
+-    FROM OPENJSON(@__types_0) WITH ([value] int '$') AS [t]
+-    WHERE [t].[value] = [w0].[AmmunitionType] OR ([t].[value] IS NULL AND [w0].[AmmunitionType] IS NULL))
++WHERE [w0].[Id] IS NOT NULL AND ([w0].[AmmunitionType] IN (
++    SELECT [t].[value]
++    FROM OPENJSON(@__types_0_without_nulls) AS [t]
++) OR [w0].[AmmunitionType] IS NULL)
+ """);
+     }
+ 
+@@ -13404,18 +13404,14 @@ UNION ALL
+     SELECT [o].[Nickname], [o].[SquadId], [o].[AssignedCityName], [o].[CityOfBirthName], [o].[FullName], [o].[HasSoulPatch], [o].[LeaderNickname], [o].[LeaderSquadId], [o].[Rank], N'Officer' AS [Discriminator]
+     FROM [Officers] AS [o]
+ ) AS [t]
+-WHERE EXISTS (
+-    SELECT 1
++WHERE (
++    SELECT TOP(1) [w].[Name]
++    FROM [Weapons] AS [w]
++    WHERE [t].[FullName] = [w].[OwnerFullName]
++    ORDER BY [w].[Id]) IN (
++    SELECT [w0].[value]
+     FROM OPENJSON(@__weapons_0) WITH ([value] nvarchar(max) '$') AS [w0]
+-    WHERE [w0].[value] = (
+-        SELECT TOP(1) [w].[Name]
+-        FROM [Weapons] AS [w]
+-        WHERE [t].[FullName] = [w].[OwnerFullName]
+-        ORDER BY [w].[Id]) OR ([w0].[value] IS NULL AND (
+-        SELECT TOP(1) [w].[Name]
+-        FROM [Weapons] AS [w]
+-        WHERE [t].[FullName] = [w].[OwnerFullName]
+-        ORDER BY [w].[Id]) IS NULL))
++)
+ """);
+     }
+ 
+@@ -13695,7 +13691,7 @@ public override async Task Nested_contains_with_enum(bool async)
+         await base.Nested_contains_with_enum(async);
+ 
+         AssertSql(
+-"""
++            """
+ @__ranks_1='[1]' (Size = 4000)
+ @__key_2='5f221fb9-66f4-442a-92c9-d97ed5989cc7'
+ @__keys_0='["0a47bcb7-a1cb-4345-8944-c58f82d6aac7","5f221fb9-66f4-442a-92c9-d97ed5989cc7"]' (Size = 4000)
+@@ -13719,8 +13715,8 @@ ELSE @__key_2
+     FROM OPENJSON(@__keys_0) WITH ([value] uniqueidentifier '$') AS [k]
+ )
+ """,
+-                //
+-                """
++            //
++            """
+ @__ammoTypes_1='[1]' (Size = 4000)
+ @__key_2='5f221fb9-66f4-442a-92c9-d97ed5989cc7'
+ @__keys_0='["0a47bcb7-a1cb-4345-8944-c58f82d6aac7","5f221fb9-66f4-442a-92c9-d97ed5989cc7"]' (Size = 4000)
+@@ -13728,10 +13724,10 @@ ELSE @__key_2
+ SELECT [w].[Id], [w].[AmmunitionType], [w].[IsAutomatic], [w].[Name], [w].[OwnerFullName], [w].[SynergyWithId]
+ FROM [Weapons] AS [w]
+ WHERE CASE
+-    WHEN EXISTS (
+-        SELECT 1
++    WHEN [w].[AmmunitionType] IN (
++        SELECT [a].[value]
+         FROM OPENJSON(@__ammoTypes_1) WITH ([value] int '$') AS [a]
+-        WHERE [a].[value] = [w].[AmmunitionType] OR ([a].[value] IS NULL AND [w].[AmmunitionType] IS NULL)) THEN @__key_2
++    ) THEN @__key_2
+     ELSE @__key_2
+ END IN (
+     SELECT [k].[value]
+diff --git a/test/EFCore.SqlServer.FunctionalTests/Query/TPTGearsOfWarQuerySqlServerTest.cs b/test/EFCore.SqlServer.FunctionalTests/Query/TPTGearsOfWarQuerySqlServerTest.cs
+index 29a71a8b4a..88c68f07cd 100644
+--- a/test/EFCore.SqlServer.FunctionalTests/Query/TPTGearsOfWarQuerySqlServerTest.cs
++++ b/test/EFCore.SqlServer.FunctionalTests/Query/TPTGearsOfWarQuerySqlServerTest.cs
+@@ -295,10 +295,10 @@ public override async Task Include_where_list_contains_navigation(bool async)
+ FROM [Gears] AS [g]
+ LEFT JOIN [Officers] AS [o] ON [g].[Nickname] = [o].[Nickname] AND [g].[SquadId] = [o].[SquadId]
+ LEFT JOIN [Tags] AS [t] ON [g].[Nickname] = [t].[GearNickName] AND [g].[SquadId] = [t].[GearSquadId]
+-WHERE [t].[Id] IS NOT NULL AND EXISTS (
+-    SELECT 1
++WHERE [t].[Id] IS NOT NULL AND [t].[Id] IN (
++    SELECT [t0].[value]
+     FROM OPENJSON(@__tags_0) WITH ([value] uniqueidentifier '$') AS [t0]
+-    WHERE [t0].[value] = [t].[Id] OR ([t0].[value] IS NULL AND [t].[Id] IS NULL))
++)
+ """);
+     }
+ 
+@@ -322,10 +322,10 @@ public override async Task Include_where_list_contains_navigation2(bool async)
+ LEFT JOIN [Officers] AS [o] ON [g].[Nickname] = [o].[Nickname] AND [g].[SquadId] = [o].[SquadId]
+ INNER JOIN [Cities] AS [c] ON [g].[CityOfBirthName] = [c].[Name]
+ LEFT JOIN [Tags] AS [t] ON [g].[Nickname] = [t].[GearNickName] AND [g].[SquadId] = [t].[GearSquadId]
+-WHERE [c].[Location] IS NOT NULL AND EXISTS (
+-    SELECT 1
++WHERE [c].[Location] IS NOT NULL AND [t].[Id] IN (
++    SELECT [t0].[value]
+     FROM OPENJSON(@__tags_0) WITH ([value] uniqueidentifier '$') AS [t0]
+-    WHERE [t0].[value] = [t].[Id] OR ([t0].[value] IS NULL AND [t].[Id] IS NULL))
++)
+ """);
+     }
+ 
+@@ -348,10 +348,10 @@ public override async Task Navigation_accessed_twice_outside_and_inside_subquery
+ FROM [Gears] AS [g]
+ LEFT JOIN [Officers] AS [o] ON [g].[Nickname] = [o].[Nickname] AND [g].[SquadId] = [o].[SquadId]
+ LEFT JOIN [Tags] AS [t] ON [g].[Nickname] = [t].[GearNickName] AND [g].[SquadId] = [t].[GearSquadId]
+-WHERE [t].[Id] IS NOT NULL AND EXISTS (
+-    SELECT 1
++WHERE [t].[Id] IS NOT NULL AND [t].[Id] IN (
++    SELECT [t0].[value]
+     FROM OPENJSON(@__tags_0) WITH ([value] uniqueidentifier '$') AS [t0]
+-    WHERE [t0].[value] = [t].[Id] OR ([t0].[value] IS NULL AND [t].[Id] IS NULL))
++)
+ """);
+     }
+ 
+@@ -2445,10 +2445,10 @@ public override async Task Non_unicode_string_literals_in_contains_is_used_for_n
+ 
+ SELECT [c].[Name], [c].[Location], [c].[Nation]
+ FROM [Cities] AS [c]
+-WHERE EXISTS (
+-    SELECT 1
++WHERE [c].[Location] IN (
++    SELECT [c0].[value]
+     FROM OPENJSON(@__cities_0) WITH ([value] varchar(100) '$') AS [c0]
+-    WHERE [c0].[value] = [c].[Location] OR ([c0].[value] IS NULL AND [c].[Location] IS NULL))
++)
+ """);
+     }
+ 
+@@ -4101,7 +4101,7 @@ public override async Task Contains_on_nullable_array_produces_correct_sql(bool
+ 
+         AssertSql(
+             """
+-@__cities_0='["Ephyra",null]' (Size = 4000)
++@__cities_0_without_nulls='["Ephyra"]' (Size = 4000)
+ 
+ SELECT [g].[Nickname], [g].[SquadId], [g].[AssignedCityName], [g].[CityOfBirthName], [g].[FullName], [g].[HasSoulPatch], [g].[LeaderNickname], [g].[LeaderSquadId], [g].[Rank], CASE
+     WHEN [o].[Nickname] IS NOT NULL THEN N'Officer'
+@@ -4109,10 +4109,10 @@ public override async Task Contains_on_nullable_array_produces_correct_sql(bool
+ FROM [Gears] AS [g]
+ LEFT JOIN [Officers] AS [o] ON [g].[Nickname] = [o].[Nickname] AND [g].[SquadId] = [o].[SquadId]
+ LEFT JOIN [Cities] AS [c] ON [g].[AssignedCityName] = [c].[Name]
+-WHERE [g].[SquadId] < 2 AND EXISTS (
+-    SELECT 1
+-    FROM OPENJSON(@__cities_0) WITH ([value] nvarchar(450) '$') AS [c0]
+-    WHERE [c0].[value] = [c].[Name] OR ([c0].[value] IS NULL AND [c].[Name] IS NULL))
++WHERE [g].[SquadId] < 2 AND ([c].[Name] IN (
++    SELECT [c0].[value]
++    FROM OPENJSON(@__cities_0_without_nulls) AS [c0]
++) OR [c].[Name] IS NULL)
+ """);
+     }
+ 
+@@ -6766,10 +6766,10 @@ public override async Task Correlated_collection_with_complex_order_by_funcletiz
+ FROM [Gears] AS [g]
+ LEFT JOIN [Weapons] AS [w] ON [g].[FullName] = [w].[OwnerFullName]
+ ORDER BY CASE
+-    WHEN EXISTS (
+-        SELECT 1
++    WHEN [g].[Nickname] IN (
++        SELECT [n].[value]
+         FROM OPENJSON(@__nicknames_0) WITH ([value] nvarchar(450) '$') AS [n]
+-        WHERE [n].[value] = [g].[Nickname]) THEN CAST(1 AS bit)
++    ) THEN CAST(1 AS bit)
+     ELSE CAST(0 AS bit)
+ END DESC, [g].[Nickname], [g].[SquadId]
+ """);
+@@ -9199,15 +9199,15 @@ public override async Task Enum_array_contains(bool async)
+ 
+         AssertSql(
+             """
+-@__types_0='[null,1]' (Size = 4000)
++@__types_0_without_nulls='[1]' (Size = 4000)
+ 
+ SELECT [w].[Id], [w].[AmmunitionType], [w].[IsAutomatic], [w].[Name], [w].[OwnerFullName], [w].[SynergyWithId]
+ FROM [Weapons] AS [w]
+ LEFT JOIN [Weapons] AS [w0] ON [w].[SynergyWithId] = [w0].[Id]
+-WHERE [w0].[Id] IS NOT NULL AND EXISTS (
+-    SELECT 1
+-    FROM OPENJSON(@__types_0) WITH ([value] int '$') AS [t]
+-    WHERE [t].[value] = [w0].[AmmunitionType] OR ([t].[value] IS NULL AND [w0].[AmmunitionType] IS NULL))
++WHERE [w0].[Id] IS NOT NULL AND ([w0].[AmmunitionType] IN (
++    SELECT [t].[value]
++    FROM OPENJSON(@__types_0_without_nulls) AS [t]
++) OR [w0].[AmmunitionType] IS NULL)
+ """);
+     }
+ 
+@@ -11442,18 +11442,14 @@ public override async Task Nav_expansion_with_member_pushdown_inside_Contains_ar
+ END AS [Discriminator]
+ FROM [Gears] AS [g]
+ LEFT JOIN [Officers] AS [o] ON [g].[Nickname] = [o].[Nickname] AND [g].[SquadId] = [o].[SquadId]
+-WHERE EXISTS (
+-    SELECT 1
++WHERE (
++    SELECT TOP(1) [w].[Name]
++    FROM [Weapons] AS [w]
++    WHERE [g].[FullName] = [w].[OwnerFullName]
++    ORDER BY [w].[Id]) IN (
++    SELECT [w0].[value]
+     FROM OPENJSON(@__weapons_0) WITH ([value] nvarchar(max) '$') AS [w0]
+-    WHERE [w0].[value] = (
+-        SELECT TOP(1) [w].[Name]
+-        FROM [Weapons] AS [w]
+-        WHERE [g].[FullName] = [w].[OwnerFullName]
+-        ORDER BY [w].[Id]) OR ([w0].[value] IS NULL AND (
+-        SELECT TOP(1) [w].[Name]
+-        FROM [Weapons] AS [w]
+-        WHERE [g].[FullName] = [w].[OwnerFullName]
+-        ORDER BY [w].[Id]) IS NULL))
++)
+ """);
+     }
+ 
+@@ -11699,7 +11695,7 @@ public override async Task Nested_contains_with_enum(bool async)
+         await base.Nested_contains_with_enum(async);
+ 
+         AssertSql(
+-"""
++            """
+ @__ranks_1='[1]' (Size = 4000)
+ @__key_2='5f221fb9-66f4-442a-92c9-d97ed5989cc7'
+ @__keys_0='["0a47bcb7-a1cb-4345-8944-c58f82d6aac7","5f221fb9-66f4-442a-92c9-d97ed5989cc7"]' (Size = 4000)
+@@ -11720,8 +11716,8 @@ ELSE @__key_2
+     FROM OPENJSON(@__keys_0) WITH ([value] uniqueidentifier '$') AS [k]
+ )
+ """,
+-                //
+-                """
++            //
++            """
+ @__ammoTypes_1='[1]' (Size = 4000)
+ @__key_2='5f221fb9-66f4-442a-92c9-d97ed5989cc7'
+ @__keys_0='["0a47bcb7-a1cb-4345-8944-c58f82d6aac7","5f221fb9-66f4-442a-92c9-d97ed5989cc7"]' (Size = 4000)
+@@ -11729,10 +11725,10 @@ ELSE @__key_2
+ SELECT [w].[Id], [w].[AmmunitionType], [w].[IsAutomatic], [w].[Name], [w].[OwnerFullName], [w].[SynergyWithId]
+ FROM [Weapons] AS [w]
+ WHERE CASE
+-    WHEN EXISTS (
+-        SELECT 1
++    WHEN [w].[AmmunitionType] IN (
++        SELECT [a].[value]
+         FROM OPENJSON(@__ammoTypes_1) WITH ([value] int '$') AS [a]
+-        WHERE [a].[value] = [w].[AmmunitionType] OR ([a].[value] IS NULL AND [w].[AmmunitionType] IS NULL)) THEN @__key_2
++    ) THEN @__key_2
+     ELSE @__key_2
+ END IN (
+     SELECT [k].[value]
+diff --git a/test/EFCore.SqlServer.FunctionalTests/Query/TemporalComplexNavigationsCollectionsQuerySqlServerTest.cs b/test/EFCore.SqlServer.FunctionalTests/Query/TemporalComplexNavigationsCollectionsQuerySqlServerTest.cs
+index 6977e6925d..85362fb39b 100644
+--- a/test/EFCore.SqlServer.FunctionalTests/Query/TemporalComplexNavigationsCollectionsQuerySqlServerTest.cs
++++ b/test/EFCore.SqlServer.FunctionalTests/Query/TemporalComplexNavigationsCollectionsQuerySqlServerTest.cs
+@@ -2307,19 +2307,19 @@ public override async Task Collection_projection_over_GroupBy_over_parameter(boo
+ FROM (
+     SELECT [l].[Date]
+     FROM [LevelOne] FOR SYSTEM_TIME AS OF '2010-01-01T00:00:00.0000000' AS [l]
+-    WHERE EXISTS (
+-        SELECT 1
++    WHERE [l].[Name] IN (
++        SELECT [v].[value]
+         FROM OPENJSON(@__validIds_0) WITH ([value] nvarchar(max) '$') AS [v]
+-        WHERE [v].[value] = [l].[Name] OR ([v].[value] IS NULL AND [l].[Name] IS NULL))
++    )
+     GROUP BY [l].[Date]
+ ) AS [t]
+ LEFT JOIN (
+     SELECT [l0].[Id], [l0].[Date]
+     FROM [LevelOne] FOR SYSTEM_TIME AS OF '2010-01-01T00:00:00.0000000' AS [l0]
+-    WHERE EXISTS (
+-        SELECT 1
++    WHERE [l0].[Name] IN (
++        SELECT [v0].[value]
+         FROM OPENJSON(@__validIds_0) WITH ([value] nvarchar(max) '$') AS [v0]
+-        WHERE [v0].[value] = [l0].[Name] OR ([v0].[value] IS NULL AND [l0].[Name] IS NULL))
++    )
+ ) AS [t0] ON [t].[Date] = [t0].[Date]
+ ORDER BY [t].[Date]
+ """);
+@@ -2627,10 +2627,10 @@ SELECT CASE
+ FROM [LevelOne] FOR SYSTEM_TIME AS OF '2010-01-01T00:00:00.0000000' AS [l]
+ LEFT JOIN [LevelTwo] FOR SYSTEM_TIME AS OF '2010-01-01T00:00:00.0000000' AS [l0] ON [l].[Id] = [l0].[Level1_Required_Id]
+ LEFT JOIN [LevelThree] FOR SYSTEM_TIME AS OF '2010-01-01T00:00:00.0000000' AS [l1] ON [l0].[Id] = [l1].[OneToMany_Required_Inverse3Id]
+-WHERE EXISTS (
+-    SELECT 1
++WHERE [l].[Name] IN (
++    SELECT [v].[value]
+     FROM OPENJSON(@__validIds_0) WITH ([value] nvarchar(max) '$') AS [v]
+-    WHERE [v].[value] = [l].[Name] OR ([v].[value] IS NULL AND [l].[Name] IS NULL))
++)
+ ORDER BY [l].[Id], [l0].[Id]
+ """);
+     }
+diff --git a/test/EFCore.SqlServer.FunctionalTests/Query/TemporalComplexNavigationsCollectionsSharedTypeQuerySqlServerTest.cs b/test/EFCore.SqlServer.FunctionalTests/Query/TemporalComplexNavigationsCollectionsSharedTypeQuerySqlServerTest.cs
+index 9e9bdd2e9e..171729be12 100644
+--- a/test/EFCore.SqlServer.FunctionalTests/Query/TemporalComplexNavigationsCollectionsSharedTypeQuerySqlServerTest.cs
++++ b/test/EFCore.SqlServer.FunctionalTests/Query/TemporalComplexNavigationsCollectionsSharedTypeQuerySqlServerTest.cs
+@@ -1876,10 +1876,10 @@ SELECT CASE
+ ) AS [t1] ON CASE
+     WHEN [t0].[OneToOne_Required_PK_Date] IS NOT NULL AND [t0].[Level1_Required_Id] IS NOT NULL AND [t0].[OneToMany_Required_Inverse2Id] IS NOT NULL AND [t0].[PeriodEnd0] IS NOT NULL AND [t0].[PeriodStart0] IS NOT NULL THEN [t0].[Id0]
+ END = [t1].[OneToMany_Required_Inverse3Id]
+-WHERE EXISTS (
+-    SELECT 1
++WHERE [l].[Name] IN (
++    SELECT [v].[value]
+     FROM OPENJSON(@__validIds_0) WITH ([value] nvarchar(max) '$') AS [v]
+-    WHERE [v].[value] = [l].[Name] OR ([v].[value] IS NULL AND [l].[Name] IS NULL))
++)
+ ORDER BY [l].[Id], [t0].[Id], [t0].[Id0]
+ """);
+     }
+@@ -3040,19 +3040,19 @@ public override async Task Collection_projection_over_GroupBy_over_parameter(boo
+ FROM (
+     SELECT [l].[Date]
+     FROM [Level1] FOR SYSTEM_TIME AS OF '2010-01-01T00:00:00.0000000' AS [l]
+-    WHERE EXISTS (
+-        SELECT 1
++    WHERE [l].[Name] IN (
++        SELECT [v].[value]
+         FROM OPENJSON(@__validIds_0) WITH ([value] nvarchar(max) '$') AS [v]
+-        WHERE [v].[value] = [l].[Name] OR ([v].[value] IS NULL AND [l].[Name] IS NULL))
++    )
+     GROUP BY [l].[Date]
+ ) AS [t]
+ LEFT JOIN (
+     SELECT [l0].[Id], [l0].[Date]
+     FROM [Level1] FOR SYSTEM_TIME AS OF '2010-01-01T00:00:00.0000000' AS [l0]
+-    WHERE EXISTS (
+-        SELECT 1
++    WHERE [l0].[Name] IN (
++        SELECT [v0].[value]
+         FROM OPENJSON(@__validIds_0) WITH ([value] nvarchar(max) '$') AS [v0]
+-        WHERE [v0].[value] = [l0].[Name] OR ([v0].[value] IS NULL AND [l0].[Name] IS NULL))
++    )
+ ) AS [t0] ON [t].[Date] = [t0].[Date]
+ ORDER BY [t].[Date]
+ """);
+diff --git a/test/EFCore.SqlServer.FunctionalTests/Query/TemporalGearsOfWarQuerySqlServerTest.cs b/test/EFCore.SqlServer.FunctionalTests/Query/TemporalGearsOfWarQuerySqlServerTest.cs
+index bcee3b3fc0..a50942b161 100644
+--- a/test/EFCore.SqlServer.FunctionalTests/Query/TemporalGearsOfWarQuerySqlServerTest.cs
++++ b/test/EFCore.SqlServer.FunctionalTests/Query/TemporalGearsOfWarQuerySqlServerTest.cs
+@@ -64,10 +64,10 @@ public override async Task Include_where_list_contains_navigation(bool async)
+ SELECT [g].[Nickname], [g].[SquadId], [g].[AssignedCityName], [g].[CityOfBirthName], [g].[Discriminator], [g].[FullName], [g].[HasSoulPatch], [g].[LeaderNickname], [g].[LeaderSquadId], [g].[PeriodEnd], [g].[PeriodStart], [g].[Rank], [t].[Id], [t].[GearNickName], [t].[GearSquadId], [t].[IssueDate], [t].[Note], [t].[PeriodEnd], [t].[PeriodStart]
+ FROM [Gears] AS [g]
+ LEFT JOIN [Tags] AS [t] ON [g].[Nickname] = [t].[GearNickName] AND [g].[SquadId] = [t].[GearSquadId]
+-WHERE [t].[Id] IS NOT NULL AND EXISTS (
+-    SELECT 1
++WHERE [t].[Id] IS NOT NULL AND [t].[Id] IN (
++    SELECT [t0].[value]
+     FROM OPENJSON(@__tags_0) WITH ([value] uniqueidentifier '$') AS [t0]
+-    WHERE [t0].[value] = [t].[Id] OR ([t0].[value] IS NULL AND [t].[Id] IS NULL))
++)
+ """);
+     }
+ 
+@@ -89,10 +89,10 @@ public override async Task Include_where_list_contains_navigation2(bool async)
+ FROM [Gears] AS [g]
+ INNER JOIN [Cities] AS [c] ON [g].[CityOfBirthName] = [c].[Name]
+ LEFT JOIN [Tags] AS [t] ON [g].[Nickname] = [t].[GearNickName] AND [g].[SquadId] = [t].[GearSquadId]
+-WHERE [c].[Location] IS NOT NULL AND EXISTS (
+-    SELECT 1
++WHERE [c].[Location] IS NOT NULL AND [t].[Id] IN (
++    SELECT [t0].[value]
+     FROM OPENJSON(@__tags_0) WITH ([value] uniqueidentifier '$') AS [t0]
+-    WHERE [t0].[value] = [t].[Id] OR ([t0].[value] IS NULL AND [t].[Id] IS NULL))
++)
+ """);
+     }
+ 
+@@ -113,10 +113,10 @@ public override async Task Navigation_accessed_twice_outside_and_inside_subquery
+ SELECT [g].[Nickname], [g].[SquadId], [g].[AssignedCityName], [g].[CityOfBirthName], [g].[Discriminator], [g].[FullName], [g].[HasSoulPatch], [g].[LeaderNickname], [g].[LeaderSquadId], [g].[PeriodEnd], [g].[PeriodStart], [g].[Rank]
+ FROM [Gears] AS [g]
+ LEFT JOIN [Tags] AS [t] ON [g].[Nickname] = [t].[GearNickName] AND [g].[SquadId] = [t].[GearSquadId]
+-WHERE [t].[Id] IS NOT NULL AND EXISTS (
+-    SELECT 1
++WHERE [t].[Id] IS NOT NULL AND [t].[Id] IN (
++    SELECT [t0].[value]
+     FROM OPENJSON(@__tags_0) WITH ([value] uniqueidentifier '$') AS [t0]
+-    WHERE [t0].[value] = [t].[Id] OR ([t0].[value] IS NULL AND [t].[Id] IS NULL))
++)
+ """);
+     }
+ 
+@@ -1725,15 +1725,15 @@ public override async Task Contains_on_nullable_array_produces_correct_sql(bool
+ 
+         AssertSql(
+             """
+-@__cities_0='["Ephyra",null]' (Size = 4000)
++@__cities_0_without_nulls='["Ephyra"]' (Size = 4000)
+ 
+ SELECT [g].[Nickname], [g].[SquadId], [g].[AssignedCityName], [g].[CityOfBirthName], [g].[Discriminator], [g].[FullName], [g].[HasSoulPatch], [g].[LeaderNickname], [g].[LeaderSquadId], [g].[PeriodEnd], [g].[PeriodStart], [g].[Rank]
+ FROM [Gears] FOR SYSTEM_TIME AS OF '2010-01-01T00:00:00.0000000' AS [g]
+ LEFT JOIN [Cities] FOR SYSTEM_TIME AS OF '2010-01-01T00:00:00.0000000' AS [c] ON [g].[AssignedCityName] = [c].[Name]
+-WHERE [g].[SquadId] < 2 AND EXISTS (
+-    SELECT 1
+-    FROM OPENJSON(@__cities_0) WITH ([value] nvarchar(450) '$') AS [c0]
+-    WHERE [c0].[value] = [c].[Name] OR ([c0].[value] IS NULL AND [c].[Name] IS NULL))
++WHERE [g].[SquadId] < 2 AND ([c].[Name] IN (
++    SELECT [c0].[value]
++    FROM OPENJSON(@__cities_0_without_nulls) AS [c0]
++) OR [c].[Name] IS NULL)
+ """);
+     }
+ 
+@@ -5568,15 +5568,15 @@ public override async Task Enum_array_contains(bool async)
+ 
+         AssertSql(
+             """
+-@__types_0='[null,1]' (Size = 4000)
++@__types_0_without_nulls='[1]' (Size = 4000)
+ 
+ SELECT [w].[Id], [w].[AmmunitionType], [w].[IsAutomatic], [w].[Name], [w].[OwnerFullName], [w].[PeriodEnd], [w].[PeriodStart], [w].[SynergyWithId]
+ FROM [Weapons] FOR SYSTEM_TIME AS OF '2010-01-01T00:00:00.0000000' AS [w]
+ LEFT JOIN [Weapons] FOR SYSTEM_TIME AS OF '2010-01-01T00:00:00.0000000' AS [w0] ON [w].[SynergyWithId] = [w0].[Id]
+-WHERE [w0].[Id] IS NOT NULL AND EXISTS (
+-    SELECT 1
+-    FROM OPENJSON(@__types_0) WITH ([value] int '$') AS [t]
+-    WHERE [t].[value] = [w0].[AmmunitionType] OR ([t].[value] IS NULL AND [w0].[AmmunitionType] IS NULL))
++WHERE [w0].[Id] IS NOT NULL AND ([w0].[AmmunitionType] IN (
++    SELECT [t].[value]
++    FROM OPENJSON(@__types_0_without_nulls) AS [t]
++) OR [w0].[AmmunitionType] IS NULL)
+ """);
+     }
+ 
+@@ -6652,10 +6652,10 @@ public override async Task Non_unicode_string_literals_in_contains_is_used_for_n
+ 
+ SELECT [c].[Name], [c].[Location], [c].[Nation], [c].[PeriodEnd], [c].[PeriodStart]
+ FROM [Cities] FOR SYSTEM_TIME AS OF '2010-01-01T00:00:00.0000000' AS [c]
+-WHERE EXISTS (
+-    SELECT 1
++WHERE [c].[Location] IN (
++    SELECT [c0].[value]
+     FROM OPENJSON(@__cities_0) WITH ([value] varchar(100) '$') AS [c0]
+-    WHERE [c0].[value] = [c].[Location] OR ([c0].[value] IS NULL AND [c].[Location] IS NULL))
++)
+ """);
+     }
+ 
+@@ -7966,10 +7966,10 @@ public override async Task Correlated_collection_with_complex_order_by_funcletiz
+ FROM [Gears] FOR SYSTEM_TIME AS OF '2010-01-01T00:00:00.0000000' AS [g]
+ LEFT JOIN [Weapons] FOR SYSTEM_TIME AS OF '2010-01-01T00:00:00.0000000' AS [w] ON [g].[FullName] = [w].[OwnerFullName]
+ ORDER BY CASE
+-    WHEN EXISTS (
+-        SELECT 1
++    WHEN [g].[Nickname] IN (
++        SELECT [n].[value]
+         FROM OPENJSON(@__nicknames_0) WITH ([value] nvarchar(450) '$') AS [n]
+-        WHERE [n].[value] = [g].[Nickname]) THEN CAST(1 AS bit)
++    ) THEN CAST(1 AS bit)
+     ELSE CAST(0 AS bit)
+ END DESC, [g].[Nickname], [g].[SquadId]
+ """);
+@@ -10072,18 +10072,14 @@ public override async Task Nav_expansion_with_member_pushdown_inside_Contains_ar
+ 
+ SELECT [g].[Nickname], [g].[SquadId], [g].[AssignedCityName], [g].[CityOfBirthName], [g].[Discriminator], [g].[FullName], [g].[HasSoulPatch], [g].[LeaderNickname], [g].[LeaderSquadId], [g].[PeriodEnd], [g].[PeriodStart], [g].[Rank]
+ FROM [Gears] FOR SYSTEM_TIME AS OF '2010-01-01T00:00:00.0000000' AS [g]
+-WHERE EXISTS (
+-    SELECT 1
++WHERE (
++    SELECT TOP(1) [w].[Name]
++    FROM [Weapons] FOR SYSTEM_TIME AS OF '2010-01-01T00:00:00.0000000' AS [w]
++    WHERE [g].[FullName] = [w].[OwnerFullName]
++    ORDER BY [w].[Id]) IN (
++    SELECT [w0].[value]
+     FROM OPENJSON(@__weapons_0) WITH ([value] nvarchar(max) '$') AS [w0]
+-    WHERE [w0].[value] = (
+-        SELECT TOP(1) [w].[Name]
+-        FROM [Weapons] FOR SYSTEM_TIME AS OF '2010-01-01T00:00:00.0000000' AS [w]
+-        WHERE [g].[FullName] = [w].[OwnerFullName]
+-        ORDER BY [w].[Id]) OR ([w0].[value] IS NULL AND (
+-        SELECT TOP(1) [w].[Name]
+-        FROM [Weapons] FOR SYSTEM_TIME AS OF '2010-01-01T00:00:00.0000000' AS [w]
+-        WHERE [g].[FullName] = [w].[OwnerFullName]
+-        ORDER BY [w].[Id]) IS NULL))
++)
+ """);
+     }
+ 
+@@ -10268,7 +10264,7 @@ public override async Task Nested_contains_with_enum(bool async)
+         await base.Nested_contains_with_enum(async);
+ 
+         AssertSql(
+-"""
++            """
+ @__ranks_1='[1]' (Size = 4000)
+ @__key_2='5f221fb9-66f4-442a-92c9-d97ed5989cc7'
+ @__keys_0='["0a47bcb7-a1cb-4345-8944-c58f82d6aac7","5f221fb9-66f4-442a-92c9-d97ed5989cc7"]' (Size = 4000)
+@@ -10286,8 +10282,8 @@ ELSE @__key_2
+     FROM OPENJSON(@__keys_0) WITH ([value] uniqueidentifier '$') AS [k]
+ )
+ """,
+-                //
+-                """
++            //
++            """
+ @__ammoTypes_1='[1]' (Size = 4000)
+ @__key_2='5f221fb9-66f4-442a-92c9-d97ed5989cc7'
+ @__keys_0='["0a47bcb7-a1cb-4345-8944-c58f82d6aac7","5f221fb9-66f4-442a-92c9-d97ed5989cc7"]' (Size = 4000)
+@@ -10295,10 +10291,10 @@ ELSE @__key_2
+ SELECT [w].[Id], [w].[AmmunitionType], [w].[IsAutomatic], [w].[Name], [w].[OwnerFullName], [w].[PeriodEnd], [w].[PeriodStart], [w].[SynergyWithId]
+ FROM [Weapons] FOR SYSTEM_TIME AS OF '2010-01-01T00:00:00.0000000' AS [w]
+ WHERE CASE
+-    WHEN EXISTS (
+-        SELECT 1
++    WHEN [w].[AmmunitionType] IN (
++        SELECT [a].[value]
+         FROM OPENJSON(@__ammoTypes_1) WITH ([value] int '$') AS [a]
+-        WHERE [a].[value] = [w].[AmmunitionType] OR ([a].[value] IS NULL AND [w].[AmmunitionType] IS NULL)) THEN @__key_2
++    ) THEN @__key_2
+     ELSE @__key_2
+ END IN (
+     SELECT [k].[value]
+diff --git a/test/EFCore.Sqlite.FunctionalTests/Query/GearsOfWarQuerySqliteTest.cs b/test/EFCore.Sqlite.FunctionalTests/Query/GearsOfWarQuerySqliteTest.cs
+index 9cb95acc00..54a4c38531 100644
+--- a/test/EFCore.Sqlite.FunctionalTests/Query/GearsOfWarQuerySqliteTest.cs
++++ b/test/EFCore.Sqlite.FunctionalTests/Query/GearsOfWarQuerySqliteTest.cs
+@@ -810,10 +810,10 @@ public override async Task Include_where_list_contains_navigation2(bool async)
+ FROM "Gears" AS "g"
+ INNER JOIN "Cities" AS "c" ON "g"."CityOfBirthName" = "c"."Name"
+ LEFT JOIN "Tags" AS "t" ON "g"."Nickname" = "t"."GearNickName" AND "g"."SquadId" = "t"."GearSquadId"
+-WHERE "c"."Location" IS NOT NULL AND EXISTS (
+-    SELECT 1
++WHERE "c"."Location" IS NOT NULL AND "t"."Id" IN (
++    SELECT "t0"."value"
+     FROM json_each(@__tags_0) AS "t0"
+-    WHERE "t0"."value" = "t"."Id" OR ("t0"."value" IS NULL AND "t"."Id" IS NULL))
++)
+ """);
+     }
+ 
+@@ -1178,10 +1178,10 @@ public override async Task Non_unicode_string_literals_in_contains_is_used_for_n
+ 
+ SELECT "c"."Name", "c"."Location", "c"."Nation"
+ FROM "Cities" AS "c"
+-WHERE EXISTS (
+-    SELECT 1
++WHERE "c"."Location" IN (
++    SELECT "c0"."value"
+     FROM json_each(@__cities_0) AS "c0"
+-    WHERE "c0"."value" = "c"."Location" OR ("c0"."value" IS NULL AND "c"."Location" IS NULL))
++)
+ """);
+     }
+ 
+@@ -1902,10 +1902,10 @@ public override async Task Correlated_collection_with_complex_order_by_funcletiz
+ SELECT "g"."Nickname", "g"."SquadId", "w"."Name", "w"."Id"
+ FROM "Gears" AS "g"
+ LEFT JOIN "Weapons" AS "w" ON "g"."FullName" = "w"."OwnerFullName"
+-ORDER BY COALESCE("g"."Nickname" IN (
++ORDER BY "g"."Nickname" IN (
+     SELECT "n"."value"
+     FROM json_each(@__nicknames_0) AS "n"
+-), 0) DESC, "g"."Nickname", "g"."SquadId"
++) DESC, "g"."Nickname", "g"."SquadId"
+ """);
+     }
+ 
+@@ -2744,15 +2744,15 @@ public override async Task Contains_on_nullable_array_produces_correct_sql(bool
+ 
+         AssertSql(
+             """
+-@__cities_0='["Ephyra",null]' (Size = 15)
++@__cities_0_without_nulls='["Ephyra"]' (Size = 10)
+ 
+ SELECT "g"."Nickname", "g"."SquadId", "g"."AssignedCityName", "g"."CityOfBirthName", "g"."Discriminator", "g"."FullName", "g"."HasSoulPatch", "g"."LeaderNickname", "g"."LeaderSquadId", "g"."Rank"
+ FROM "Gears" AS "g"
+ LEFT JOIN "Cities" AS "c" ON "g"."AssignedCityName" = "c"."Name"
+-WHERE "g"."SquadId" < 2 AND EXISTS (
+-    SELECT 1
+-    FROM json_each(@__cities_0) AS "c0"
+-    WHERE "c0"."value" = "c"."Name" OR ("c0"."value" IS NULL AND "c"."Name" IS NULL))
++WHERE "g"."SquadId" < 2 AND ("c"."Name" IN (
++    SELECT "c0"."value"
++    FROM json_each(@__cities_0_without_nulls) AS "c0"
++) OR "c"."Name" IS NULL)
+ """);
+     }
+ 
+@@ -3033,15 +3033,15 @@ public override async Task Enum_array_contains(bool async)
+ 
+         AssertSql(
+             """
+-@__types_0='[null,1]' (Size = 8)
++@__types_0_without_nulls='[1]' (Size = 3)
+ 
+ SELECT "w"."Id", "w"."AmmunitionType", "w"."IsAutomatic", "w"."Name", "w"."OwnerFullName", "w"."SynergyWithId"
+ FROM "Weapons" AS "w"
+ LEFT JOIN "Weapons" AS "w0" ON "w"."SynergyWithId" = "w0"."Id"
+-WHERE "w0"."Id" IS NOT NULL AND EXISTS (
+-    SELECT 1
+-    FROM json_each(@__types_0) AS "t"
+-    WHERE "t"."value" = "w0"."AmmunitionType" OR ("t"."value" IS NULL AND "w0"."AmmunitionType" IS NULL))
++WHERE "w0"."Id" IS NOT NULL AND ("w0"."AmmunitionType" IN (
++    SELECT "t"."value"
++    FROM json_each(@__types_0_without_nulls) AS "t"
++) OR "w0"."AmmunitionType" IS NULL)
+ """);
+     }
+ 
+@@ -3668,10 +3668,10 @@ public override async Task Navigation_accessed_twice_outside_and_inside_subquery
+ SELECT "g"."Nickname", "g"."SquadId", "g"."AssignedCityName", "g"."CityOfBirthName", "g"."Discriminator", "g"."FullName", "g"."HasSoulPatch", "g"."LeaderNickname", "g"."LeaderSquadId", "g"."Rank"
+ FROM "Gears" AS "g"
+ LEFT JOIN "Tags" AS "t" ON "g"."Nickname" = "t"."GearNickName" AND "g"."SquadId" = "t"."GearSquadId"
+-WHERE "t"."Id" IS NOT NULL AND EXISTS (
+-    SELECT 1
++WHERE "t"."Id" IS NOT NULL AND "t"."Id" IN (
++    SELECT "t0"."value"
+     FROM json_each(@__tags_0) AS "t0"
+-    WHERE "t0"."value" = "t"."Id" OR ("t0"."value" IS NULL AND "t"."Id" IS NULL))
++)
+ """);
+     }
+ 
+@@ -4835,10 +4835,10 @@ public override async Task Include_where_list_contains_navigation(bool async)
+ SELECT "g"."Nickname", "g"."SquadId", "g"."AssignedCityName", "g"."CityOfBirthName", "g"."Discriminator", "g"."FullName", "g"."HasSoulPatch", "g"."LeaderNickname", "g"."LeaderSquadId", "g"."Rank", "t"."Id", "t"."GearNickName", "t"."GearSquadId", "t"."IssueDate", "t"."Note"
+ FROM "Gears" AS "g"
+ LEFT JOIN "Tags" AS "t" ON "g"."Nickname" = "t"."GearNickName" AND "g"."SquadId" = "t"."GearSquadId"
+-WHERE "t"."Id" IS NOT NULL AND EXISTS (
+-    SELECT 1
++WHERE "t"."Id" IS NOT NULL AND "t"."Id" IN (
++    SELECT "t0"."value"
+     FROM json_each(@__tags_0) AS "t0"
+-    WHERE "t0"."value" = "t"."Id" OR ("t0"."value" IS NULL AND "t"."Id" IS NULL))
++)
+ """);
+     }
+ 
+@@ -9547,20 +9547,15 @@ public override async Task Nav_expansion_with_member_pushdown_inside_Contains_ar
+ 
+ SELECT "g"."Nickname", "g"."SquadId", "g"."AssignedCityName", "g"."CityOfBirthName", "g"."Discriminator", "g"."FullName", "g"."HasSoulPatch", "g"."LeaderNickname", "g"."LeaderSquadId", "g"."Rank"
+ FROM "Gears" AS "g"
+-WHERE EXISTS (
+-    SELECT 1
++WHERE (
++    SELECT "w"."Name"
++    FROM "Weapons" AS "w"
++    WHERE "g"."FullName" = "w"."OwnerFullName"
++    ORDER BY "w"."Id"
++    LIMIT 1) IN (
++    SELECT "w0"."value"
+     FROM json_each(@__weapons_0) AS "w0"
+-    WHERE "w0"."value" = (
+-        SELECT "w"."Name"
+-        FROM "Weapons" AS "w"
+-        WHERE "g"."FullName" = "w"."OwnerFullName"
+-        ORDER BY "w"."Id"
+-        LIMIT 1) OR ("w0"."value" IS NULL AND (
+-        SELECT "w"."Name"
+-        FROM "Weapons" AS "w"
+-        WHERE "g"."FullName" = "w"."OwnerFullName"
+-        ORDER BY "w"."Id"
+-        LIMIT 1) IS NULL))
++)
+ """);
+     }
+ 
+@@ -9739,7 +9734,7 @@ public override async Task Nested_contains_with_enum(bool async)
+         await base.Nested_contains_with_enum(async);
+ 
+         AssertSql(
+-"""
++            """
+ @__ranks_1='[1]' (Size = 3)
+ @__key_2='5f221fb9-66f4-442a-92c9-d97ed5989cc7'
+ @__keys_0='["0A47BCB7-A1CB-4345-8944-C58F82D6AAC7","5F221FB9-66F4-442A-92C9-D97ED5989CC7"]' (Size = 79)
+@@ -9757,8 +9752,8 @@ ELSE @__key_2
+     FROM json_each(@__keys_0) AS "k"
+ )
+ """,
+-                //
+-                """
++            //
++            """
+ @__ammoTypes_1='[1]' (Size = 3)
+ @__key_2='5f221fb9-66f4-442a-92c9-d97ed5989cc7'
+ @__keys_0='["0A47BCB7-A1CB-4345-8944-C58F82D6AAC7","5F221FB9-66F4-442A-92C9-D97ED5989CC7"]' (Size = 79)
+@@ -9766,10 +9761,10 @@ ELSE @__key_2
+ SELECT "w"."Id", "w"."AmmunitionType", "w"."IsAutomatic", "w"."Name", "w"."OwnerFullName", "w"."SynergyWithId"
+ FROM "Weapons" AS "w"
+ WHERE CASE
+-    WHEN EXISTS (
+-        SELECT 1
++    WHEN "w"."AmmunitionType" IN (
++        SELECT "a"."value"
+         FROM json_each(@__ammoTypes_1) AS "a"
+-        WHERE "a"."value" = "w"."AmmunitionType" OR ("a"."value" IS NULL AND "w"."AmmunitionType" IS NULL)) THEN @__key_2
++    ) THEN @__key_2
+     ELSE @__key_2
+ END IN (
+     SELECT "k"."value"
+diff --git a/test/EFCore.Sqlite.FunctionalTests/Query/NorthwindAggregateOperatorsQuerySqliteTest.cs b/test/EFCore.Sqlite.FunctionalTests/Query/NorthwindAggregateOperatorsQuerySqliteTest.cs
+index 05c75dfe23..045ab4eba7 100644
+--- a/test/EFCore.Sqlite.FunctionalTests/Query/NorthwindAggregateOperatorsQuerySqliteTest.cs
++++ b/test/EFCore.Sqlite.FunctionalTests/Query/NorthwindAggregateOperatorsQuerySqliteTest.cs
+@@ -81,10 +81,10 @@ public override async Task Contains_inside_aggregate_function_with_GroupBy(bool
+ @__cities_0='["London","Berlin"]' (Size = 19)
+ 
+ SELECT COUNT(CASE
+-    WHEN EXISTS (
+-        SELECT 1
++    WHEN "c"."City" IN (
++        SELECT "c0"."value"
+         FROM json_each(@__cities_0) AS "c0"
+-        WHERE "c0"."value" = "c"."City" OR ("c0"."value" IS NULL AND "c"."City" IS NULL)) THEN 1
++    ) THEN 1
+ END)
+ FROM "Customers" AS "c"
+ GROUP BY "c"."Country"
+@@ -100,10 +100,10 @@ public override async Task Contains_inside_Average_without_GroupBy(bool async)
+ @__cities_0='["London","Berlin"]' (Size = 19)
+ 
+ SELECT AVG(CASE
+-    WHEN EXISTS (
+-        SELECT 1
++    WHEN "c"."City" IN (
++        SELECT "c0"."value"
+         FROM json_each(@__cities_0) AS "c0"
+-        WHERE "c0"."value" = "c"."City" OR ("c0"."value" IS NULL AND "c"."City" IS NULL)) THEN 1.0
++    ) THEN 1.0
+     ELSE 0.0
+ END)
+ FROM "Customers" AS "c"
+@@ -119,10 +119,10 @@ public override async Task Contains_inside_Sum_without_GroupBy(bool async)
+ @__cities_0='["London","Berlin"]' (Size = 19)
+ 
+ SELECT COALESCE(SUM(CASE
+-    WHEN EXISTS (
+-        SELECT 1
++    WHEN "c"."City" IN (
++        SELECT "c0"."value"
+         FROM json_each(@__cities_0) AS "c0"
+-        WHERE "c0"."value" = "c"."City" OR ("c0"."value" IS NULL AND "c"."City" IS NULL)) THEN 1
++    ) THEN 1
+     ELSE 0
+ END), 0)
+ FROM "Customers" AS "c"
+@@ -139,10 +139,10 @@ public override async Task Contains_inside_Count_without_GroupBy(bool async)
+ 
+ SELECT COUNT(*)
+ FROM "Customers" AS "c"
+-WHERE EXISTS (
+-    SELECT 1
++WHERE "c"."City" IN (
++    SELECT "c0"."value"
+     FROM json_each(@__cities_0) AS "c0"
+-    WHERE "c0"."value" = "c"."City" OR ("c0"."value" IS NULL AND "c"."City" IS NULL))
++)
+ """);
+     }
+ 
+@@ -156,10 +156,10 @@ public override async Task Contains_inside_LongCount_without_GroupBy(bool async)
+ 
+ SELECT COUNT(*)
+ FROM "Customers" AS "c"
+-WHERE EXISTS (
+-    SELECT 1
++WHERE "c"."City" IN (
++    SELECT "c0"."value"
+     FROM json_each(@__cities_0) AS "c0"
+-    WHERE "c0"."value" = "c"."City" OR ("c0"."value" IS NULL AND "c"."City" IS NULL))
++)
+ """);
+     }
+ 
+@@ -172,10 +172,10 @@ public override async Task Contains_inside_Max_without_GroupBy(bool async)
+ @__cities_0='["London","Berlin"]' (Size = 19)
+ 
+ SELECT MAX(CASE
+-    WHEN EXISTS (
+-        SELECT 1
++    WHEN "c"."City" IN (
++        SELECT "c0"."value"
+         FROM json_each(@__cities_0) AS "c0"
+-        WHERE "c0"."value" = "c"."City" OR ("c0"."value" IS NULL AND "c"."City" IS NULL)) THEN 1
++    ) THEN 1
+     ELSE 0
+ END)
+ FROM "Customers" AS "c"
+@@ -191,10 +191,10 @@ public override async Task Contains_inside_Min_without_GroupBy(bool async)
+ @__cities_0='["London","Berlin"]' (Size = 19)
+ 
+ SELECT MIN(CASE
+-    WHEN EXISTS (
+-        SELECT 1
++    WHEN "c"."City" IN (
++        SELECT "c0"."value"
+         FROM json_each(@__cities_0) AS "c0"
+-        WHERE "c0"."value" = "c"."City" OR ("c0"."value" IS NULL AND "c"."City" IS NULL)) THEN 1
++    ) THEN 1
+     ELSE 0
+ END)
+ FROM "Customers" AS "c"
+diff --git a/test/EFCore.Sqlite.FunctionalTests/Query/PrimitiveCollectionsQuerySqliteTest.cs b/test/EFCore.Sqlite.FunctionalTests/Query/PrimitiveCollectionsQuerySqliteTest.cs
+index e4a6ac772e..6628301f79 100644
+--- a/test/EFCore.Sqlite.FunctionalTests/Query/PrimitiveCollectionsQuerySqliteTest.cs
++++ b/test/EFCore.Sqlite.FunctionalTests/Query/PrimitiveCollectionsQuerySqliteTest.cs
+@@ -301,9 +301,9 @@ SELECT COUNT(*)
+ """);
+     }
+ 
+-    public override async Task Parameter_collection_of_ints_Contains(bool async)
++    public override async Task Parameter_collection_of_ints_Contains_int(bool async)
+     {
+-        await base.Parameter_collection_of_ints_Contains(async);
++        await base.Parameter_collection_of_ints_Contains_int(async);
+ 
+         AssertSql(
+             """
+@@ -315,6 +315,45 @@ public override async Task Parameter_collection_of_ints_Contains(bool async)
+     SELECT "i"."value"
+     FROM json_each(@__ints_0) AS "i"
+ )
++""",
++            //
++            """
++@__ints_0='[10,999]' (Size = 8)
++
++SELECT "p"."Id", "p"."Bool", "p"."Bools", "p"."DateTime", "p"."DateTimes", "p"."Enum", "p"."Enums", "p"."Int", "p"."Ints", "p"."NullableInt", "p"."NullableInts", "p"."NullableString", "p"."NullableStrings", "p"."String", "p"."Strings"
++FROM "PrimitiveCollectionsEntity" AS "p"
++WHERE "p"."Int" NOT IN (
++    SELECT "i"."value"
++    FROM json_each(@__ints_0) AS "i"
++)
++""");
++    }
++
++    public override async Task Parameter_collection_of_ints_Contains_nullable_int(bool async)
++    {
++        await base.Parameter_collection_of_ints_Contains_nullable_int(async);
++
++        AssertSql(
++            """
++@__ints_0='[10,999]' (Size = 8)
++
++SELECT "p"."Id", "p"."Bool", "p"."Bools", "p"."DateTime", "p"."DateTimes", "p"."Enum", "p"."Enums", "p"."Int", "p"."Ints", "p"."NullableInt", "p"."NullableInts", "p"."NullableString", "p"."NullableStrings", "p"."String", "p"."Strings"
++FROM "PrimitiveCollectionsEntity" AS "p"
++WHERE "p"."NullableInt" IN (
++    SELECT "i"."value"
++    FROM json_each(@__ints_0) AS "i"
++)
++""",
++            //
++            """
++@__ints_0='[10,999]' (Size = 8)
++
++SELECT "p"."Id", "p"."Bool", "p"."Bools", "p"."DateTime", "p"."DateTimes", "p"."Enum", "p"."Enums", "p"."Int", "p"."Ints", "p"."NullableInt", "p"."NullableInts", "p"."NullableString", "p"."NullableStrings", "p"."String", "p"."Strings"
++FROM "PrimitiveCollectionsEntity" AS "p"
++WHERE "p"."NullableInt" NOT IN (
++    SELECT "i"."value"
++    FROM json_each(@__ints_0) AS "i"
++) OR "p"."NullableInt" IS NULL
+ """);
+     }
+ 
+@@ -332,6 +371,17 @@ public override async Task Parameter_collection_of_nullable_ints_Contains_int(bo
+     SELECT "n"."value"
+     FROM json_each(@__nullableInts_0) AS "n"
+ )
++""",
++            //
++            """
++@__nullableInts_0='[10,999]' (Size = 8)
++
++SELECT "p"."Id", "p"."Bool", "p"."Bools", "p"."DateTime", "p"."DateTimes", "p"."Enum", "p"."Enums", "p"."Int", "p"."Ints", "p"."NullableInt", "p"."NullableInts", "p"."NullableString", "p"."NullableStrings", "p"."String", "p"."Strings"
++FROM "PrimitiveCollectionsEntity" AS "p"
++WHERE "p"."Int" NOT IN (
++    SELECT "n"."value"
++    FROM json_each(@__nullableInts_0) AS "n"
++)
+ """);
+     }
+ 
+@@ -341,20 +391,31 @@ public override async Task Parameter_collection_of_nullable_ints_Contains_nullab
+ 
+         AssertSql(
+             """
+-@__nullableInts_0='[null,999]' (Size = 10)
++@__nullableInts_0_without_nulls='[999]' (Size = 5)
+ 
+ SELECT "p"."Id", "p"."Bool", "p"."Bools", "p"."DateTime", "p"."DateTimes", "p"."Enum", "p"."Enums", "p"."Int", "p"."Ints", "p"."NullableInt", "p"."NullableInts", "p"."NullableString", "p"."NullableStrings", "p"."String", "p"."Strings"
+ FROM "PrimitiveCollectionsEntity" AS "p"
+-WHERE EXISTS (
+-    SELECT 1
+-    FROM json_each(@__nullableInts_0) AS "n"
+-    WHERE "n"."value" = "p"."NullableInt" OR ("n"."value" IS NULL AND "p"."NullableInt" IS NULL))
++WHERE "p"."NullableInt" IN (
++    SELECT "n"."value"
++    FROM json_each(@__nullableInts_0_without_nulls) AS "n"
++) OR "p"."NullableInt" IS NULL
++""",
++            //
++            """
++@__nullableInts_0_without_nulls='[999]' (Size = 5)
++
++SELECT "p"."Id", "p"."Bool", "p"."Bools", "p"."DateTime", "p"."DateTimes", "p"."Enum", "p"."Enums", "p"."Int", "p"."Ints", "p"."NullableInt", "p"."NullableInts", "p"."NullableString", "p"."NullableStrings", "p"."String", "p"."Strings"
++FROM "PrimitiveCollectionsEntity" AS "p"
++WHERE "p"."NullableInt" NOT IN (
++    SELECT "n"."value"
++    FROM json_each(@__nullableInts_0_without_nulls) AS "n"
++) AND "p"."NullableInt" IS NOT NULL
+ """);
+     }
+ 
+-    public override async Task Parameter_collection_of_strings_Contains_non_nullable_string(bool async)
++    public override async Task Parameter_collection_of_strings_Contains_string(bool async)
+     {
+-        await base.Parameter_collection_of_strings_Contains_non_nullable_string(async);
++        await base.Parameter_collection_of_strings_Contains_string(async);
+ 
+         AssertSql(
+             """
+@@ -366,6 +427,17 @@ public override async Task Parameter_collection_of_strings_Contains_non_nullable
+     SELECT "s"."value"
+     FROM json_each(@__strings_0) AS "s"
+ )
++""",
++            //
++            """
++@__strings_0='["10","999"]' (Size = 12)
++
++SELECT "p"."Id", "p"."Bool", "p"."Bools", "p"."DateTime", "p"."DateTimes", "p"."Enum", "p"."Enums", "p"."Int", "p"."Ints", "p"."NullableInt", "p"."NullableInts", "p"."NullableString", "p"."NullableStrings", "p"."String", "p"."Strings"
++FROM "PrimitiveCollectionsEntity" AS "p"
++WHERE "p"."String" NOT IN (
++    SELECT "s"."value"
++    FROM json_each(@__strings_0) AS "s"
++)
+ """);
+     }
+ 
+@@ -375,14 +447,81 @@ public override async Task Parameter_collection_of_strings_Contains_nullable_str
+ 
+         AssertSql(
+             """
+-@__strings_0='["999",null]' (Size = 12)
++@__strings_0='["10","999"]' (Size = 12)
+ 
+ SELECT "p"."Id", "p"."Bool", "p"."Bools", "p"."DateTime", "p"."DateTimes", "p"."Enum", "p"."Enums", "p"."Int", "p"."Ints", "p"."NullableInt", "p"."NullableInts", "p"."NullableString", "p"."NullableStrings", "p"."String", "p"."Strings"
+ FROM "PrimitiveCollectionsEntity" AS "p"
+-WHERE EXISTS (
+-    SELECT 1
++WHERE "p"."NullableString" IN (
++    SELECT "s"."value"
++    FROM json_each(@__strings_0) AS "s"
++)
++""",
++            //
++            """
++@__strings_0='["10","999"]' (Size = 12)
++
++SELECT "p"."Id", "p"."Bool", "p"."Bools", "p"."DateTime", "p"."DateTimes", "p"."Enum", "p"."Enums", "p"."Int", "p"."Ints", "p"."NullableInt", "p"."NullableInts", "p"."NullableString", "p"."NullableStrings", "p"."String", "p"."Strings"
++FROM "PrimitiveCollectionsEntity" AS "p"
++WHERE "p"."NullableString" NOT IN (
++    SELECT "s"."value"
+     FROM json_each(@__strings_0) AS "s"
+-    WHERE "s"."value" = "p"."NullableString" OR ("s"."value" IS NULL AND "p"."NullableString" IS NULL))
++) OR "p"."NullableString" IS NULL
++""");
++    }
++
++    public override async Task Parameter_collection_of_nullable_strings_Contains_string(bool async)
++    {
++        await base.Parameter_collection_of_nullable_strings_Contains_string(async);
++
++        AssertSql(
++            """
++@__strings_0='["10",null]' (Size = 11)
++
++SELECT "p"."Id", "p"."Bool", "p"."Bools", "p"."DateTime", "p"."DateTimes", "p"."Enum", "p"."Enums", "p"."Int", "p"."Ints", "p"."NullableInt", "p"."NullableInts", "p"."NullableString", "p"."NullableStrings", "p"."String", "p"."Strings"
++FROM "PrimitiveCollectionsEntity" AS "p"
++WHERE "p"."String" IN (
++    SELECT "s"."value"
++    FROM json_each(@__strings_0) AS "s"
++)
++""",
++            //
++            """
++@__strings_0_without_nulls='["10"]' (Size = 6)
++
++SELECT "p"."Id", "p"."Bool", "p"."Bools", "p"."DateTime", "p"."DateTimes", "p"."Enum", "p"."Enums", "p"."Int", "p"."Ints", "p"."NullableInt", "p"."NullableInts", "p"."NullableString", "p"."NullableStrings", "p"."String", "p"."Strings"
++FROM "PrimitiveCollectionsEntity" AS "p"
++WHERE "p"."String" NOT IN (
++    SELECT "s"."value"
++    FROM json_each(@__strings_0_without_nulls) AS "s"
++)
++""");
++    }
++
++    public override async Task Parameter_collection_of_nullable_strings_Contains_nullable_string(bool async)
++    {
++        await base.Parameter_collection_of_nullable_strings_Contains_nullable_string(async);
++
++        AssertSql(
++            """
++@__strings_0_without_nulls='["999"]' (Size = 7)
++
++SELECT "p"."Id", "p"."Bool", "p"."Bools", "p"."DateTime", "p"."DateTimes", "p"."Enum", "p"."Enums", "p"."Int", "p"."Ints", "p"."NullableInt", "p"."NullableInts", "p"."NullableString", "p"."NullableStrings", "p"."String", "p"."Strings"
++FROM "PrimitiveCollectionsEntity" AS "p"
++WHERE "p"."NullableString" IN (
++    SELECT "s"."value"
++    FROM json_each(@__strings_0_without_nulls) AS "s"
++) OR "p"."NullableString" IS NULL
++""",
++            //
++            """
++@__strings_0_without_nulls='["999"]' (Size = 7)
++
++SELECT "p"."Id", "p"."Bool", "p"."Bools", "p"."DateTime", "p"."DateTimes", "p"."Enum", "p"."Enums", "p"."Int", "p"."Ints", "p"."NullableInt", "p"."NullableInts", "p"."NullableString", "p"."NullableStrings", "p"."String", "p"."Strings"
++FROM "PrimitiveCollectionsEntity" AS "p"
++WHERE "p"."NullableString" NOT IN (
++    SELECT "s"."value"
++    FROM json_each(@__strings_0_without_nulls) AS "s"
++) AND "p"."NullableString" IS NOT NULL
+ """);
+     }
+ 

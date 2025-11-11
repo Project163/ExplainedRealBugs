@@ -205,7 +205,7 @@ def process_project(project_id, project_name, repository_url, issue_tracker_name
 
                             if 'api.github.com' in data.get('url', ''):
                                 timeline_url = data.get('timeline_url') # 获取 timeline_url
-                                print(f"  -> Found timeline URL in GitHub API response: {timeline_url}")
+                                # print(f"  -> Found timeline URL in GitHub API response: {timeline_url}")
                                 
                         except json.JSONDecodeError:
                             print(f"  -> [Warning] {report_file} 不是有效的 JSON，无法查找 timeline URL。")
