@@ -1,0 +1,557 @@
+diff --git a/CHANGES.txt b/CHANGES.txt
+index b316aa5f2b..c37ef02777 100644
+--- a/CHANGES.txt
++++ b/CHANGES.txt
+@@ -1,4 +1,6 @@
+ 2.1.8
++ * Eliminate strong self-reference chains in sstable ref tidiers (CASSANDRA-9656)
++ * Ensure StreamSession uses canonical sstable reader instances (CASSANDRA-9700) 
+  * Ensure memtable book keeping is not corrupted in the event we shrink usage (CASSANDRA-9681)
+  * Update internal python driver for cqlsh (CASSANDRA-9064)
+  * Fix IndexOutOfBoundsException when inserting tuple with too many
+diff --git a/src/java/org/apache/cassandra/db/DataTracker.java b/src/java/org/apache/cassandra/db/DataTracker.java
+index a520dcd7f5..e84371c50e 100644
+--- a/src/java/org/apache/cassandra/db/DataTracker.java
++++ b/src/java/org/apache/cassandra/db/DataTracker.java
+@@ -32,10 +32,13 @@ import org.slf4j.LoggerFactory;
+ import org.apache.cassandra.config.DatabaseDescriptor;
+ import org.apache.cassandra.db.compaction.OperationType;
+ import org.apache.cassandra.dht.AbstractBounds;
++import org.apache.cassandra.io.sstable.IndexSummary;
+ import org.apache.cassandra.io.sstable.SSTableReader;
+ import org.apache.cassandra.io.util.FileUtils;
++import org.apache.cassandra.io.util.SegmentedFile;
+ import org.apache.cassandra.metrics.StorageMetrics;
+ import org.apache.cassandra.notifications.*;
++import org.apache.cassandra.utils.IFilter;
+ import org.apache.cassandra.utils.Interval;
+ import org.apache.cassandra.utils.IntervalTree;
+ import org.apache.cassandra.utils.concurrent.OpOrder;
+@@ -399,7 +402,7 @@ public class DataTracker
+             notifySSTablesChanged(oldSSTables, newSSTables, OperationType.UNKNOWN);
+ 
+         for (SSTableReader sstable : newSSTables)
+-            sstable.setTrackedBy(this);
++            sstable.setupKeyCache();
+ 
+         Refs.release(Refs.selfRefs(oldSSTables));
+     }
+@@ -439,7 +442,7 @@ public class DataTracker
+             StorageMetrics.load.inc(size);
+             cfstore.metric.liveDiskSpaceUsed.inc(size);
+             cfstore.metric.totalDiskSpaceUsed.inc(size);
+-            sstable.setTrackedBy(this);
++            sstable.setupKeyCache();
+         }
+     }
+ 
+@@ -460,17 +463,12 @@ public class DataTracker
+     {
+         for (SSTableReader sstable : oldSSTables)
+         {
+-            boolean firstToCompact = sstable.markObsolete();
++            boolean firstToCompact = sstable.markObsolete(this);
+             assert tolerateCompacted || firstToCompact : sstable + " was already marked compacted";
+             sstable.selfRef().release();
+         }
+     }
+ 
+-    public void spaceReclaimed(long size)
+-    {
+-        cfstore.metric.totalDiskSpaceUsed.dec(size);
+-    }
+-
+     public long estimatedKeys()
+     {
+         long n = 0;
+@@ -572,6 +570,11 @@ public class DataTracker
+         return getView().compacting;
+     }
+ 
++    public SSTableReader getCurrentVersion(SSTableReader sstable)
++    {
++        return view.get().sstablesMap.get(sstable);
++    }
++
+     public static class SSTableIntervalTree extends IntervalTree<RowPosition, SSTableReader, Interval<RowPosition, SSTableReader>>
+     {
+         private static final SSTableIntervalTree EMPTY = new SSTableIntervalTree(null);
+diff --git a/src/java/org/apache/cassandra/io/sstable/SSTableDeletingTask.java b/src/java/org/apache/cassandra/io/sstable/SSTableDeletingTask.java
+index 3da6906350..8703494f3f 100644
+--- a/src/java/org/apache/cassandra/io/sstable/SSTableDeletingTask.java
++++ b/src/java/org/apache/cassandra/io/sstable/SSTableDeletingTask.java
+@@ -27,6 +27,7 @@ import com.google.common.collect.Sets;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
++import com.yammer.metrics.core.Counter;
+ import org.apache.cassandra.concurrent.ScheduledExecutors;
+ import org.apache.cassandra.db.DataTracker;
+ import org.apache.cassandra.db.SystemKeyspace;
+@@ -42,24 +43,25 @@ public class SSTableDeletingTask implements Runnable
+     // will be recognized as GCable.
+     private static final Set<SSTableDeletingTask> failedTasks = new CopyOnWriteArraySet<>();
+ 
+-    private final SSTableReader referent;
+     private final Descriptor desc;
+     private final Set<Component> components;
+-    private DataTracker tracker;
++    private final long bytesOnDisk;
++    private final Counter totalDiskSpaceUsed;
+ 
+     /**
+      * realDescriptor is the actual descriptor for the sstable, the descriptor inside
+      * referent can be 'faked' as FINAL for early opened files. We need the real one
+      * to be able to remove the files.
+      */
+-    public SSTableDeletingTask(Descriptor realDescriptor, SSTableReader referent)
++    public SSTableDeletingTask(Descriptor realDescriptor, Set<Component> components, Counter totalDiskSpaceUsed, long bytesOnDisk)
+     {
+-        this.referent = referent;
+         this.desc = realDescriptor;
++        this.bytesOnDisk = bytesOnDisk;
++        this.totalDiskSpaceUsed = totalDiskSpaceUsed;
+         switch (desc.type)
+         {
+             case FINAL:
+-                this.components = referent.components;
++                this.components = components;
+                 break;
+             case TEMPLINK:
+                 this.components = Sets.newHashSet(Component.DATA, Component.PRIMARY_INDEX);
+@@ -69,15 +71,6 @@ public class SSTableDeletingTask implements Runnable
+         }
+     }
+ 
+-    public void setTracker(DataTracker tracker)
+-    {
+-        // the tracker is used only to notify listeners of deletion of the sstable;
+-        // since deletion of a non-final file is not really deletion of the sstable,
+-        // we don't want to notify the listeners in this event
+-        if (desc.type == Descriptor.Type.FINAL)
+-            this.tracker = tracker;
+-    }
+-
+     public void schedule()
+     {
+         ScheduledExecutors.nonPeriodicTasks.submit(this);
+@@ -85,11 +78,6 @@ public class SSTableDeletingTask implements Runnable
+ 
+     public void run()
+     {
+-        long size = referent.bytesOnDisk();
+-
+-        if (tracker != null)
+-            tracker.notifyDeleting(referent);
+-
+         // If we can't successfully delete the DATA component, set the task to be retried later: see above
+         File datafile = new File(desc.filenameFor(Component.DATA));
+         if (!datafile.delete())
+@@ -100,8 +88,8 @@ public class SSTableDeletingTask implements Runnable
+         }
+         // let the remainder be cleaned up by delete
+         SSTable.delete(desc, Sets.difference(components, Collections.singleton(Component.DATA)));
+-        if (tracker != null)
+-            tracker.spaceReclaimed(size);
++        if (totalDiskSpaceUsed != null)
++            totalDiskSpaceUsed.dec(bytesOnDisk);
+     }
+ 
+     /**
+diff --git a/src/java/org/apache/cassandra/io/sstable/SSTableReader.java b/src/java/org/apache/cassandra/io/sstable/SSTableReader.java
+index 0635826b34..d2b4416c68 100644
+--- a/src/java/org/apache/cassandra/io/sstable/SSTableReader.java
++++ b/src/java/org/apache/cassandra/io/sstable/SSTableReader.java
+@@ -24,7 +24,6 @@ import java.io.FileInputStream;
+ import java.io.FileNotFoundException;
+ import java.io.FileOutputStream;
+ import java.io.IOException;
+-import java.io.RandomAccessFile;
+ import java.nio.ByteBuffer;
+ import java.util.*;
+ import java.util.concurrent.*;
+@@ -33,6 +32,7 @@ import java.util.concurrent.atomic.AtomicLong;
+ 
+ import com.google.common.annotations.VisibleForTesting;
+ import com.google.common.base.Predicate;
++import com.google.common.collect.Iterables;
+ import com.google.common.collect.Iterators;
+ import com.google.common.collect.Ordering;
+ import com.google.common.primitives.Longs;
+@@ -43,6 +43,7 @@ import org.slf4j.LoggerFactory;
+ import com.clearspring.analytics.stream.cardinality.CardinalityMergeException;
+ import com.clearspring.analytics.stream.cardinality.HyperLogLogPlus;
+ import com.clearspring.analytics.stream.cardinality.ICardinality;
++import com.yammer.metrics.core.Counter;
+ import org.apache.cassandra.cache.CachingOptions;
+ import org.apache.cassandra.cache.InstrumentingCache;
+ import org.apache.cassandra.cache.KeyCacheKey;
+@@ -97,7 +98,6 @@ import org.apache.cassandra.utils.IFilter;
+ import org.apache.cassandra.utils.Pair;
+ import org.apache.cassandra.utils.concurrent.OpOrder;
+ import org.apache.cassandra.utils.concurrent.Ref;
+-import org.apache.cassandra.utils.concurrent.RefCounted;
+ import org.apache.cassandra.utils.concurrent.SelfRefCounted;
+ 
+ import static org.apache.cassandra.db.Directories.SECONDARY_INDEX_NAME_SEPARATOR;
+@@ -643,9 +643,8 @@ public class SSTableReader extends SSTable implements SelfRefCounted<SSTableRead
+         return ifile.path;
+     }
+ 
+-    public void setTrackedBy(DataTracker tracker)
++    public void setupKeyCache()
+     {
+-        tidy.type.deletingTask.setTracker(tracker);
+         // under normal operation we can do this at any time, but SSTR is also used outside C* proper,
+         // e.g. by BulkLoader, which does not initialize the cache.  As a kludge, we set up the cache
+         // here when we know we're being wired into the rest of the server infrastructure.
+@@ -953,9 +952,7 @@ public class SSTableReader extends SSTable implements SelfRefCounted<SSTableRead
+         {
+             assert replacement != null;
+             assert !tidy.isReplaced;
+-            assert tidy.global.live == this;
+             tidy.isReplaced = true;
+-            tidy.global.live = replacement;
+         }
+     }
+ 
+@@ -1003,52 +1000,60 @@ public class SSTableReader extends SSTable implements SelfRefCounted<SSTableRead
+         return replacement;
+     }
+ 
++    // runOnClose must NOT be an anonymous or non-static inner class, nor must it retain a reference chain to this reader
+     public SSTableReader cloneWithNewStart(DecoratedKey newStart, final Runnable runOnClose)
+     {
+         synchronized (tidy.global)
+         {
+             assert openReason != OpenReason.EARLY;
+-            // TODO: make data/index start accurate for compressed files
+             // TODO: merge with caller's firstKeyBeyond() work,to save time
+             if (newStart.compareTo(first) > 0)
+             {
+                 final long dataStart = getPosition(newStart, Operator.EQ).position;
+                 final long indexStart = getIndexScanPosition(newStart);
+-                this.tidy.runOnClose = new Runnable()
+-                {
+-                    public void run()
+-                    {
+-                        dfile.dropPageCache(dataStart);
+-                        ifile.dropPageCache(indexStart);
+-                        if (runOnClose != null)
+-                            runOnClose.run();
+-                    }
+-                };
++                this.tidy.runOnClose = new DropPageCache(dfile, dataStart, ifile, indexStart, runOnClose);
+             }
+ 
+             return cloneAndReplace(newStart, OpenReason.MOVED_START);
+         }
+     }
+ 
++    // runOnClose must NOT be an anonymous or non-static inner class, nor must it retain a reference chain to this reader
+     public SSTableReader cloneAsShadowed(final Runnable runOnClose)
+     {
+         synchronized (tidy.global)
+         {
+             assert openReason != OpenReason.EARLY;
+-            this.tidy.runOnClose = new Runnable()
+-            {
+-                public void run()
+-                {
+-                    dfile.dropPageCache(0);
+-                    ifile.dropPageCache(0);
+-                    runOnClose.run();
+-                }
+-            };
+-
++            this.tidy.runOnClose = new DropPageCache(dfile, 0, ifile, 0, runOnClose);
+             return cloneAndReplace(first, OpenReason.SHADOWED);
+         }
+     }
+ 
++    private static class DropPageCache implements Runnable
++    {
++        final SegmentedFile dfile;
++        final long dfilePosition;
++        final SegmentedFile ifile;
++        final long ifilePosition;
++        final Runnable andThen;
++
++        private DropPageCache(SegmentedFile dfile, long dfilePosition, SegmentedFile ifile, long ifilePosition, Runnable andThen)
++        {
++            this.dfile = dfile;
++            this.dfilePosition = dfilePosition;
++            this.ifile = ifile;
++            this.ifilePosition = ifilePosition;
++            this.andThen = andThen;
++        }
++
++        public void run()
++        {
++            dfile.dropPageCache(dfilePosition);
++            ifile.dropPageCache(ifilePosition);
++            andThen.run();
++        }
++    }
++
+     /**
+      * Returns a new SSTableReader with the same properties as this SSTableReader except that a new IndexSummary will
+      * be built at the target samplingLevel.  This (original) SSTableReader instance will be marked as replaced, have
+@@ -1439,10 +1444,9 @@ public class SSTableReader extends SSTable implements SelfRefCounted<SSTableRead
+         return positions;
+     }
+ 
+-    public void invalidateCacheKey(DecoratedKey key)
++    public KeyCacheKey getCacheKey(DecoratedKey key)
+     {
+-        KeyCacheKey cacheKey = new KeyCacheKey(metadata.cfId, descriptor, key.getKey());
+-        keyCache.remove(cacheKey);
++        return new KeyCacheKey(metadata.cfId, descriptor, key.getKey());
+     }
+ 
+     public void cacheKey(DecoratedKey key, RowIndexEntry info)
+@@ -1725,7 +1729,7 @@ public class SSTableReader extends SSTable implements SelfRefCounted<SSTableRead
+      * @return true if the this is the first time the file was marked obsolete.  Calling this
+      * multiple times is usually buggy (see exceptions in DataTracker.unmarkCompacting and removeOldSSTablesSize).
+      */
+-    public boolean markObsolete()
++    public boolean markObsolete(DataTracker tracker)
+     {
+         if (logger.isDebugEnabled())
+             logger.debug("Marking {} compacted", getFilename());
+@@ -1734,7 +1738,12 @@ public class SSTableReader extends SSTable implements SelfRefCounted<SSTableRead
+         {
+             assert !tidy.isReplaced;
+         }
+-        return !tidy.global.isCompacted.getAndSet(true);
++        if (!tidy.global.isCompacted.getAndSet(true))
++        {
++            tidy.type.markObsolete(this, tracker);
++            return true;
++        }
++        return false;
+     }
+ 
+     public boolean isMarkedCompacted()
+@@ -1834,11 +1843,6 @@ public class SSTableReader extends SSTable implements SelfRefCounted<SSTableRead
+         return sstableMetadata.repairedAt != ActiveRepairService.UNREPAIRED_SSTABLE;
+     }
+ 
+-    public SSTableReader getCurrentReplacement()
+-    {
+-        return tidy.global.live;
+-    }
+-
+     /**
+      * TODO: Move someplace reusable
+      */
+@@ -2180,14 +2184,29 @@ public class SSTableReader extends SSTable implements SelfRefCounted<SSTableRead
+ 
+         private final Descriptor desc;
+         private final Ref<GlobalTidy> globalRef;
+-        private final SSTableDeletingTask deletingTask;
++        private final Set<Component> components;
++        private long sizeOnDelete;
++        private Counter totalDiskSpaceUsed;
+ 
+         DescriptorTypeTidy(Descriptor desc, SSTableReader sstable)
+         {
+             this.desc = desc;
+-            this.deletingTask = new SSTableDeletingTask(desc, sstable);
+             // get a new reference to the shared global tidy
+             this.globalRef = GlobalTidy.get(sstable);
++            this.components = sstable.components;
++        }
++
++        void markObsolete(SSTableReader instance, DataTracker tracker)
++        {
++            // the tracker is used only to notify listeners of deletion of the sstable;
++            // since deletion of a non-final file is not really deletion of the sstable,
++            // we don't want to notify the listeners in this event
++            if (tracker != null && desc.type == Descriptor.Type.FINAL)
++            {
++                sizeOnDelete = instance.bytesOnDisk();
++                totalDiskSpaceUsed = tracker.cfstore.metric.totalDiskSpaceUsed;
++                tracker.notifyDeleting(instance);
++            }
+         }
+ 
+         public void tidy()
+@@ -2199,10 +2218,10 @@ public class SSTableReader extends SSTable implements SelfRefCounted<SSTableRead
+             {
+                 case FINAL:
+                     if (isCompacted)
+-                        deletingTask.run();
++                        new SSTableDeletingTask(desc, components, totalDiskSpaceUsed, sizeOnDelete).run();
+                     break;
+                 case TEMPLINK:
+-                    deletingTask.run();
++                    new SSTableDeletingTask(desc, components, null, 0).run();
+                     break;
+                 default:
+                     throw new IllegalStateException();
+@@ -2244,8 +2263,6 @@ public class SSTableReader extends SSTable implements SelfRefCounted<SSTableRead
+         static final ConcurrentMap<Descriptor, Ref<GlobalTidy>> lookup = new ConcurrentHashMap<>();
+ 
+         private final Descriptor desc;
+-        // a single convenience property for getting the most recent version of an sstable, not related to tidying
+-        private SSTableReader live;
+         // the readMeter that is shared between all instances of the sstable, and can be overridden in all of them
+         // at once also, for testing purposes
+         private RestorableMeter readMeter;
+@@ -2260,7 +2277,6 @@ public class SSTableReader extends SSTable implements SelfRefCounted<SSTableRead
+         {
+             this.desc = reader.descriptor;
+             this.isCompacted = new AtomicBoolean();
+-            this.live = reader;
+         }
+ 
+         void ensureReadMeter()
+diff --git a/src/java/org/apache/cassandra/io/sstable/SSTableRewriter.java b/src/java/org/apache/cassandra/io/sstable/SSTableRewriter.java
+index 824e58ba18..92f74d77ee 100644
+--- a/src/java/org/apache/cassandra/io/sstable/SSTableRewriter.java
++++ b/src/java/org/apache/cassandra/io/sstable/SSTableRewriter.java
+@@ -23,6 +23,8 @@ import com.google.common.annotations.VisibleForTesting;
+ import com.google.common.base.Throwables;
+ import com.google.common.collect.ImmutableList;
+ 
++import org.apache.cassandra.cache.InstrumentingCache;
++import org.apache.cassandra.cache.KeyCacheKey;
+ import org.apache.cassandra.config.DatabaseDescriptor;
+ import org.apache.cassandra.db.ColumnFamilyStore;
+ import org.apache.cassandra.db.DataTracker;
+@@ -214,7 +216,7 @@ public class SSTableRewriter
+         {
+             try
+             {
+-                sstable.markObsolete();
++                sstable.markObsolete(dataTracker);
+                 sstable.selfRef().release();
+             }
+             catch (Throwable t)
+@@ -243,7 +245,7 @@ public class SSTableRewriter
+                 {
+                     // if we've already been opened, add ourselves to the discard pile
+                     discard.add(finished.reader);
+-                    finished.reader.markObsolete();
++                    finished.reader.markObsolete(dataTracker);
+                 }
+             }
+             catch (Throwable t)
+@@ -298,7 +300,7 @@ public class SSTableRewriter
+         {
+             // we call getCurrentReplacement() to support multiple rewriters operating over the same source readers at once.
+             // note: only one such writer should be written to at any moment
+-            final SSTableReader latest = sstable.getCurrentReplacement();
++            final SSTableReader latest = dataTracker.getCurrentVersion(sstable);
+             SSTableReader replacement;
+             if (reset)
+             {
+@@ -313,17 +315,7 @@ public class SSTableRewriter
+                 if (latest.first.compareTo(lowerbound) > 0)
+                     continue;
+ 
+-                final Runnable runOnClose = new Runnable()
+-                {
+-                    public void run()
+-                    {
+-                        // this is somewhat racey, in that we could theoretically be closing this old reader
+-                        // when an even older reader is still in use, but it's not likely to have any major impact
+-                        for (DecoratedKey key : invalidateKeys)
+-                            latest.invalidateCacheKey(key);
+-                    }
+-                };
+-
++                final Runnable runOnClose = new InvalidateKeys(latest, invalidateKeys);
+                 if (lowerbound.compareTo(latest.last) >= 0)
+                 {
+                     replacement = latest.cloneAsShadowed(runOnClose);
+@@ -344,6 +336,25 @@ public class SSTableRewriter
+         cfs.getDataTracker().replaceWithNewInstances(toReplace, replaceWith);
+     }
+ 
++    private static final class InvalidateKeys implements Runnable
++    {
++        final List<KeyCacheKey> cacheKeys = new ArrayList<>();
++        final InstrumentingCache<KeyCacheKey, ?> cache;
++
++        private InvalidateKeys(SSTableReader reader, Collection<DecoratedKey> invalidate)
++        {
++            this.cache = reader.getKeyCache();
++            for (DecoratedKey key : invalidate)
++                cacheKeys.add(reader.getCacheKey(key));
++        }
++
++        public void run()
++        {
++            for (KeyCacheKey key : cacheKeys)
++                cache.remove(key);
++        }
++    }
++
+     private void replaceEarlyOpenedFile(SSTableReader toReplace, SSTableReader replaceWith)
+     {
+         if (isOffline)
+@@ -489,8 +500,8 @@ public class SSTableRewriter
+         {
+             for (SSTableReader reader : discard)
+             {
+-                if (reader.getCurrentReplacement() == reader)
+-                    reader.markObsolete();
++                if (dataTracker.getCurrentVersion(reader) == reader)
++                    reader.markObsolete(dataTracker);
+                 reader.selfRef().release();
+             }
+         }
+diff --git a/src/java/org/apache/cassandra/tools/StandaloneScrubber.java b/src/java/org/apache/cassandra/tools/StandaloneScrubber.java
+index 459df9888d..f60f989838 100644
+--- a/src/java/org/apache/cassandra/tools/StandaloneScrubber.java
++++ b/src/java/org/apache/cassandra/tools/StandaloneScrubber.java
+@@ -121,7 +121,7 @@ public class StandaloneScrubber
+                         }
+ 
+                         // Remove the sstable (it's been copied by scrub and snapshotted)
+-                        sstable.markObsolete();
++                        sstable.markObsolete(null);
+                         sstable.selfRef().release();
+                     }
+                     catch (Exception e)
+diff --git a/src/java/org/apache/cassandra/tools/StandaloneSplitter.java b/src/java/org/apache/cassandra/tools/StandaloneSplitter.java
+index fd93f03ce1..9c3c58b37c 100644
+--- a/src/java/org/apache/cassandra/tools/StandaloneSplitter.java
++++ b/src/java/org/apache/cassandra/tools/StandaloneSplitter.java
+@@ -153,7 +153,7 @@ public class StandaloneSplitter
+                     new SSTableSplitter(cfs, sstable, options.sizeInMB).split();
+ 
+                     // Remove the sstable (it's been copied by split and snapshotted)
+-                    sstable.markObsolete();
++                    sstable.markObsolete(null);
+                     sstable.selfRef().release();
+                 }
+                 catch (Exception e)
+diff --git a/src/java/org/apache/cassandra/tools/StandaloneUpgrader.java b/src/java/org/apache/cassandra/tools/StandaloneUpgrader.java
+index 90579987ed..abe5521886 100644
+--- a/src/java/org/apache/cassandra/tools/StandaloneUpgrader.java
++++ b/src/java/org/apache/cassandra/tools/StandaloneUpgrader.java
+@@ -107,7 +107,7 @@ public class StandaloneUpgrader
+                     {
+                         // Remove the sstable (it's been copied by upgrade)
+                         System.out.format("Deleting table %s.%n", sstable.descriptor.baseFilename());
+-                        sstable.markObsolete();
++                        sstable.markObsolete(null);
+                         sstable.selfRef().release();
+                     }
+                 }
+diff --git a/test/unit/org/apache/cassandra/io/sstable/SSTableRewriterTest.java b/test/unit/org/apache/cassandra/io/sstable/SSTableRewriterTest.java
+index e1b001eeaf..73055a27ee 100644
+--- a/test/unit/org/apache/cassandra/io/sstable/SSTableRewriterTest.java
++++ b/test/unit/org/apache/cassandra/io/sstable/SSTableRewriterTest.java
+@@ -203,7 +203,7 @@ public class SSTableRewriterTest extends SchemaLoader
+             SSTableReader s2 = writer.openEarly(1000);
+             assertTrue(s.last.compareTo(s2.last) < 0);
+             assertFileCounts(dir.list(), 2, 2);
+-            s.markObsolete();
++            s.markObsolete(cfs.getDataTracker());
+             s.selfRef().release();
+             s2.selfRef().release();
+             Thread.sleep(1000);

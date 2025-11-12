@@ -1,0 +1,187 @@
+diff --git a/solr/CHANGES.txt b/solr/CHANGES.txt
+index 6f8e0477bf9..a6b21ee9fb3 100644
+--- a/solr/CHANGES.txt
++++ b/solr/CHANGES.txt
+@@ -156,6 +156,8 @@ Bug Fixes
+ * SOLR-17057: JSON Query regression: If "query" is specified with a String (not JSON structure),
+   "defType" should parse it.  Since 9.4 defType was ignored.  (David Smiley)
+ 
++* SOLR-17060: CoreContainer#create may deadlock with concurrent requests for metrics (Alex Deparvu, David Smiley)
++
+ Dependency Upgrades
+ ---------------------
+ * SOLR-17012: Update Apache Hadoop to 3.3.6 and Apache Curator to 5.5.0 (Kevin Risden)
+diff --git a/solr/core/src/java/org/apache/solr/core/SolrCore.java b/solr/core/src/java/org/apache/solr/core/SolrCore.java
+index 5f22e95b3fc..be6f7526b3d 100644
+--- a/solr/core/src/java/org/apache/solr/core/SolrCore.java
++++ b/solr/core/src/java/org/apache/solr/core/SolrCore.java
+@@ -259,6 +259,7 @@ public class SolrCore implements SolrInfoBean, Closeable {
+   private Counter newSearcherCounter;
+   private Counter newSearcherMaxReachedCounter;
+   private Counter newSearcherOtherErrorsCounter;
++  private volatile boolean newSearcherReady = false;
+ 
+   private final String metricTag = SolrMetricProducer.getUniqueMetricTag(this, null);
+   private final SolrMetricsContext solrMetricsContext;
+@@ -1338,14 +1339,14 @@ public class SolrCore implements SolrInfoBean, Closeable {
+         "sizeInBytes",
+         Category.INDEX.toString());
+     parentContext.gauge(
+-        () -> isClosed() ? parentContext.nullNumber() : getSegmentCount(),
++        () -> isClosed() ? parentContext.nullString() : NumberUtils.readableSize(getIndexSize()),
+         true,
+-        "segments",
++        "size",
+         Category.INDEX.toString());
+     parentContext.gauge(
+-        () -> isClosed() ? parentContext.nullString() : NumberUtils.readableSize(getIndexSize()),
++        () -> isReady() ? getSegmentCount() : parentContext.nullNumber(),
+         true,
+-        "size",
++        "segments",
+         Category.INDEX.toString());
+ 
+     final CloudDescriptor cd = getCoreDescriptor().getCloudDescriptor();
+@@ -1899,6 +1900,11 @@ public class SolrCore implements SolrInfoBean, Closeable {
+     return refCount.get() <= 0;
+   }
+ 
++  /** Returns true if the core is ready for use. It is not initializing or closing/closed. */
++  public boolean isReady() {
++    return !isClosed() && newSearcherReady;
++  }
++
+   private Collection<CloseHook> closeHooks = null;
+ 
+   /** Add a close callback hook */
+@@ -2107,6 +2113,7 @@ public class SolrCore implements SolrInfoBean, Closeable {
+    * because it might be closed soon after this method returns; it really depends.
+    */
+   public <R> R withSearcher(IOFunction<SolrIndexSearcher, R> lambda) throws IOException {
++    assert isReady();
+     final RefCounted<SolrIndexSearcher> refCounted = getSearcher();
+     try {
+       return lambda.apply(refCounted.get());
+@@ -2704,7 +2711,6 @@ public class SolrCore implements SolrInfoBean, Closeable {
+ 
+       if (!success) {
+         newSearcherOtherErrorsCounter.inc();
+-        ;
+         synchronized (searcherLock) {
+           onDeckSearchers--;
+ 
+@@ -2734,6 +2740,7 @@ public class SolrCore implements SolrInfoBean, Closeable {
+       // we want to do this after we decrement onDeckSearchers so another thread
+       // doesn't increment first and throw a false warning.
+       openSearcherLock.unlock();
++      newSearcherReady = true;
+     }
+   }
+ 
+diff --git a/solr/core/src/test/org/apache/solr/core/SolrCoreTest.java b/solr/core/src/test/org/apache/solr/core/SolrCoreTest.java
+index e401bcc695a..28cfbc70cae 100644
+--- a/solr/core/src/test/org/apache/solr/core/SolrCoreTest.java
++++ b/solr/core/src/test/org/apache/solr/core/SolrCoreTest.java
+@@ -16,6 +16,8 @@
+  */
+ package org.apache.solr.core;
+ 
++import com.codahale.metrics.Gauge;
++import com.codahale.metrics.MetricFilter;
+ import java.util.ArrayList;
+ import java.util.HashMap;
+ import java.util.List;
+@@ -24,6 +26,7 @@ import java.util.concurrent.Callable;
+ import java.util.concurrent.ExecutorService;
+ import java.util.concurrent.Future;
+ import java.util.concurrent.TimeUnit;
++import java.util.concurrent.atomic.AtomicBoolean;
+ import org.apache.solr.SolrTestCaseJ4;
+ import org.apache.solr.common.SolrException;
+ import org.apache.solr.common.util.ExecutorUtil;
+@@ -32,6 +35,7 @@ import org.apache.solr.handler.ReplicationHandler;
+ import org.apache.solr.handler.RequestHandlerBase;
+ import org.apache.solr.handler.component.QueryComponent;
+ import org.apache.solr.handler.component.SpellCheckComponent;
++import org.apache.solr.metrics.SolrMetricManager;
+ import org.apache.solr.request.SolrQueryRequest;
+ import org.apache.solr.request.SolrRequestHandler;
+ import org.apache.solr.response.SolrQueryResponse;
+@@ -327,6 +331,62 @@ public class SolrCoreTest extends SolrTestCaseJ4 {
+     assertTrue(core.areAllSearcherReferencesEmpty());
+   }
+ 
++  /**
++   * Best effort attempt to recreate a deadlock between SolrCore initialization and Index metrics
++   * poll.
++   *
++   * <p>See https://issues.apache.org/jira/browse/SOLR-17060
++   */
++  @Test
++  public void testCoreInitDeadlockMetrics() throws Exception {
++    SolrMetricManager metricManager = h.getCoreContainer().getMetricManager();
++    CoreContainer coreContainer = h.getCoreContainer();
++
++    String coreName = "tmpCore";
++    AtomicBoolean created = new AtomicBoolean(false);
++    AtomicBoolean atLeastOnePoll = new AtomicBoolean(false);
++
++    final ExecutorService executor =
++        ExecutorUtil.newMDCAwareFixedThreadPool(
++            1, new SolrNamedThreadFactory("testCoreInitDeadlockMetrics"));
++    executor.submit(
++        () -> {
++          while (!created.get()) {
++            var metrics =
++                metricManager.getMetrics(
++                    "solr.core." + coreName,
++                    MetricFilter.startsWith(SolrInfoBean.Category.INDEX.toString()));
++            for (var m : metrics.values()) {
++              if (m instanceof Gauge) {
++                var v = ((Gauge<?>) m).getValue();
++                atLeastOnePoll.compareAndSet(false, v != null);
++              }
++            }
++
++            try {
++              TimeUnit.MILLISECONDS.sleep(5);
++            } catch (InterruptedException e1) {
++              throw new RuntimeException(e1);
++            }
++          }
++        });
++
++    TimeUnit.MILLISECONDS.sleep(25);
++    try (var tmpCore = coreContainer.create(coreName, Map.of("configSet", "minimal"))) {
++      tmpCore.open();
++      for (int i = 0; i < 10; i++) {
++        TimeUnit.MILLISECONDS.sleep(50); // to allow metrics to be checked at least once
++        if (atLeastOnePoll.get()) {
++          break;
++        }
++      }
++    } finally {
++      created.set(true);
++      ExecutorUtil.shutdownAndAwaitTermination(executor);
++    }
++    assertTrue(atLeastOnePoll.get());
++  }
++
+   private static class NewSearcherRunnable implements Runnable {
+     private final SolrCore core;
+ 
+diff --git a/solr/core/src/test/org/apache/solr/handler/admin/MetricsHandlerTest.java b/solr/core/src/test/org/apache/solr/handler/admin/MetricsHandlerTest.java
+index 1f4697ecc10..c2ccdb43baf 100644
+--- a/solr/core/src/test/org/apache/solr/handler/admin/MetricsHandlerTest.java
++++ b/solr/core/src/test/org/apache/solr/handler/admin/MetricsHandlerTest.java
+@@ -93,6 +93,10 @@ public class MetricsHandlerTest extends SolrTestCaseJ4 {
+     // response wasn't serialized, so we get here whatever MetricUtils produced instead of NamedList
+     assertNotNull(((MapWriter) o)._get("count", null));
+     assertEquals(0L, ((MapWriter) nl.get("SEARCHER.new.errors"))._get("count", null));
++    assertNotNull(nl.get("INDEX.segments")); // int gauge
++    assertTrue((int) ((MapWriter) nl.get("INDEX.segments"))._get("value", null) >= 0);
++    assertNotNull(nl.get("INDEX.sizeInBytes")); // long gauge
++    assertTrue((long) ((MapWriter) nl.get("INDEX.sizeInBytes"))._get("value", null) >= 0);
+     nl = (NamedList<?>) values.get("solr.node");
+     assertNotNull(nl.get("CONTAINER.cores.loaded")); // int gauge
+     assertEquals(1, ((MapWriter) nl.get("CONTAINER.cores.loaded"))._get("value", null));

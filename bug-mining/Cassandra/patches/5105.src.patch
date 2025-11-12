@@ -1,0 +1,335 @@
+diff --git a/CHANGES.txt b/CHANGES.txt
+index 6ca14a02f8..78c0c47823 100644
+--- a/CHANGES.txt
++++ b/CHANGES.txt
+@@ -1,4 +1,5 @@
+ 3.0.18
++ * Legacy sstables with  multi block range tombstones create invalid bound sequences (CASSANDRA-14823)
+  * Expand range tombstone validation checks to multiple interim request stages (CASSANDRA-14824)
+  * Reverse order reads can return incomplete results (CASSANDRA-14803)
+  * Avoid calling iter.next() in a loop when notifying indexers about range tombstones (CASSANDRA-14794)
+diff --git a/src/java/org/apache/cassandra/db/columniterator/SSTableReversedIterator.java b/src/java/org/apache/cassandra/db/columniterator/SSTableReversedIterator.java
+index f8c0e77b85..2d95dab432 100644
+--- a/src/java/org/apache/cassandra/db/columniterator/SSTableReversedIterator.java
++++ b/src/java/org/apache/cassandra/db/columniterator/SSTableReversedIterator.java
+@@ -20,7 +20,7 @@ package org.apache.cassandra.db.columniterator;
+ import java.io.IOException;
+ import java.util.*;
+ 
+-import com.google.common.base.Preconditions;
++import com.google.common.base.Verify;
+ 
+ import org.apache.cassandra.config.CFMetaData;
+ import org.apache.cassandra.db.*;
+@@ -79,6 +79,8 @@ public class SSTableReversedIterator extends AbstractSSTableIterator
+         protected boolean skipFirstIteratedItem;
+         protected boolean skipLastIteratedItem;
+ 
++        protected Unfiltered mostRecentlyEmitted = null;
++
+         private ReverseReader(FileDataInput file, boolean shouldCloseFile)
+         {
+             super(file, shouldCloseFile);
+@@ -122,7 +124,7 @@ public class SSTableReversedIterator extends AbstractSSTableIterator
+                 // Note that we can reuse that buffer between slices (we could alternatively re-read from disk
+                 // every time, but that feels more wasteful) so we want to include everything from the beginning.
+                 // We can stop at the slice end however since any following slice will be before that.
+-                loadFromDisk(null, slice.end(), true, false, false);
++                loadFromDisk(null, slice.end(), false, false, null, null);
+             }
+             setIterator(slice);
+         }
+@@ -155,7 +157,9 @@ public class SSTableReversedIterator extends AbstractSSTableIterator
+         {
+             if (!hasNext())
+                 throw new NoSuchElementException();
+-            return iterator.next();
++            Unfiltered next = iterator.next();
++            mostRecentlyEmitted = next;
++            return next;
+         }
+ 
+         protected boolean stopReadingDisk()
+@@ -163,13 +167,20 @@ public class SSTableReversedIterator extends AbstractSSTableIterator
+             return false;
+         }
+ 
++        // checks if left prefix precedes right prefix
++        private boolean precedes(ClusteringPrefix left, ClusteringPrefix right)
++        {
++            return metadata().comparator.compare(left, right) < 0;
++        }
++
+         // Reads the unfiltered from disk and load them into the reader buffer. It stops reading when either the partition
+         // is fully read, or when stopReadingDisk() returns true.
+         protected void loadFromDisk(Slice.Bound start,
+                                     Slice.Bound end,
+-                                    boolean includeFirst,
+                                     boolean hasPreviousBlock,
+-                                    boolean hasNextBlock) throws IOException
++                                    boolean hasNextBlock,
++                                    ClusteringPrefix currentFirstName,
++                                    ClusteringPrefix nextLastName) throws IOException
+         {
+             // start != null means it's the block covering the beginning of the slice, so it has to be the last block for this slice.
+             assert start == null || !hasNextBlock;
+@@ -220,16 +231,82 @@ public class SSTableReversedIterator extends AbstractSSTableIterator
+                    && !stopReadingDisk())
+             {
+                 Unfiltered unfiltered = deserializer.readNext();
+-                // We may get empty row for the same reason expressed on UnfilteredSerializer.deserializeOne.
+-                if (!unfiltered.isEmpty() && (!isFirst || includeFirst))
+-                    buffer.add(unfiltered);
+ 
+-                isFirst = false;
++                if (isFirst && openMarker == null
++                    && currentFirstName != null && nextLastName != null
++                    && (precedes(currentFirstName, nextLastName) || precedes(unfiltered.clustering(), currentFirstName)))
++                {
++                    // Range tombstones spanning multiple index blocks when reading legacy sstables need special handling.
++                    // Pre-3.0, the column index didn't encode open markers. Instead, open range tombstones were rewritten
++                    // at the start of index blocks they at least partially covered. These rewritten RTs found at the
++                    // beginning of index blocks need to be handled as though they were an open marker, otherwise iterator
++                    // validation will fail and/or some rows will be excluded from the result. These rewritten RTs can be
++                    // detected based on their relation to the current index block and the next one depending on what wrote
++                    // the sstable. For sstables coming from a memtable flush, a rewritten RT will have a clustering value
++                    // less than the first name of its index block. For sstables coming from compaction, the index block
++                    // first name will be the RT open bound, which will be less than the last name of the next block. So,
++                    // here we compare the first name of this block to the last name of the next block to detect the
++                    // compaction case, and clustering value of the unfiltered we just read to the index block's first name
++                    // to detect the flush case.
++                    Verify.verify(!sstable.descriptor.version.storeRows());
++                    Verify.verify(openMarker == null);
++                    Verify.verify(!skipLastIteratedItem);
++                    Verify.verify(unfiltered.isRangeTombstoneMarker());
++                    buffer.add(unfiltered);
++                    if (hasNextBlock)
++                        skipLastIteratedItem = true;
++                }
++                else if (isFirst && nextLastName != null && !precedes(nextLastName, unfiltered.clustering()))
++                {
++                    // When dealing with old format sstable, we have the problem that a row can span 2 index block, i.e. it can
++                    // start at the end of a block and end at the beginning of the next one. That's not a problem per se for
++                    // UnfilteredDeserializer.OldFormatSerializer, since it always read rows entirely, even if they span index
++                    // blocks, but as we reading index block in reverse we must be careful to not read the end of the row at
++                    // beginning of a block before we're reading the beginning of that row. So what we do is that if we detect
++                    // that the row starting this block is also the row ending the next one we're read (previous on disk), then
++                    // we'll skip that first result and  let it be read with the next block.
++                    Verify.verify(!sstable.descriptor.version.storeRows());
++                    isFirst = false;
++                }
++                else if (unfiltered.isEmpty())
++                {
++                    isFirst = false;
++                }
++                else
++                {
++                    buffer.add(unfiltered);
++                    isFirst = false;
++                }
+ 
+                 if (unfiltered.isRangeTombstoneMarker())
+                     updateOpenMarker((RangeTombstoneMarker)unfiltered);
+             }
+ 
++            if (!sstable.descriptor.version.storeRows()
++                && deserializer.hasNext()
++                && (end == null || deserializer.compareNextTo(end) < 0))
++            {
++                // Range tombstone start and end bounds are stored together in legacy sstables. When we read one, we
++                // stash the closing bound until we reach the appropriate place to emit it, which is immediately before
++                // the next unfiltered with a greater clustering.
++                // If SSTRI considers the block exhausted before encountering such a clustering though, this end marker
++                // will never be emitted. So here we just check if there's a closing bound left in the deserializer.
++                // If there is, we compare it against the most recently emitted unfiltered (i.e.: the last unfiltered
++                // that this RT would enclose. And we have to do THAT comparison because the last name field on the
++                // current index block will be whatever was written at the end of the index block (i.e. the last name
++                // physically in the block), not the closing bound of the range tombstone (i.e. the last name logically
++                // in the block). If all this indicates that there is indeed a range tombstone we're missing, we add it
++                // to the buffer and update the open marker field.
++                Unfiltered unfiltered = deserializer.readNext();
++                RangeTombstoneMarker marker = unfiltered.isRangeTombstoneMarker() ? (RangeTombstoneMarker) unfiltered : null;
++                if (marker != null && marker.isClose(false)
++                    && (mostRecentlyEmitted == null || precedes(marker.clustering(), mostRecentlyEmitted.clustering())))
++                {
++                    buffer.add(marker);
++                    updateOpenMarker(marker);
++                }
++            }
++
+             // If we have an open marker, we should close it before finishing
+             if (openMarker != null)
+             {
+@@ -333,7 +410,7 @@ public class SSTableReversedIterator extends AbstractSSTableIterator
+                 // formats (see next comment)
+                 if (!iterator.hasNext() && nextBlockIdx > lastBlockIdx)
+                 {
+-                    Preconditions.checkState(!sstable.descriptor.version.storeRows());
++                    Verify.verify(!sstable.descriptor.version.storeRows());
+                     continue;
+                 }
+ 
+@@ -362,26 +439,21 @@ public class SSTableReversedIterator extends AbstractSSTableIterator
+             boolean canIncludeSliceStart = !hasNextBlock;
+             boolean canIncludeSliceEnd = !hasPreviousBlock;
+ 
+-            // When dealing with old format sstable, we have the problem that a row can span 2 index block, i.e. it can
+-            // start at the end of a block and end at the beginning of the next one. That's not a problem per se for
+-            // UnfilteredDeserializer.OldFormatSerializer, since it always read rows entirely, even if they span index
+-            // blocks, but as we reading index block in reverse we must be careful to not read the end of the row at
+-            // beginning of a block before we're reading the beginning of that row. So what we do is that if we detect
+-            // that the row starting this block is also the row ending the next one we're read (previous on disk), then
+-            // we'll skip that first result and  let it be read with the next block.
+-            boolean includeFirst = true;
++            ClusteringPrefix currentFirstName = null;
++            ClusteringPrefix nextLastName = null;
+             if (!sstable.descriptor.version.storeRows() && currentBlock > 0)
+             {
+-                ClusteringPrefix lastOfNext = indexState.index(currentBlock - 1).lastName;
+-                ClusteringPrefix firstOfCurrent = indexState.index(currentBlock).firstName;
+-                includeFirst = metadata().comparator.compare(lastOfNext, firstOfCurrent) != 0;
++                currentFirstName = indexState.index(currentBlock).firstName;
++                nextLastName = indexState.index(currentBlock - 1).lastName;
+             }
+ 
+             loadFromDisk(canIncludeSliceStart ? slice.start() : null,
+                          canIncludeSliceEnd ? slice.end() : null,
+-                         includeFirst,
+                          hasPreviousBlock,
+-                         hasNextBlock);
++                         hasNextBlock,
++                         currentFirstName,
++                         nextLastName
++            );
+             setIterator(slice);
+         }
+ 
+diff --git a/test/data/legacy-sstables/ka/legacy_tables/legacy_ka_compacted_multi_block_rt/legacy_tables-legacy_ka_compacted_multi_block_rt-ka-4-CompressionInfo.db b/test/data/legacy-sstables/ka/legacy_tables/legacy_ka_compacted_multi_block_rt/legacy_tables-legacy_ka_compacted_multi_block_rt-ka-4-CompressionInfo.db
+new file mode 100644
+index 0000000000..d320406f7c
+Binary files /dev/null and b/test/data/legacy-sstables/ka/legacy_tables/legacy_ka_compacted_multi_block_rt/legacy_tables-legacy_ka_compacted_multi_block_rt-ka-4-CompressionInfo.db differ
+diff --git a/test/data/legacy-sstables/ka/legacy_tables/legacy_ka_compacted_multi_block_rt/legacy_tables-legacy_ka_compacted_multi_block_rt-ka-4-Data.db b/test/data/legacy-sstables/ka/legacy_tables/legacy_ka_compacted_multi_block_rt/legacy_tables-legacy_ka_compacted_multi_block_rt-ka-4-Data.db
+new file mode 100644
+index 0000000000..775b68c3cd
+Binary files /dev/null and b/test/data/legacy-sstables/ka/legacy_tables/legacy_ka_compacted_multi_block_rt/legacy_tables-legacy_ka_compacted_multi_block_rt-ka-4-Data.db differ
+diff --git a/test/data/legacy-sstables/ka/legacy_tables/legacy_ka_compacted_multi_block_rt/legacy_tables-legacy_ka_compacted_multi_block_rt-ka-4-Digest.sha1 b/test/data/legacy-sstables/ka/legacy_tables/legacy_ka_compacted_multi_block_rt/legacy_tables-legacy_ka_compacted_multi_block_rt-ka-4-Digest.sha1
+new file mode 100644
+index 0000000000..63993fced0
+--- /dev/null
++++ b/test/data/legacy-sstables/ka/legacy_tables/legacy_ka_compacted_multi_block_rt/legacy_tables-legacy_ka_compacted_multi_block_rt-ka-4-Digest.sha1
+@@ -0,0 +1 @@
++3417730863
+\ No newline at end of file
+diff --git a/test/data/legacy-sstables/ka/legacy_tables/legacy_ka_compacted_multi_block_rt/legacy_tables-legacy_ka_compacted_multi_block_rt-ka-4-Filter.db b/test/data/legacy-sstables/ka/legacy_tables/legacy_ka_compacted_multi_block_rt/legacy_tables-legacy_ka_compacted_multi_block_rt-ka-4-Filter.db
+new file mode 100644
+index 0000000000..aa97e86d57
+Binary files /dev/null and b/test/data/legacy-sstables/ka/legacy_tables/legacy_ka_compacted_multi_block_rt/legacy_tables-legacy_ka_compacted_multi_block_rt-ka-4-Filter.db differ
+diff --git a/test/data/legacy-sstables/ka/legacy_tables/legacy_ka_compacted_multi_block_rt/legacy_tables-legacy_ka_compacted_multi_block_rt-ka-4-Index.db b/test/data/legacy-sstables/ka/legacy_tables/legacy_ka_compacted_multi_block_rt/legacy_tables-legacy_ka_compacted_multi_block_rt-ka-4-Index.db
+new file mode 100644
+index 0000000000..f42522615a
+Binary files /dev/null and b/test/data/legacy-sstables/ka/legacy_tables/legacy_ka_compacted_multi_block_rt/legacy_tables-legacy_ka_compacted_multi_block_rt-ka-4-Index.db differ
+diff --git a/test/data/legacy-sstables/ka/legacy_tables/legacy_ka_compacted_multi_block_rt/legacy_tables-legacy_ka_compacted_multi_block_rt-ka-4-Statistics.db b/test/data/legacy-sstables/ka/legacy_tables/legacy_ka_compacted_multi_block_rt/legacy_tables-legacy_ka_compacted_multi_block_rt-ka-4-Statistics.db
+new file mode 100644
+index 0000000000..2580202254
+Binary files /dev/null and b/test/data/legacy-sstables/ka/legacy_tables/legacy_ka_compacted_multi_block_rt/legacy_tables-legacy_ka_compacted_multi_block_rt-ka-4-Statistics.db differ
+diff --git a/test/data/legacy-sstables/ka/legacy_tables/legacy_ka_compacted_multi_block_rt/legacy_tables-legacy_ka_compacted_multi_block_rt-ka-4-Summary.db b/test/data/legacy-sstables/ka/legacy_tables/legacy_ka_compacted_multi_block_rt/legacy_tables-legacy_ka_compacted_multi_block_rt-ka-4-Summary.db
+new file mode 100644
+index 0000000000..c85b4a8192
+Binary files /dev/null and b/test/data/legacy-sstables/ka/legacy_tables/legacy_ka_compacted_multi_block_rt/legacy_tables-legacy_ka_compacted_multi_block_rt-ka-4-Summary.db differ
+diff --git a/test/data/legacy-sstables/ka/legacy_tables/legacy_ka_compacted_multi_block_rt/legacy_tables-legacy_ka_compacted_multi_block_rt-ka-4-TOC.txt b/test/data/legacy-sstables/ka/legacy_tables/legacy_ka_compacted_multi_block_rt/legacy_tables-legacy_ka_compacted_multi_block_rt-ka-4-TOC.txt
+new file mode 100644
+index 0000000000..3fc5eece84
+--- /dev/null
++++ b/test/data/legacy-sstables/ka/legacy_tables/legacy_ka_compacted_multi_block_rt/legacy_tables-legacy_ka_compacted_multi_block_rt-ka-4-TOC.txt
+@@ -0,0 +1,8 @@
++Summary.db
++Digest.sha1
++CompressionInfo.db
++TOC.txt
++Filter.db
++Data.db
++Index.db
++Statistics.db
+diff --git a/test/data/legacy-sstables/ka/legacy_tables/legacy_ka_flushed_multi_block_rt/legacy_tables-legacy_ka_flushed_multi_block_rt-ka-1-CompressionInfo.db b/test/data/legacy-sstables/ka/legacy_tables/legacy_ka_flushed_multi_block_rt/legacy_tables-legacy_ka_flushed_multi_block_rt-ka-1-CompressionInfo.db
+new file mode 100644
+index 0000000000..23369025fd
+Binary files /dev/null and b/test/data/legacy-sstables/ka/legacy_tables/legacy_ka_flushed_multi_block_rt/legacy_tables-legacy_ka_flushed_multi_block_rt-ka-1-CompressionInfo.db differ
+diff --git a/test/data/legacy-sstables/ka/legacy_tables/legacy_ka_flushed_multi_block_rt/legacy_tables-legacy_ka_flushed_multi_block_rt-ka-1-Data.db b/test/data/legacy-sstables/ka/legacy_tables/legacy_ka_flushed_multi_block_rt/legacy_tables-legacy_ka_flushed_multi_block_rt-ka-1-Data.db
+new file mode 100644
+index 0000000000..e7a9fd7ac8
+Binary files /dev/null and b/test/data/legacy-sstables/ka/legacy_tables/legacy_ka_flushed_multi_block_rt/legacy_tables-legacy_ka_flushed_multi_block_rt-ka-1-Data.db differ
+diff --git a/test/data/legacy-sstables/ka/legacy_tables/legacy_ka_flushed_multi_block_rt/legacy_tables-legacy_ka_flushed_multi_block_rt-ka-1-Digest.sha1 b/test/data/legacy-sstables/ka/legacy_tables/legacy_ka_flushed_multi_block_rt/legacy_tables-legacy_ka_flushed_multi_block_rt-ka-1-Digest.sha1
+new file mode 100644
+index 0000000000..bfe4bc39b9
+--- /dev/null
++++ b/test/data/legacy-sstables/ka/legacy_tables/legacy_ka_flushed_multi_block_rt/legacy_tables-legacy_ka_flushed_multi_block_rt-ka-1-Digest.sha1
+@@ -0,0 +1 @@
++3995406674
+\ No newline at end of file
+diff --git a/test/data/legacy-sstables/ka/legacy_tables/legacy_ka_flushed_multi_block_rt/legacy_tables-legacy_ka_flushed_multi_block_rt-ka-1-Filter.db b/test/data/legacy-sstables/ka/legacy_tables/legacy_ka_flushed_multi_block_rt/legacy_tables-legacy_ka_flushed_multi_block_rt-ka-1-Filter.db
+new file mode 100644
+index 0000000000..606783dea3
+Binary files /dev/null and b/test/data/legacy-sstables/ka/legacy_tables/legacy_ka_flushed_multi_block_rt/legacy_tables-legacy_ka_flushed_multi_block_rt-ka-1-Filter.db differ
+diff --git a/test/data/legacy-sstables/ka/legacy_tables/legacy_ka_flushed_multi_block_rt/legacy_tables-legacy_ka_flushed_multi_block_rt-ka-1-Index.db b/test/data/legacy-sstables/ka/legacy_tables/legacy_ka_flushed_multi_block_rt/legacy_tables-legacy_ka_flushed_multi_block_rt-ka-1-Index.db
+new file mode 100644
+index 0000000000..1faa378938
+Binary files /dev/null and b/test/data/legacy-sstables/ka/legacy_tables/legacy_ka_flushed_multi_block_rt/legacy_tables-legacy_ka_flushed_multi_block_rt-ka-1-Index.db differ
+diff --git a/test/data/legacy-sstables/ka/legacy_tables/legacy_ka_flushed_multi_block_rt/legacy_tables-legacy_ka_flushed_multi_block_rt-ka-1-Statistics.db b/test/data/legacy-sstables/ka/legacy_tables/legacy_ka_flushed_multi_block_rt/legacy_tables-legacy_ka_flushed_multi_block_rt-ka-1-Statistics.db
+new file mode 100644
+index 0000000000..0070c96630
+Binary files /dev/null and b/test/data/legacy-sstables/ka/legacy_tables/legacy_ka_flushed_multi_block_rt/legacy_tables-legacy_ka_flushed_multi_block_rt-ka-1-Statistics.db differ
+diff --git a/test/data/legacy-sstables/ka/legacy_tables/legacy_ka_flushed_multi_block_rt/legacy_tables-legacy_ka_flushed_multi_block_rt-ka-1-Summary.db b/test/data/legacy-sstables/ka/legacy_tables/legacy_ka_flushed_multi_block_rt/legacy_tables-legacy_ka_flushed_multi_block_rt-ka-1-Summary.db
+new file mode 100644
+index 0000000000..d2adbfaeda
+Binary files /dev/null and b/test/data/legacy-sstables/ka/legacy_tables/legacy_ka_flushed_multi_block_rt/legacy_tables-legacy_ka_flushed_multi_block_rt-ka-1-Summary.db differ
+diff --git a/test/data/legacy-sstables/ka/legacy_tables/legacy_ka_flushed_multi_block_rt/legacy_tables-legacy_ka_flushed_multi_block_rt-ka-1-TOC.txt b/test/data/legacy-sstables/ka/legacy_tables/legacy_ka_flushed_multi_block_rt/legacy_tables-legacy_ka_flushed_multi_block_rt-ka-1-TOC.txt
+new file mode 100644
+index 0000000000..3fc5eece84
+--- /dev/null
++++ b/test/data/legacy-sstables/ka/legacy_tables/legacy_ka_flushed_multi_block_rt/legacy_tables-legacy_ka_flushed_multi_block_rt-ka-1-TOC.txt
+@@ -0,0 +1,8 @@
++Summary.db
++Digest.sha1
++CompressionInfo.db
++TOC.txt
++Filter.db
++Data.db
++Index.db
++Statistics.db
+diff --git a/test/unit/org/apache/cassandra/io/sstable/LegacySSTableTest.java b/test/unit/org/apache/cassandra/io/sstable/LegacySSTableTest.java
+index f6467e1c47..d58ce8acad 100644
+--- a/test/unit/org/apache/cassandra/io/sstable/LegacySSTableTest.java
++++ b/test/unit/org/apache/cassandra/io/sstable/LegacySSTableTest.java
+@@ -231,6 +231,32 @@ public class LegacySSTableTest
+         Assert.assertEquals(forward.size(), reverse.size());
+     }
+ 
++    @Test
++    public void testMultiBlockRangeTombstones() throws Exception
++    {
++        /**
++         * During upgrades from 2.1 to 3.0, reading old sstables in reverse order would generate invalid sequences of
++         * range tombstone bounds if their range tombstones spanned multiple column index blocks. The read would fail
++         * in different ways depending on whether the 2.1 tables were produced by a flush or a compaction.
++         */
++
++        String version = "ka";
++        for (String tableFmt : new String[]{"legacy_%s_compacted_multi_block_rt%s", "legacy_%s_flushed_multi_block_rt%s"})
++        {
++            String table = String.format(tableFmt, version, "");
++            QueryProcessor.executeOnceInternal(String.format("CREATE TABLE legacy_tables.%s " +
++                                                             "(k int, c1 int, c2 int, v1 blob, v2 blob, " +
++                                                             "PRIMARY KEY (k, c1, c2))", table));
++            loadLegacyTable(tableFmt, version, "");
++
++            UntypedResultSet forward = QueryProcessor.executeOnceInternal(String.format("SELECT * FROM legacy_tables.%s WHERE k=100", table));
++            UntypedResultSet reverse = QueryProcessor.executeOnceInternal(String.format("SELECT * FROM legacy_tables.%s WHERE k=100 ORDER BY c1 DESC, c2 DESC", table));
++
++            Assert.assertFalse(forward.isEmpty());
++            Assert.assertEquals(table, forward.size(), reverse.size());
++        }
++    }
++
+     @Test
+     public void testVerifyOldSSTables() throws Exception
+     {

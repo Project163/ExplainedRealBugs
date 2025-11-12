@@ -1,0 +1,226 @@
+diff --git a/CHANGES.txt b/CHANGES.txt
+index 58798fac43..2d14e34ee1 100644
+--- a/CHANGES.txt
++++ b/CHANGES.txt
+@@ -1,4 +1,5 @@
+ 3.0.21
++ * Memtable memory allocations may deadlock (CASSANDRA-15367)
+  * Run evictFromMembership in GossipStage (CASSANDRA-15592)
+ Merged from 2.2:
+  * Disable JMX rebinding (CASSANDRA-15653)
+diff --git a/src/java/org/apache/cassandra/db/Memtable.java b/src/java/org/apache/cassandra/db/Memtable.java
+index f507cf22e7..041ac2e435 100644
+--- a/src/java/org/apache/cassandra/db/Memtable.java
++++ b/src/java/org/apache/cassandra/db/Memtable.java
+@@ -49,7 +49,6 @@ import org.apache.cassandra.io.sstable.Descriptor;
+ import org.apache.cassandra.io.sstable.SSTableTxnWriter;
+ import org.apache.cassandra.io.sstable.format.SSTableReader;
+ import org.apache.cassandra.io.sstable.metadata.MetadataCollector;
+-import org.apache.cassandra.io.util.DiskAwareRunnable;
+ import org.apache.cassandra.service.ActiveRepairService;
+ import org.apache.cassandra.utils.ByteBufferUtil;
+ import org.apache.cassandra.utils.FBUtilities;
+@@ -70,7 +69,7 @@ public class Memtable implements Comparable<Memtable>
+     private final AtomicLong liveDataSize = new AtomicLong(0);
+     private final AtomicLong currentOperations = new AtomicLong(0);
+ 
+-    // the write barrier for directing writes to this memtable during a switch
++    // the write barrier for directing writes to this memtable or the next during a switch
+     private volatile OpOrder.Barrier writeBarrier;
+     // the precise upper bound of ReplayPosition owned by this memtable
+     private volatile AtomicReference<ReplayPosition> commitLogUpperBound;
+@@ -381,7 +380,7 @@ public class Memtable implements Comparable<Memtable>
+                 if (isBatchLogTable && !partition.partitionLevelDeletion().isLive() && partition.hasRows())
+                     continue;
+ 
+-                if (trackContention && partition.usePessimisticLocking())
++                if (trackContention && partition.useLock())
+                     heavilyContendedRowCount++;
+ 
+                 if (!partition.isEmpty())
+diff --git a/src/java/org/apache/cassandra/db/partitions/AtomicBTreePartition.java b/src/java/org/apache/cassandra/db/partitions/AtomicBTreePartition.java
+index 7f2de828f2..1543fd35b2 100644
+--- a/src/java/org/apache/cassandra/db/partitions/AtomicBTreePartition.java
++++ b/src/java/org/apache/cassandra/db/partitions/AtomicBTreePartition.java
+@@ -113,12 +113,7 @@ public class AtomicBTreePartition extends AbstractBTreePartition
+         boolean monitorOwned = false;
+         try
+         {
+-            if (usePessimisticLocking())
+-            {
+-                Locks.monitorEnterUnsafe(this);
+-                monitorOwned = true;
+-            }
+-
++            monitorOwned = maybeLock(writeOp);
+             indexer.start();
+ 
+             while (true)
+@@ -162,16 +157,7 @@ public class AtomicBTreePartition extends AbstractBTreePartition
+                 }
+                 else if (!monitorOwned)
+                 {
+-                    boolean shouldLock = usePessimisticLocking();
+-                    if (!shouldLock)
+-                    {
+-                        shouldLock = updateWastedAllocationTracker(updater.heapSize);
+-                    }
+-                    if (shouldLock)
+-                    {
+-                        Locks.monitorEnterUnsafe(this);
+-                        monitorOwned = true;
+-                    }
++                    monitorOwned = maybeLock(updater.heapSize, writeOp);
+                 }
+             }
+         }
+@@ -181,10 +167,38 @@ public class AtomicBTreePartition extends AbstractBTreePartition
+             if (monitorOwned)
+                 Locks.monitorExitUnsafe(this);
+         }
++    }
+ 
++    private boolean maybeLock(OpOrder.Group writeOp)
++    {
++        if (!useLock())
++            return false;
++
++        return lockIfOldest(writeOp);
++    }
++
++    private boolean maybeLock(long addWaste, OpOrder.Group writeOp)
++    {
++        if (!updateWastedAllocationTracker(addWaste))
++            return false;
++
++        return lockIfOldest(writeOp);
++    }
++
++    private boolean lockIfOldest(OpOrder.Group writeOp)
++    {
++        if (!writeOp.isOldestLiveGroup())
++        {
++            Thread.yield();
++            if (!writeOp.isOldestLiveGroup())
++                return false;
++        }
++
++        Locks.monitorEnterUnsafe(this);
++        return true;
+     }
+ 
+-    public boolean usePessimisticLocking()
++    public boolean useLock()
+     {
+         return wasteTracker == TRACKER_PESSIMISTIC_LOCKING;
+     }
+diff --git a/src/java/org/apache/cassandra/utils/concurrent/OpOrder.java b/src/java/org/apache/cassandra/utils/concurrent/OpOrder.java
+index b80fe99e50..497eec31b5 100644
+--- a/src/java/org/apache/cassandra/utils/concurrent/OpOrder.java
++++ b/src/java/org/apache/cassandra/utils/concurrent/OpOrder.java
+@@ -240,6 +240,37 @@ public class OpOrder
+             }
+         }
+ 
++        public boolean isFinished()
++        {
++            return next.prev == null;
++        }
++
++        public boolean isOldestLiveGroup()
++        {
++            return prev == null;
++        }
++
++        public void await()
++        {
++            while (!isFinished())
++            {
++                WaitQueue.Signal signal = waiting.register();
++                if (isFinished())
++                {
++                    signal.cancel();
++                    return;
++                }
++                else
++                    signal.awaitUninterruptibly();
++            }
++            assert running == FINISHED;
++        }
++
++        public OpOrder.Group prev()
++        {
++            return prev;
++        }
++
+         /**
+          * called once we know all operations started against this Ordered have completed,
+          * however we do not know if operations against its ancestors have completed, or
+@@ -390,35 +421,14 @@ public class OpOrder
+         }
+ 
+         /**
+-         * @return true if all operations started prior to barrier.issue() have completed
++         * wait for all operations started prior to issuing the barrier to complete
+          */
+-        public boolean allPriorOpsAreFinished()
++        public void await()
+         {
+             Group current = orderOnOrBefore;
+             if (current == null)
+                 throw new IllegalStateException("This barrier needs to have issue() called on it before prior operations can complete");
+-            if (current.next.prev == null)
+-                return true;
+-            return false;
+-        }
+-
+-        /**
+-         * wait for all operations started prior to issuing the barrier to complete
+-         */
+-        public void await()
+-        {
+-            while (!allPriorOpsAreFinished())
+-            {
+-                WaitQueue.Signal signal = register();
+-                if (allPriorOpsAreFinished())
+-                {
+-                    signal.cancel();
+-                    return;
+-                }
+-                else
+-                    signal.awaitUninterruptibly();
+-            }
+-            assert orderOnOrBefore.running == FINISHED;
++            current.await();
+         }
+ 
+         /**
+diff --git a/src/java/org/apache/cassandra/utils/memory/MemtableAllocator.java b/src/java/org/apache/cassandra/utils/memory/MemtableAllocator.java
+index fa547ce17f..8383ddcd6b 100644
+--- a/src/java/org/apache/cassandra/utils/memory/MemtableAllocator.java
++++ b/src/java/org/apache/cassandra/utils/memory/MemtableAllocator.java
+@@ -147,6 +147,11 @@ public abstract class MemtableAllocator
+                     acquired(size);
+                     return;
+                 }
++                if (opGroup.isBlocking())
++                {
++                    allocated(size);
++                    return;
++                }
+                 WaitQueue.Signal signal = opGroup.isBlockingSignal(parent.hasRoom().register(parent.blockedTimerContext()));
+                 boolean allocated = parent.tryAllocate(size);
+                 if (allocated || opGroup.isBlocking())
+diff --git a/test/unit/org/apache/cassandra/index/CustomIndexTest.java b/test/unit/org/apache/cassandra/index/CustomIndexTest.java
+index 66e9fe5813..dcd6d3410e 100644
+--- a/test/unit/org/apache/cassandra/index/CustomIndexTest.java
++++ b/test/unit/org/apache/cassandra/index/CustomIndexTest.java
+@@ -684,7 +684,7 @@ public class CustomIndexTest extends CQLTester
+         assertTrue(index.writeGroups.size() > 1);
+         assertFalse(index.readOrderingAtFinish.isBlocking());
+         index.writeGroups.forEach(group -> assertFalse(group.isBlocking()));
+-        index.barriers.forEach(OpOrder.Barrier::allPriorOpsAreFinished);
++        index.barriers.forEach(b -> assertTrue(b.getSyncPoint().isFinished()));
+     }
+ 
+     @Test

@@ -1,0 +1,418 @@
+diff --git a/CHANGES.txt b/CHANGES.txt
+index 83fc711893..a4bf5f51f7 100644
+--- a/CHANGES.txt
++++ b/CHANGES.txt
+@@ -1,4 +1,5 @@
+ 3.11.11
++ * Read only the required SSTables for single partition queries (CASSANDRA-16737)
+  * Fix LeveledCompactionStrategy compacts last level throw an ArrayIndexOutOfBoundsException (CASSANDRA-15669)
+  * Maps $CASSANDRA_LOG_DIR to cassandra.logdir java property when executing nodetool (CASSANDRA-16199)
+  * Nodetool garbagecollect should retain SSTableLevel for LCS (CASSANDRA-16634)
+diff --git a/src/java/org/apache/cassandra/db/SinglePartitionReadCommand.java b/src/java/org/apache/cassandra/db/SinglePartitionReadCommand.java
+index 80c13d91c4..fad4886197 100644
+--- a/src/java/org/apache/cassandra/db/SinglePartitionReadCommand.java
++++ b/src/java/org/apache/cassandra/db/SinglePartitionReadCommand.java
+@@ -688,11 +688,15 @@ public class SinglePartitionReadCommand extends ReadCommand
+          *   2) If we have a name filter (so we query specific rows), we can make a bet: that all column for all queried row
+          *      will have data in the most recent sstable(s), thus saving us from reading older ones. This does imply we
+          *      have a way to guarantee we have all the data for what is queried, which is only possible for name queries
+-         *      and if we have neither non-frozen collections/UDTs nor counters (indeed, for a non-frozen collection or UDT,
+-         *      we can't guarantee an older sstable won't have some elements that weren't in the most recent sstables,
+-         *      and counters are intrinsically a collection of shards and so have the same problem).
++         *      and if we have neither non-frozen collections/UDTs nor counters.
++         *      If a non-frozen collection or UDT is queried we can't guarantee that an older sstable won't have some
++         *      elements that weren't in the most recent sstables.
++         *      Counters are intrinsically a collection of shards and so have the same problem.
++         *      Counter tables are also special in the sense that their rows do not have primary key liveness
++         *      as INSERT statements are not supported on counter tables. Due to that even if only the primary key
++         *      columns where queried, querying SSTables in timestamp order will always be less efficient for counter tables.
+          */
+-        if (clusteringIndexFilter() instanceof ClusteringIndexNamesFilter && !queriesMulticellType())
++        if (clusteringIndexFilter() instanceof ClusteringIndexNamesFilter && !metadata().isCounter() && !queriesMulticellType())
+             return queryMemtableAndSSTablesInTimestampOrder(cfs, (ClusteringIndexNamesFilter)clusteringIndexFilter());
+ 
+         Tracing.trace("Acquiring sstable references");
+@@ -870,9 +874,9 @@ public class SinglePartitionReadCommand extends ReadCommand
+ 
+     private boolean queriesMulticellType()
+     {
+-        for (ColumnDefinition column : columnFilter().fetchedColumns())
++        for (ColumnDefinition column : columnFilter().queriedColumns())
+         {
+-            if (column.type.isMultiCell() || column.type.isCounter())
++            if (column.type.isMultiCell())
+                 return true;
+         }
+         return false;
+@@ -1033,7 +1037,15 @@ public class SinglePartitionReadCommand extends ReadCommand
+ 
+         SearchIterator<Clustering, Row> searchIter = result.searchIterator(columnFilter(), false);
+ 
+-        PartitionColumns columns = columnFilter().fetchedColumns();
++        // According to the CQL semantics a row exists if at least one of its columns is not null (including the primary key columns).
++        // Having the queried columns not null is unfortunately not enough to prove that a row exists as some column deletion
++        // for the queried columns can exist on another node.
++        // For CQL tables it is enough to have the primary key liveness and the queried columns as the primary key liveness prove that
++        // the row exists even if all the other columns are deleted.
++        // COMPACT tables do not have primary key liveness and by consequence we are forced to get  all the fetched columns to ensure that
++        // we can return the correct result if the queried columns are deleted on another node but one of the non-queried columns is not.
++        PartitionColumns columns = metadata().isCompactTable() ? columnFilter().fetchedColumns() : columnFilter().queriedColumns();
++
+         NavigableSet<Clustering> clusterings = filter.requestedRows();
+ 
+         // We want to remove rows for which we have values for all requested columns. We have to deal with both static and regular rows.
+diff --git a/test/distributed/org/apache/cassandra/distributed/test/SinglePartitionReadCommandTest.java b/test/distributed/org/apache/cassandra/distributed/test/SinglePartitionReadCommandTest.java
+index 0b7b0e7543..cb6e463f00 100644
+--- a/test/distributed/org/apache/cassandra/distributed/test/SinglePartitionReadCommandTest.java
++++ b/test/distributed/org/apache/cassandra/distributed/test/SinglePartitionReadCommandTest.java
+@@ -144,4 +144,47 @@ public class SinglePartitionReadCommandTest extends TestBaseImpl
+             assertRows(cluster.coordinator(2).execute(withKeyspace("SELECT DISTINCT s1 FROM %s.tbl WHERE pk=2"), ConsistencyLevel.ALL));
+         }
+     }
++
++    @Test
++    public void testNonCompactTableWithEmptyRowOnBothNodes() throws Throwable
++    {
++        try (Cluster cluster = init(builder().withNodes(2).start()))
++        {
++            cluster.schemaChange(withKeyspace("CREATE TABLE %s.tbl (pk int, ck text, v int, PRIMARY KEY (pk, ck))"));
++            cluster.coordinator(1).execute(withKeyspace("INSERT INTO %s.tbl (pk, ck, v) VALUES (1, '1', 1) USING TIMESTAMP 1000"), ConsistencyLevel.ALL);
++            cluster.get(1).flush(KEYSPACE);
++            cluster.coordinator(1).execute(withKeyspace("DELETE v FROM %s.tbl USING TIMESTAMP 2000 WHERE pk=1 AND ck='1'"), ConsistencyLevel.ALL);
++            cluster.get(1).flush(KEYSPACE);
++            cluster.get(2).flush(KEYSPACE);
++
++            assertRows(cluster.coordinator(2).execute(withKeyspace("SELECT * FROM %s.tbl WHERE pk=1 AND ck='1'"), ConsistencyLevel.ALL),
++                       row(1, "1", null));
++            assertRows(cluster.coordinator(2).execute(withKeyspace("SELECT v FROM %s.tbl WHERE pk=1 AND ck='1'"), ConsistencyLevel.ALL),
++                       row((Integer) null));
++
++        }
++    }
++
++    @Test
++    public void testNonCompactTableWithRowOnOneNodeMissingAColumnAndColumnDeletionOnTheOther() throws Throwable
++    {
++        try (Cluster cluster = init(builder().withNodes(2).start()))
++        {
++            cluster.schemaChange(withKeyspace("CREATE TABLE %s.tbl (pk int, ck text, v1 int, v2 int, PRIMARY KEY (pk, ck))"));
++            cluster.get(1).executeInternal(withKeyspace("INSERT INTO %s.tbl (pk, ck, v1, v2) VALUES (1, '1', 1, 1) USING TIMESTAMP 1000"));
++            cluster.get(1).flush(KEYSPACE);
++            cluster.get(1).executeInternal(withKeyspace("INSERT INTO %s.tbl (pk, ck, v1) VALUES (1, '1', 2) USING TIMESTAMP 2000"));
++            cluster.get(1).flush(KEYSPACE);
++
++            cluster.get(2).executeInternal(withKeyspace("DELETE v1 FROM %s.tbl USING TIMESTAMP 3000 WHERE pk=1 AND ck='1'"));
++            cluster.get(2).flush(KEYSPACE);
++
++            assertRows(cluster.coordinator(2).execute(withKeyspace("SELECT * FROM %s.tbl WHERE pk=1 AND ck='1'"), ConsistencyLevel.ALL),
++                       row(1, "1", null, 1));
++            assertRows(cluster.coordinator(2).execute(withKeyspace("SELECT v1 FROM %s.tbl WHERE pk=1 AND ck='1'"), ConsistencyLevel.ALL),
++                       row((Integer) null));
++            assertRows(cluster.coordinator(2).execute(withKeyspace("SELECT v2 FROM %s.tbl WHERE pk=1 AND ck='1'"), ConsistencyLevel.ALL),
++                       row(1));
++        }
++    }
+ }
+\ No newline at end of file
+diff --git a/test/unit/org/apache/cassandra/cql3/KeyCacheCqlTest.java b/test/unit/org/apache/cassandra/cql3/KeyCacheCqlTest.java
+index 32e6aece9b..1fb6e35415 100644
+--- a/test/unit/org/apache/cassandra/cql3/KeyCacheCqlTest.java
++++ b/test/unit/org/apache/cassandra/cql3/KeyCacheCqlTest.java
+@@ -43,6 +43,7 @@ import static org.junit.Assert.assertEquals;
+ import static org.junit.Assert.assertFalse;
+ import static org.junit.Assert.assertTrue;
+ import static org.junit.Assert.assertNull;
++
+ import org.apache.cassandra.utils.Pair;
+ 
+ 
+@@ -253,16 +254,21 @@ public class KeyCacheCqlTest extends CQLTester
+ 
+         CacheMetrics metrics = CacheService.instance.keyCache.getMetrics();
+ 
++        long expectedRequests = 0;
++
+         for (int i = 0; i < 10; i++)
+         {
+             UntypedResultSet result = execute("SELECT part_key_a FROM %s WHERE col_int = ?", i);
+             assertEquals(500, result.size());
++            // Index requests and table requests are both added to the same metric
++            // We expect 10 requests on the index SSTables and 10 IN requests on the table SSTables + BF false positives
++            expectedRequests += recentBloomFilterFalsePositives() + 20;
+         }
+ 
+         long hits = metrics.hits.getCount();
+         long requests = metrics.requests.getCount();
+         assertEquals(0, hits);
+-        assertEquals(210, requests);
++        assertEquals(expectedRequests, requests);
+ 
+         for (int i = 0; i < 10; i++)
+         {
+@@ -271,13 +277,16 @@ public class KeyCacheCqlTest extends CQLTester
+             // indexed on part-key % 10 = 10 index partitions
+             // (50 clust-keys  *  100-part-keys  /  10 possible index-values) = 500
+             assertEquals(500, result.size());
++            // Index requests and table requests are both added to the same metric
++            // We expect 10 requests on the index SSTables and 10 IN requests on the table SSTables + BF false positives
++            expectedRequests += recentBloomFilterFalsePositives() + 20;
+         }
+ 
+         metrics = CacheService.instance.keyCache.getMetrics();
+         hits = metrics.hits.getCount();
+         requests = metrics.requests.getCount();
+         assertEquals(200, hits);
+-        assertEquals(420, requests);
++        assertEquals(expectedRequests, requests);
+ 
+         CacheService.instance.keyCache.submitWrite(Integer.MAX_VALUE).get();
+ 
+@@ -343,18 +352,22 @@ public class KeyCacheCqlTest extends CQLTester
+ 
+         CacheMetrics metrics = CacheService.instance.keyCache.getMetrics();
+ 
++        long expectedNumberOfRequests = 0;
++
+         for (int i = 0; i < 10; i++)
+         {
+             UntypedResultSet result = execute("SELECT part_key_a FROM %s WHERE col_int = ?", i);
+             assertEquals(500, result.size());
++
++            // Index requests and table requests are both added to the same metric
++            // We expect 10 requests on the index SSTables and 10 IN requests on the table SSTables + BF false positives
++            expectedNumberOfRequests += recentBloomFilterFalsePositives() + 20;
+         }
+ 
+         long hits = metrics.hits.getCount();
+         long requests = metrics.requests.getCount();
+         assertEquals(0, hits);
+-        assertEquals(210, requests);
+-
+-        //
++        assertEquals(expectedNumberOfRequests, requests);
+ 
+         for (int i = 0; i < 10; i++)
+         {
+@@ -363,13 +376,17 @@ public class KeyCacheCqlTest extends CQLTester
+             // indexed on part-key % 10 = 10 index partitions
+             // (50 clust-keys  *  100-part-keys  /  10 possible index-values) = 500
+             assertEquals(500, result.size());
++
++            // Index requests and table requests are both added to the same metric
++            // We expect 10 requests on the index SSTables and 10 IN requests on the table SSTables + BF false positives
++            expectedNumberOfRequests += recentBloomFilterFalsePositives() + 20;
+         }
+ 
+         metrics = CacheService.instance.keyCache.getMetrics();
+         hits = metrics.hits.getCount();
+         requests = metrics.requests.getCount();
+         assertEquals(200, hits);
+-        assertEquals(420, requests);
++        assertEquals(expectedNumberOfRequests, requests);
+ 
+         dropTable("DROP TABLE %s");
+ 
+@@ -413,10 +430,15 @@ public class KeyCacheCqlTest extends CQLTester
+         insertData(table, null, false);
+         clearCache();
+ 
++        long expectedNumberOfRequests = 0;
++
+         for (int i = 0; i < 10; i++)
+         {
+             assertRows(execute("SELECT col_text FROM %s WHERE part_key_a = ? AND part_key_b = ?", i, Integer.toOctalString(i)),
+                        new Object[]{ String.valueOf(i) + '-' + String.valueOf(0) });
++
++            // the data for the key is in 1 SSTable but we have to take into account bloom filter false positive
++            expectedNumberOfRequests += recentBloomFilterFalsePositives() + 1;
+         }
+ 
+         CacheMetrics metrics = CacheService.instance.keyCache.getMetrics();
+@@ -429,12 +451,15 @@ public class KeyCacheCqlTest extends CQLTester
+         {
+             assertRows(execute("SELECT col_text FROM %s WHERE part_key_a = ? AND part_key_b = ?", i, Integer.toOctalString(i)),
+                        new Object[]{ String.valueOf(i) + '-' + String.valueOf(0) });
++
++            // the data for the key is in 1 SSTable but we have to take into account bloom filter false positive
++            expectedNumberOfRequests += recentBloomFilterFalsePositives() + 1;
+         }
+ 
+         hits = metrics.hits.getCount();
+         requests = metrics.requests.getCount();
+         assertEquals(10, hits);
+-        assertEquals(120, requests);
++        assertEquals(expectedNumberOfRequests, requests);
+     }
+ 
+     @Test
+@@ -590,4 +615,9 @@ public class KeyCacheCqlTest extends CQLTester
+         if (flushTask != null)
+             flushTask.call();
+     }
++
++    private long recentBloomFilterFalsePositives()
++    {
++        return getCurrentColumnFamilyStore(KEYSPACE_PER_TEST).metric.recentBloomFilterFalsePositives.getValue();
++    }
+ }
+diff --git a/test/unit/org/apache/cassandra/cql3/validation/miscellaneous/SSTablesIteratedTest.java b/test/unit/org/apache/cassandra/cql3/validation/miscellaneous/SSTablesIteratedTest.java
+index a5290609ba..c3a64ac964 100644
+--- a/test/unit/org/apache/cassandra/cql3/validation/miscellaneous/SSTablesIteratedTest.java
++++ b/test/unit/org/apache/cassandra/cql3/validation/miscellaneous/SSTablesIteratedTest.java
+@@ -842,12 +842,12 @@ public class SSTablesIteratedTest extends CQLTester
+         executeAndCheck("SELECT * FROM %s WHERE pk = 1 AND c = 2", 3, row(1, 2, 3, null));
+         executeAndCheck("SELECT * FROM %s WHERE pk = 1 AND c = 3", 3, row(1, 3, 3, null));
+ 
+-        executeAndCheck("SELECT c, v1 FROM %s WHERE pk = 1 AND c = 1", 3, row(1, 3));
+-        executeAndCheck("SELECT c, v1 FROM %s WHERE pk = 1 AND c = 2", 3, row(2, 3));
++        executeAndCheck("SELECT c, v1 FROM %s WHERE pk = 1 AND c = 1", 1, row(1, 3));
++        executeAndCheck("SELECT c, v1 FROM %s WHERE pk = 1 AND c = 2", 2, row(2, 3));
+         executeAndCheck("SELECT c, v1 FROM %s WHERE pk = 1 AND c = 3", 3, row(3, 3));
+ 
+-        executeAndCheck("SELECT v1 FROM %s WHERE pk = 1 AND c = 1", 3, row(3));
+-        executeAndCheck("SELECT v1 FROM %s WHERE pk = 1 AND c = 2", 3, row(3));
++        executeAndCheck("SELECT v1 FROM %s WHERE pk = 1 AND c = 1", 1, row(3));
++        executeAndCheck("SELECT v1 FROM %s WHERE pk = 1 AND c = 2", 2, row(3));
+         executeAndCheck("SELECT v1 FROM %s WHERE pk = 1 AND c = 3", 3, row(3));
+ 
+         executeAndCheck("SELECT v1, v2 FROM %s WHERE pk = 1 AND c = 1", 3, row(3, (Integer) null));
+@@ -881,11 +881,13 @@ public class SSTablesIteratedTest extends CQLTester
+         executeAndCheck("SELECT * FROM %s WHERE pk = 1 AND c = 2", 3, row(1, 2, 3, 1));
+         executeAndCheck("SELECT * FROM %s WHERE pk = 1 AND c = 3", 3, row(1, 3, 3, 1));
+ 
+-        executeAndCheck("SELECT c, v1 FROM %s WHERE pk = 1 AND c = 1", 3, row(1, 3));
+-        executeAndCheck("SELECT c, v1 FROM %s WHERE pk = 1 AND c = 2", 3, row(2, 3));
++        // As we have the primary key liveness and all the queried columns in the first SSTable we can stop at this point
++        executeAndCheck("SELECT c, v1 FROM %s WHERE pk = 1 AND c = 1", 1, row(1, 3));
++        // As we have the primary key liveness and all the queried columns in the second SSTable we can stop at this point
++        executeAndCheck("SELECT c, v1 FROM %s WHERE pk = 1 AND c = 2", 2, row(2, 3));
+ 
+-        executeAndCheck("SELECT v1 FROM %s WHERE pk = 1 AND c = 1", 3, row(3));
+-        executeAndCheck("SELECT v1 FROM %s WHERE pk = 1 AND c = 2", 3, row(3));
++        executeAndCheck("SELECT v1 FROM %s WHERE pk = 1 AND c = 1", 1, row(3));
++        executeAndCheck("SELECT v1 FROM %s WHERE pk = 1 AND c = 2", 2, row(3));
+ 
+         executeAndCheck("SELECT v1, v2 FROM %s WHERE pk = 1 AND c = 1", 3, row(3, 1));
+         executeAndCheck("SELECT v1, v2 FROM %s WHERE pk = 1 AND c = 2", 3, row(3, 1));
+@@ -917,7 +919,8 @@ public class SSTablesIteratedTest extends CQLTester
+         executeAndCheck("SELECT s, v FROM %s WHERE pk = 1 AND c = 1", 3, row(null, 3));
+         executeAndCheck("SELECT s, v FROM %s WHERE pk = 2 AND c = 1", 2, row(1, 3));
+         executeAndCheck("SELECT s, v FROM %s WHERE pk = 3 AND c = 3", 3, row(3, 1));
+-        executeAndCheck("SELECT v FROM %s WHERE pk = 1 AND c = 1", 3, row(3));
++        // As we have the primary key liveness and all the queried columns in the first SSTable we can stop at this point
++        executeAndCheck("SELECT v FROM %s WHERE pk = 1 AND c = 1", 1, row(3));
+         executeAndCheck("SELECT v FROM %s WHERE pk = 2 AND c = 1", 2, row(3));
+         executeAndCheck("SELECT v FROM %s WHERE pk = 3 AND c = 3", 3, row(1));
+         executeAndCheck("SELECT s FROM %s WHERE pk = 1", 3, row((Integer) null));
+@@ -973,8 +976,8 @@ public class SSTablesIteratedTest extends CQLTester
+         execute("UPDATE %s USING TIMESTAMP 3001 SET v1 = ?, s = ? WHERE pk = ? AND c = ?", 3, set(3, 4), 1, 2);
+         flush();
+ 
+-        executeAndCheck("SELECT c, v1 FROM %s WHERE pk = 1 AND c = 1", 3, row(1, 3));
+-        executeAndCheck("SELECT v1 FROM %s WHERE pk = 1 AND c = 1", 3, row(3));
++        executeAndCheck("SELECT c, v1 FROM %s WHERE pk = 1 AND c = 1", 1, row(1, 3));
++        executeAndCheck("SELECT v1 FROM %s WHERE pk = 1 AND c = 1", 1, row(3));
+         executeAndCheck("SELECT * FROM %s WHERE pk = 1 AND c = 1", 3, row(1, 1, set(3, 4), 3, null));
+         executeAndCheck("SELECT c, s FROM %s WHERE pk = 1 AND c = 1", 3, row(1, set(3, 4)));
+ 
+@@ -984,6 +987,26 @@ public class SSTablesIteratedTest extends CQLTester
+         executeAndCheck("SELECT c, s FROM %s WHERE pk = 1 AND c = 2", 3, row(2, set(3, 4)));
+     }
+ 
++    @Test
++    public void testCompactAndNonCompactTableWithCounter() throws Throwable
++    {
++        for (String with : new String[]{"", " WITH COMPACT STORAGE"})
++        {
++            createTable("CREATE TABLE %s (pk int, c int, count counter, PRIMARY KEY(pk, c))" + with);
++
++            execute("UPDATE %s SET count = count + 1 WHERE pk = 1 AND c = 1");
++            flush();
++            execute("UPDATE %s SET count = count + 1 WHERE pk = 1 AND c = 1");
++            flush();
++            execute("UPDATE %s SET count = count + 1 WHERE pk = 1 AND c = 1");
++            flush();
++
++            executeAndCheck("SELECT * FROM %s WHERE pk = 1 AND c = 1", 3, row(1, 1, 3L));
++            executeAndCheck("SELECT pk, c FROM %s WHERE pk = 1 AND c = 1", 3, row(1, 1));
++            executeAndCheck("SELECT count FROM %s WHERE pk = 1 AND c = 1", 3, row(3L));
++        }
++    }
++
+     @Test
+     public void testNonCompactTableWithStaticColumnValueMissingAndMulticellColumn() throws Throwable
+     {
+@@ -1258,8 +1281,9 @@ public class SSTablesIteratedTest extends CQLTester
+         flush();
+ 
+         executeAndCheck("SELECT * FROM %s WHERE pk = 1 AND c = 1", 3, row(1, 1, null, 1));
+-        executeAndCheck("SELECT c, v1 FROM %s WHERE pk = 1 AND c = 1", 3, row(1, null));
+-        executeAndCheck("SELECT v1 FROM %s WHERE pk = 1 AND c = 1", 3, row((Integer) null));
++        // As we have the primary key liveness and all the queried columns in the second SSTable we can stop at this point
++        executeAndCheck("SELECT c, v1 FROM %s WHERE pk = 1 AND c = 1", 2, row(1, null));
++        executeAndCheck("SELECT v1 FROM %s WHERE pk = 1 AND c = 1", 2, row((Integer) null));
+ 
+         executeAndCheck("SELECT * FROM %s WHERE pk = 2 AND c = 1", 2, row(2, 1, 3, null));
+         executeAndCheck("SELECT v1, v2 FROM %s WHERE pk = 2 AND c = 1", 2, row(3, null));
+@@ -1333,7 +1357,9 @@ public class SSTablesIteratedTest extends CQLTester
+ 
+         executeAndCheck("SELECT * FROM %s WHERE pk = 1", 3, row(1, null, 1));
+         executeAndCheck("SELECT v1, v2 FROM %s WHERE pk = 1", 3, row((Integer) null, 1));
+-        executeAndCheck("SELECT v1 FROM %s WHERE pk = 1", 3, row((Integer) null));
++        // As the primary key liveness is found on the second SSTable, we can stop there as it it enough to ensure
++        // that we know that the row exist
++        executeAndCheck("SELECT v1 FROM %s WHERE pk = 1", 2, row((Integer) null));
+ 
+         executeAndCheck("SELECT * FROM %s WHERE pk = 2", 2, row(2, 3, null));
+         executeAndCheck("SELECT v1, v2 FROM %s WHERE pk = 2", 2, row(3, null));
+@@ -1404,4 +1430,50 @@ public class SSTablesIteratedTest extends CQLTester
+         executeAndCheck("SELECT v1, v2 FROM %s WHERE pk = 4", 3, row(3, null));
+         executeAndCheck("SELECT v2 FROM %s WHERE pk = 4", 3, row((Integer) null));
+     }
++
++    @Test
++    public void testNonCompactTableWithAlterTableStatement() throws Throwable
++    {
++        createTable("CREATE TABLE %s (pk int, ck int, v1 int, PRIMARY KEY(pk, ck))");
++
++        execute("INSERT INTO %s (pk, ck, v1) VALUES (?, ?, ?) USING TIMESTAMP 1000", 1, 1, 1);
++        flush();
++        execute("INSERT INTO %s (pk, ck, v1) VALUES (?, ?, ?) USING TIMESTAMP 2000", 1, 1, 2);
++        flush();
++        execute("INSERT INTO %s (pk, ck, v1) VALUES (?, ?, ?) USING TIMESTAMP 3000", 1, 1, 3);
++        flush();
++
++        executeAndCheck("SELECT pk, ck, v1 FROM %s WHERE pk = 1 AND ck = 1", 1, row(1, 1, 3));
++
++        execute("ALTER TABLE %s ADD v2 int");
++
++        executeAndCheck("SELECT pk, ck, v1 FROM %s WHERE pk = 1 AND ck = 1", 1, row(1, 1, 3));
++
++        execute("ALTER TABLE %s ADD s int static");
++
++        executeAndCheck("SELECT pk, ck, v1 FROM %s WHERE pk = 1 AND ck = 1", 1, row(1, 1, 3));
++    }
++
++    @Test
++    public void testNonCompactTableWithAlterTableStatementAndStaticColumns() throws Throwable
++    {
++        createTable("CREATE TABLE %s (pk int, ck int, s1 int static, v1 int, PRIMARY KEY(pk, ck))");
++
++        execute("INSERT INTO %s (pk, ck, v1) VALUES (?, ?, ?) USING TIMESTAMP 1000", 1, 1, 1);
++        flush();
++        execute("INSERT INTO %s (pk, ck, v1) VALUES (?, ?, ?) USING TIMESTAMP 2000", 1, 1, 2);
++        flush();
++        execute("INSERT INTO %s (pk, s1) VALUES (?, ?) USING TIMESTAMP 3000", 1, 3);
++        flush();
++
++        executeAndCheck("SELECT pk, s1 FROM %s WHERE pk = 1", 3, row(1, 3));
++        executeAndCheck("SELECT DISTINCT pk, s1 FROM %s WHERE pk = 1", 3, row(1, 3));
++        executeAndCheck("SELECT s1 FROM %s WHERE pk = 1", 3, row(3));
++
++        execute("ALTER TABLE %s ADD s2 int static");
++
++        executeAndCheck("SELECT pk, s1 FROM %s WHERE pk = 1", 3, row(1, 3));
++        executeAndCheck("SELECT DISTINCT pk, s1 FROM %s WHERE pk = 1", 3, row(1, 3));
++        executeAndCheck("SELECT s1 FROM %s WHERE pk = 1", 3, row(3));
++    }
+ }

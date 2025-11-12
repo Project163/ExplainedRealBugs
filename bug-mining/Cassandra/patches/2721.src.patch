@@ -1,0 +1,514 @@
+diff --git a/CHANGES.txt b/CHANGES.txt
+index 483ee0b7c3..3cc99375c3 100644
+--- a/CHANGES.txt
++++ b/CHANGES.txt
+@@ -40,6 +40,7 @@
+  * Fix LIMT with static columns (CASSANDRA-6956)
+  * Fix clash with CQL column name in thrift validation (CASSANDRA-6892)
+  * Fix error with super columns in mixed 1.2-2.0 clusters (CASSANDRA-6966)
++ * Fix bad skip of sstables on slice query with composite start/finish (CASSANDRA-6825)
+ Merged from 1.2:
+  * Add UNLOGGED, COUNTER options to BATCH documentation (CASSANDRA-6816)
+  * add extra SSL cipher suites (CASSANDRA-6613)
+diff --git a/src/java/org/apache/cassandra/cql3/statements/SelectStatement.java b/src/java/org/apache/cassandra/cql3/statements/SelectStatement.java
+index 53b2c05656..56e87e84a9 100644
+--- a/src/java/org/apache/cassandra/cql3/statements/SelectStatement.java
++++ b/src/java/org/apache/cassandra/cql3/statements/SelectStatement.java
+@@ -22,9 +22,7 @@ import java.util.*;
+ 
+ import com.google.common.base.Objects;
+ import com.google.common.base.Predicate;
+-import com.google.common.collect.AbstractIterator;
+ import com.google.common.collect.Iterables;
+-import com.google.common.collect.Lists;
+ 
+ import org.github.jamm.MemoryMeter;
+ 
+@@ -53,6 +51,8 @@ import org.apache.cassandra.serializers.MarshalException;
+ import org.apache.cassandra.utils.ByteBufferUtil;
+ import org.apache.cassandra.utils.FBUtilities;
+ import org.apache.cassandra.utils.Pair;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
+ 
+ /**
+  * Encapsulates a completely parsed SELECT query, including the target
+@@ -61,6 +61,8 @@ import org.apache.cassandra.utils.Pair;
+  */
+ public class SelectStatement implements CQLStatement, MeasurableForPreparedCache
+ {
++    private static final Logger logger = LoggerFactory.getLogger(SelectStatement.class);
++
+     private static final int DEFAULT_COUNT_PAGE_SIZE = 10000;
+ 
+     private final int boundTerms;
+@@ -257,6 +259,7 @@ public class SelectStatement implements CQLStatement, MeasurableForPreparedCache
+         while (!pager.isExhausted())
+         {
+             int maxLimit = pager.maxRemaining();
++            logger.debug("New maxLimit for paged count query is {}", maxLimit);
+             ResultSet rset = process(pager.fetchPage(pageSize), variables, maxLimit, now);
+             count += rset.rows.size();
+         }
+diff --git a/src/java/org/apache/cassandra/db/marshal/CompositeType.java b/src/java/org/apache/cassandra/db/marshal/CompositeType.java
+index 83e3b97039..7f08219bb3 100644
+--- a/src/java/org/apache/cassandra/db/marshal/CompositeType.java
++++ b/src/java/org/apache/cassandra/db/marshal/CompositeType.java
+@@ -264,26 +264,54 @@ public class CompositeType extends AbstractCompositeType
+     public boolean intersects(List<ByteBuffer> minColumnNames, List<ByteBuffer> maxColumnNames, SliceQueryFilter filter)
+     {
+         assert minColumnNames.size() == maxColumnNames.size();
++
++        // If any of the slices in the filter intersect, return true
+         outer:
+         for (ColumnSlice slice : filter.slices)
+         {
+-            // This slices intersects if all component intersect. And we don't intersect
+-            // only if no slice intersects
+             ByteBuffer[] start = split(filter.isReversed() ? slice.finish : slice.start);
+             ByteBuffer[] finish = split(filter.isReversed() ? slice.start : slice.finish);
+-            for (int i = 0; i < minColumnNames.size(); i++)
++
++            if (compare(start, maxColumnNames, true) > 0 || compare(finish, minColumnNames, false) < 0)
++                continue;  // slice does not intersect
++
++            // We could safely return true here, but there's a minor optimization: if the first component is restricted
++            // to a single value, we can check that the second component falls within the min/max for that component
++            // (and repeat for all components).
++            for (int i = 0; i < Math.min(Math.min(start.length, finish.length), minColumnNames.size()); i++)
+             {
+                 AbstractType<?> t = types.get(i);
+-                ByteBuffer s = i < start.length ? start[i] : ByteBufferUtil.EMPTY_BYTE_BUFFER;
+-                ByteBuffer f = i < finish.length ? finish[i] : ByteBufferUtil.EMPTY_BYTE_BUFFER;
+-                if (!t.intersects(minColumnNames.get(i), maxColumnNames.get(i), s, f))
++
++                // we already know the first component falls within its min/max range (otherwise we wouldn't get here)
++                if (i > 0 && !t.intersects(minColumnNames.get(i), maxColumnNames.get(i), start[i], finish[i]))
+                     continue outer;
++
++                // if this component isn't equal in the start and finish, we don't need to check any more
++                if (t.compare(start[i], finish[i]) != 0)
++                    break;
+             }
+             return true;
+         }
++
++        // none of the slices intersected
+         return false;
+     }
+ 
++    /** Helper method for intersects() */
++    private int compare(ByteBuffer[] sliceBounds, List<ByteBuffer> sstableBounds, boolean isSliceStart)
++    {
++        for (int i = 0; i < sstableBounds.size(); i++)
++        {
++            if (i >= sliceBounds.length)
++                return isSliceStart ? -1 : 1;
++
++            int comparison = types.get(i).compare(sliceBounds[i], sstableBounds.get(i));
++            if (comparison != 0)
++                return comparison;
++        }
++        return 0;
++    }
++
+     private static class StaticParsedComparator implements ParsedComparator
+     {
+         final AbstractType<?> type;
+diff --git a/src/java/org/apache/cassandra/service/pager/AbstractQueryPager.java b/src/java/org/apache/cassandra/service/pager/AbstractQueryPager.java
+index 1b4bdbd7c9..42102961ca 100644
+--- a/src/java/org/apache/cassandra/service/pager/AbstractQueryPager.java
++++ b/src/java/org/apache/cassandra/service/pager/AbstractQueryPager.java
+@@ -32,9 +32,13 @@ import org.apache.cassandra.db.filter.ColumnCounter;
+ import org.apache.cassandra.db.filter.IDiskAtomFilter;
+ import org.apache.cassandra.exceptions.RequestExecutionException;
+ import org.apache.cassandra.exceptions.RequestValidationException;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
+ 
+ abstract class AbstractQueryPager implements QueryPager
+ {
++    private static final Logger logger = LoggerFactory.getLogger(AbstractQueryPager.class);
++
+     private final ConsistencyLevel consistencyLevel;
+     private final boolean localQuery;
+ 
+@@ -85,11 +89,13 @@ abstract class AbstractQueryPager implements QueryPager
+ 
+         if (rows.isEmpty())
+         {
++            logger.debug("Got empty set of rows, considering pager exhausted");
+             exhausted = true;
+             return Collections.emptyList();
+         }
+ 
+         int liveCount = getPageLiveCount(rows);
++        logger.debug("Fetched {} live rows", liveCount);
+ 
+         // Because SP.getRangeSlice doesn't trim the result (see SP.trim()), liveCount may be greater than what asked
+         // (currentPageSize). This would throw off the paging logic so we trim the excess. It's not extremely efficient
+@@ -105,7 +111,10 @@ abstract class AbstractQueryPager implements QueryPager
+         // If we've got less than requested, there is no more query to do (but
+         // we still need to return the current page)
+         if (liveCount < currentPageSize)
++        {
++            logger.debug("Got result ({}) smaller than page size ({}), considering pager exhausted", liveCount, currentPageSize);
+             exhausted = true;
++        }
+ 
+         // If it's not the first query and the first column is the last one returned (likely
+         // but not certain since paging can race with deletes/expiration), then remove the
+@@ -124,6 +133,8 @@ abstract class AbstractQueryPager implements QueryPager
+             remaining++;
+         }
+ 
++        logger.debug("Remaining rows to page: {}", remaining);
++
+         if (!isExhausted())
+             lastWasRecorded = recordLast(rows.get(rows.size() - 1));
+ 
+diff --git a/src/java/org/apache/cassandra/service/pager/SliceQueryPager.java b/src/java/org/apache/cassandra/service/pager/SliceQueryPager.java
+index c94f7f6018..ec229cbd4e 100644
+--- a/src/java/org/apache/cassandra/service/pager/SliceQueryPager.java
++++ b/src/java/org/apache/cassandra/service/pager/SliceQueryPager.java
+@@ -26,12 +26,16 @@ import org.apache.cassandra.db.filter.SliceQueryFilter;
+ import org.apache.cassandra.exceptions.RequestValidationException;
+ import org.apache.cassandra.exceptions.RequestExecutionException;
+ import org.apache.cassandra.service.StorageProxy;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
+ 
+ /**
+  * Pager over a SliceFromReadCommand.
+  */
+ public class SliceQueryPager extends AbstractQueryPager implements SinglePartitionPager
+ {
++    private static final Logger logger = LoggerFactory.getLogger(SliceQueryPager.class);
++
+     private final SliceFromReadCommand command;
+ 
+     private volatile ByteBuffer lastReturned;
+@@ -73,6 +77,7 @@ public class SliceQueryPager extends AbstractQueryPager implements SinglePartiti
+         if (lastReturned != null)
+             filter = filter.withUpdatedStart(lastReturned, cfm.comparator);
+ 
++        logger.debug("Querying next page of slice query; new filter: {}", filter);
+         ReadCommand pageCmd = command.withUpdatedFilter(filter);
+         return localQuery
+              ? Collections.singletonList(pageCmd.getRow(Keyspace.open(command.ksName)))
+diff --git a/test/unit/org/apache/cassandra/db/marshal/CompositeTypeTest.java b/test/unit/org/apache/cassandra/db/marshal/CompositeTypeTest.java
+index 1039fb6c73..20cb5efcd9 100644
+--- a/test/unit/org/apache/cassandra/db/marshal/CompositeTypeTest.java
++++ b/test/unit/org/apache/cassandra/db/marshal/CompositeTypeTest.java
+@@ -24,10 +24,14 @@ import java.util.Iterator;
+ import java.util.List;
+ import java.util.UUID;
+ 
++import org.apache.cassandra.db.filter.ColumnSlice;
++import org.apache.cassandra.db.filter.SliceQueryFilter;
+ import org.apache.cassandra.serializers.MarshalException;
+ import org.junit.Test;
+ import static org.junit.Assert.fail;
+ import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertTrue;
+ 
+ import org.apache.cassandra.SchemaLoader;
+ import org.apache.cassandra.Util;
+@@ -255,6 +259,296 @@ public class CompositeTypeTest extends SchemaLoader
+         }
+     }
+ 
++    @Test
++    public void testIntersectsSingleSlice()
++    {
++        CompositeType comparator = CompositeType.getInstance(Int32Type.instance, Int32Type.instance, Int32Type.instance);
++
++        // filter falls entirely before sstable
++        SliceQueryFilter filter = new SliceQueryFilter(composite(0, 0, 0), composite(1, 0, 0), false, 1);
++        assertFalse(comparator.intersects(columnNames(2, 0, 0), columnNames(3, 0, 0), filter));
++
++        // same case, but with empty start
++        filter = new SliceQueryFilter(ByteBufferUtil.EMPTY_BYTE_BUFFER, composite(1, 0, 0), false, 1);
++        assertFalse(comparator.intersects(columnNames(2, 0, 0), columnNames(3, 0, 0), filter));
++
++        // same case, but with missing components for start
++        filter = new SliceQueryFilter(composite(0), composite(1, 0, 0), false, 1);
++        assertFalse(comparator.intersects(columnNames(2, 0, 0), columnNames(3, 0, 0), filter));
++
++        // same case, but with missing components for start and end
++        filter = new SliceQueryFilter(composite(0), composite(1, 0), false, 1);
++        assertFalse(comparator.intersects(columnNames(2, 0, 0), columnNames(3, 0, 0), filter));
++
++
++        // end of slice matches start of sstable for the first component, but not the second component
++        filter = new SliceQueryFilter(composite(0, 0, 0), composite(1, 0, 0), false, 1);
++        assertFalse(comparator.intersects(columnNames(1, 1, 0), columnNames(3, 0, 0), filter));
++
++        // same case, but with missing components for start
++        filter = new SliceQueryFilter(composite(0), composite(1, 0, 0), false, 1);
++        assertFalse(comparator.intersects(columnNames(1, 1, 0), columnNames(3, 0, 0), filter));
++
++        // same case, but with missing components for start and end
++        filter = new SliceQueryFilter(composite(0), composite(1, 0), false, 1);
++        assertFalse(comparator.intersects(columnNames(1, 1, 0), columnNames(3, 0, 0), filter));
++
++        // first two components match, but not the last
++        filter = new SliceQueryFilter(composite(0, 0, 0), composite(1, 1, 0), false, 1);
++        assertFalse(comparator.intersects(columnNames(1, 1, 1), columnNames(3, 1, 1), filter));
++
++        // all three components in slice end match the start of the sstable
++        filter = new SliceQueryFilter(composite(0, 0, 0), composite(1, 1, 1), false, 1);
++        assertTrue(comparator.intersects(columnNames(1, 1, 1), columnNames(3, 1, 1), filter));
++
++
++        // filter falls entirely after sstable
++        filter = new SliceQueryFilter(composite(4, 0, 0), composite(4, 0, 0), false, 1);
++        assertFalse(comparator.intersects(columnNames(2, 0, 0), columnNames(3, 0, 0), filter));
++
++        // same case, but with empty end
++        filter = new SliceQueryFilter(composite(4, 0, 0), ByteBufferUtil.EMPTY_BYTE_BUFFER, false, 1);
++        assertFalse(comparator.intersects(columnNames(2, 0, 0), columnNames(3, 0, 0), filter));
++
++        // same case, but with missing components for end
++        filter = new SliceQueryFilter(composite(4, 0, 0), composite(1), false, 1);
++        assertFalse(comparator.intersects(columnNames(2, 0, 0), columnNames(3, 0, 0), filter));
++
++        // same case, but with missing components for start and end
++        filter = new SliceQueryFilter(composite(4, 0), composite(1), false, 1);
++        assertFalse(comparator.intersects(columnNames(2, 0, 0), columnNames(3, 0, 0), filter));
++
++
++        // start of slice matches end of sstable for the first component, but not the second component
++        filter = new SliceQueryFilter(composite(1, 1, 1), composite(2, 0, 0), false, 1);
++        assertFalse(comparator.intersects(columnNames(0, 0, 0), columnNames(1, 0, 0), filter));
++
++        // start of slice matches end of sstable for the first two components, but not the last component
++        filter = new SliceQueryFilter(composite(1, 1, 1), composite(2, 0, 0), false, 1);
++        assertFalse(comparator.intersects(columnNames(0, 0, 0), columnNames(1, 1, 0), filter));
++
++        // all three components in the slice start match the end of the sstable
++        filter = new SliceQueryFilter(composite(1, 1, 1), composite(2, 0, 0), false, 1);
++        assertTrue(comparator.intersects(columnNames(0, 0, 0), columnNames(1, 1, 1), filter));
++
++
++        // slice covers entire sstable (with no matching edges)
++        filter = new SliceQueryFilter(composite(0, 0, 0), composite(2, 0, 0), false, 1);
++        assertTrue(comparator.intersects(columnNames(1, 0, 0), columnNames(1, 1, 1), filter));
++
++        // same case, but with empty ends
++        filter = new SliceQueryFilter(ByteBufferUtil.EMPTY_BYTE_BUFFER, ByteBufferUtil.EMPTY_BYTE_BUFFER, false, 1);
++        assertTrue(comparator.intersects(columnNames(1, 0, 0), columnNames(1, 1, 1), filter));
++
++        // same case, but with missing components
++        filter = new SliceQueryFilter(composite(0), composite(2, 0), false, 1);
++        assertTrue(comparator.intersects(columnNames(1, 0, 0), columnNames(1, 1, 1), filter));
++
++        // slice covers entire sstable (with matching start)
++        filter = new SliceQueryFilter(composite(1, 0, 0), composite(2, 0, 0), false, 1);
++        assertTrue(comparator.intersects(columnNames(1, 0, 0), columnNames(1, 1, 1), filter));
++
++        // slice covers entire sstable (with matching end)
++        filter = new SliceQueryFilter(composite(0, 0, 0), composite(1, 1, 1), false, 1);
++        assertTrue(comparator.intersects(columnNames(1, 0, 0), columnNames(1, 1, 1), filter));
++
++        // slice covers entire sstable (with matching start and end)
++        filter = new SliceQueryFilter(composite(1, 0, 0), composite(1, 1, 1), false, 1);
++        assertTrue(comparator.intersects(columnNames(1, 0, 0), columnNames(1, 1, 1), filter));
++
++
++        // slice falls entirely within sstable (with matching start)
++        filter = new SliceQueryFilter(composite(1, 0, 0), composite(1, 1, 0), false, 1);
++        assertTrue(comparator.intersects(columnNames(1, 0, 0), columnNames(1, 1, 1), filter));
++
++        // same case, but with a missing end component
++        filter = new SliceQueryFilter(composite(1, 0, 0), composite(1, 1), false, 1);
++        assertTrue(comparator.intersects(columnNames(1, 0, 0), columnNames(1, 1, 1), filter));
++
++        // slice falls entirely within sstable (with matching end)
++        filter = new SliceQueryFilter(composite(1, 1, 0), composite(1, 1, 1), false, 1);
++        assertTrue(comparator.intersects(columnNames(1, 0, 0), columnNames(1, 1, 1), filter));
++
++        // same case, but with a missing start component
++        filter = new SliceQueryFilter(composite(1, 1), composite(1, 1, 1), false, 1);
++        assertTrue(comparator.intersects(columnNames(1, 0, 0), columnNames(1, 1, 1), filter));
++
++
++        // slice falls entirely within sstable
++        filter = new SliceQueryFilter(composite(1, 1, 0), composite(1, 1, 1), false, 1);
++        assertTrue(comparator.intersects(columnNames(1, 0, 0), columnNames(2, 2, 2), filter));
++
++        // same case, but with a missing start component
++        filter = new SliceQueryFilter(composite(1, 1), composite(1, 1, 1), false, 1);
++        assertTrue(comparator.intersects(columnNames(1, 0, 0), columnNames(2, 2, 2), filter));
++
++        // same case, but with a missing start and end components
++        filter = new SliceQueryFilter(composite(1), composite(1, 2), false, 1);
++        assertTrue(comparator.intersects(columnNames(1, 0, 0), columnNames(2, 2, 2), filter));
++
++        // slice falls entirely within sstable (slice start and end are the same)
++        filter = new SliceQueryFilter(composite(1, 1, 1), composite(1, 1, 1), false, 1);
++        assertTrue(comparator.intersects(columnNames(1, 0, 0), columnNames(2, 2, 2), filter));
++
++
++        // slice starts within sstable, empty end
++        filter = new SliceQueryFilter(composite(1, 1, 1), ByteBufferUtil.EMPTY_BYTE_BUFFER, false, 1);
++        assertTrue(comparator.intersects(columnNames(1, 0, 0), columnNames(2, 0, 0), filter));
++
++        // same case, but with missing end components
++        filter = new SliceQueryFilter(composite(1, 1, 1), composite(3), false, 1);
++        assertTrue(comparator.intersects(columnNames(1, 0, 0), columnNames(2, 0, 0), filter));
++
++        // slice starts within sstable (matching sstable start), empty end
++        filter = new SliceQueryFilter(composite(1, 0, 0), ByteBufferUtil.EMPTY_BYTE_BUFFER, false, 1);
++        assertTrue(comparator.intersects(columnNames(1, 0, 0), columnNames(2, 0, 0), filter));
++
++        // same case, but with missing end components
++        filter = new SliceQueryFilter(composite(1, 0, 0), composite(3), false, 1);
++        assertTrue(comparator.intersects(columnNames(1, 0, 0), columnNames(2, 0, 0), filter));
++
++        // slice starts within sstable (matching sstable end), empty end
++        filter = new SliceQueryFilter(composite(2, 0, 0), ByteBufferUtil.EMPTY_BYTE_BUFFER, false, 1);
++        assertTrue(comparator.intersects(columnNames(1, 0, 0), columnNames(2, 0, 0), filter));
++
++        // same case, but with missing end components
++        filter = new SliceQueryFilter(composite(2, 0, 0), composite(3), false, 1);
++        assertTrue(comparator.intersects(columnNames(1, 0, 0), columnNames(2, 0, 0), filter));
++
++
++        // slice ends within sstable, empty end
++        filter = new SliceQueryFilter(ByteBufferUtil.EMPTY_BYTE_BUFFER, composite(1, 1, 1), false, 1);
++        assertTrue(comparator.intersects(columnNames(1, 0, 0), columnNames(2, 0, 0), filter));
++
++        // same case, but with missing start components
++        filter = new SliceQueryFilter(composite(0), composite(1, 1, 1), false, 1);
++        assertTrue(comparator.intersects(columnNames(1, 0, 0), columnNames(2, 0, 0), filter));
++
++        // slice ends within sstable (matching sstable start), empty start
++        filter = new SliceQueryFilter(ByteBufferUtil.EMPTY_BYTE_BUFFER, composite(1, 0, 0), false, 1);
++        assertTrue(comparator.intersects(columnNames(1, 0, 0), columnNames(2, 0, 0), filter));
++
++        // same case, but with missing start components
++        filter = new SliceQueryFilter(composite(0), composite(1, 0, 0), false, 1);
++        assertTrue(comparator.intersects(columnNames(1, 0, 0), columnNames(2, 0, 0), filter));
++
++        // slice ends within sstable (matching sstable end), empty start
++        filter = new SliceQueryFilter(ByteBufferUtil.EMPTY_BYTE_BUFFER, composite(2, 0, 0), false, 1);
++        assertTrue(comparator.intersects(columnNames(1, 0, 0), columnNames(2, 0, 0), filter));
++
++        // same case, but with missing start components
++        filter = new SliceQueryFilter(composite(0), composite(2, 0, 0), false, 1);
++        assertTrue(comparator.intersects(columnNames(1, 0, 0), columnNames(2, 0, 0), filter));
++
++
++        // the slice technically falls within the sstable range, but since the first component is restricted to
++        // a single value, we can check that the second component does not fall within its min/max
++        filter = new SliceQueryFilter(composite(1, 2, 0), composite(1, 3, 0), false, 1);
++        assertFalse(comparator.intersects(columnNames(1, 0, 0), columnNames(2, 1, 0), filter));
++
++        // same case, but with a missing start component
++        filter = new SliceQueryFilter(composite(1, 2), composite(1, 3, 0), false, 1);
++        assertFalse(comparator.intersects(columnNames(1, 0, 0), columnNames(2, 1, 0), filter));
++
++        // same case, but with a missing end component
++        filter = new SliceQueryFilter(composite(1, 2, 0), composite(1, 3), false, 1);
++        assertFalse(comparator.intersects(columnNames(1, 0, 0), columnNames(2, 1, 0), filter));
++
++        // same case, but with a missing start and end components
++        filter = new SliceQueryFilter(composite(1, 2), composite(1, 3), false, 1);
++        assertFalse(comparator.intersects(columnNames(1, 0, 0), columnNames(2, 1, 0), filter));
++
++
++        // same as the previous set of tests, but the second component is equal in the slice start and end
++        filter = new SliceQueryFilter(composite(1, 2, 0), composite(1, 2, 0), false, 1);
++        assertFalse(comparator.intersects(columnNames(1, 0, 0), columnNames(2, 1, 0), filter));
++
++        // same case, but with a missing start component
++        filter = new SliceQueryFilter(composite(1, 2), composite(1, 2, 0), false, 1);
++        assertFalse(comparator.intersects(columnNames(1, 0, 0), columnNames(2, 1, 0), filter));
++
++        // same case, but with a missing end component
++        filter = new SliceQueryFilter(composite(1, 2, 0), composite(1, 2), false, 1);
++        assertFalse(comparator.intersects(columnNames(1, 0, 0), columnNames(2, 1, 0), filter));
++
++        // same case, but with a missing start and end components
++        filter = new SliceQueryFilter(composite(1, 2), composite(1, 2), false, 1);
++        assertFalse(comparator.intersects(columnNames(1, 0, 0), columnNames(2, 1, 0), filter));
++
++        // same as the previous tests, but it's the third component that doesn't fit in its range this time
++        filter = new SliceQueryFilter(composite(1, 1, 2), composite(1, 1, 3), false, 1);
++        assertFalse(comparator.intersects(columnNames(1, 1, 0), columnNames(2, 2, 1), filter));
++
++
++        // basic check on reversed slices
++        filter = new SliceQueryFilter(composite(1, 0, 0), composite(0, 0, 0), true, 1);
++        assertFalse(comparator.intersects(columnNames(2, 0, 0), columnNames(3, 0, 0), filter));
++
++        filter = new SliceQueryFilter(composite(1, 0, 0), composite(0, 0, 0), true, 1);
++        assertFalse(comparator.intersects(columnNames(1, 1, 0), columnNames(3, 0, 0), filter));
++
++        filter = new SliceQueryFilter(composite(1, 1, 1), composite(1, 1, 0), true, 1);
++        assertTrue(comparator.intersects(columnNames(1, 0, 0), columnNames(2, 2, 2), filter));
++    }
++
++    @Test
++    public void testIntersectsMultipleSlices()
++    {
++        CompositeType comparator = CompositeType.getInstance(Int32Type.instance, Int32Type.instance, Int32Type.instance);
++
++        // all slices intersect
++        SliceQueryFilter filter = new SliceQueryFilter(new ColumnSlice[]{
++            new ColumnSlice(composite(1, 0, 0), composite(2, 0, 0)),
++            new ColumnSlice(composite(3, 0, 0), composite(4, 0, 0)),
++            new ColumnSlice(composite(5, 0, 0), composite(6, 0, 0)),
++        }, false, 1);
++
++        // first slice doesn't intersect
++        assertTrue(comparator.intersects(columnNames(0, 0, 0), columnNames(7, 0, 0), filter));
++        filter = new SliceQueryFilter(new ColumnSlice[]{
++                new ColumnSlice(composite(1, 0, 0), composite(2, 0, 0)),
++                new ColumnSlice(composite(3, 0, 0), composite(4, 0, 0)),
++                new ColumnSlice(composite(5, 0, 0), composite(6, 0, 0)),
++        }, false, 1);
++        assertTrue(comparator.intersects(columnNames(3, 0, 0), columnNames(7, 0, 0), filter));
++
++        // first two slices don't intersect
++        assertTrue(comparator.intersects(columnNames(0, 0, 0), columnNames(7, 0, 0), filter));
++        filter = new SliceQueryFilter(new ColumnSlice[]{
++                new ColumnSlice(composite(1, 0, 0), composite(2, 0, 0)),
++                new ColumnSlice(composite(3, 0, 0), composite(4, 0, 0)),
++                new ColumnSlice(composite(5, 0, 0), composite(6, 0, 0)),
++        }, false, 1);
++        assertTrue(comparator.intersects(columnNames(5, 0, 0), columnNames(7, 0, 0), filter));
++
++        // none of the slices intersect
++        assertTrue(comparator.intersects(columnNames(0, 0, 0), columnNames(7, 0, 0), filter));
++        filter = new SliceQueryFilter(new ColumnSlice[]{
++                new ColumnSlice(composite(1, 0, 0), composite(2, 0, 0)),
++                new ColumnSlice(composite(3, 0, 0), composite(4, 0, 0)),
++                new ColumnSlice(composite(5, 0, 0), composite(6, 0, 0)),
++        }, false, 1);
++        assertFalse(comparator.intersects(columnNames(7, 0, 0), columnNames(8, 0, 0), filter));
++    }
++
++
++    private static ByteBuffer composite(Integer ... components)
++    {
++        CompositeType comparator = CompositeType.getInstance(Int32Type.instance, Int32Type.instance, Int32Type.instance);
++        CompositeType.Builder builder = comparator.builder();
++        for (int component : components)
++            builder.add(ByteBufferUtil.bytes(component));
++        return builder.build();
++    }
++
++    private static List<ByteBuffer> columnNames(Integer ... components)
++    {
++        List<ByteBuffer> names = new ArrayList<>(components.length);
++        for (int component : components)
++            names.add(ByteBufferUtil.bytes(component));
++        return names;
++    }
++
+     private void addColumn(RowMutation rm, ByteBuffer cname)
+     {
+         rm.add(cfName, cname, ByteBufferUtil.EMPTY_BYTE_BUFFER, 0);

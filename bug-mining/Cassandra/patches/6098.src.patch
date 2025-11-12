@@ -1,0 +1,252 @@
+diff --git a/CHANGES.txt b/CHANGES.txt
+index 309905c503..b09b00e498 100644
+--- a/CHANGES.txt
++++ b/CHANGES.txt
+@@ -1,4 +1,5 @@
+ 4.0.6
++ * Fix race condition on updating cdc size and advancing to next segment (CASSANDRA-17792)
+  * Add 'noboolean' rpm build for older distros like CentOS7 (CASSANDRA-17765)
+  * Fix default value for compaction_throughput_mb_per_sec in Config class to match  the one in cassandra.yaml (CASSANDRA-17790)
+  * Fix Setting Virtual Table - update after startup config properties gc_log_threshold_in_ms, gc_warn_threshold_in_ms,
+diff --git a/src/java/org/apache/cassandra/db/commitlog/CommitLogSegment.java b/src/java/org/apache/cassandra/db/commitlog/CommitLogSegment.java
+index 7c80b949ff..64b815e3de 100644
+--- a/src/java/org/apache/cassandra/db/commitlog/CommitLogSegment.java
++++ b/src/java/org/apache/cassandra/db/commitlog/CommitLogSegment.java
+@@ -687,11 +687,13 @@ public abstract class CommitLogSegment
+     /**
+      * Change the current cdcState on this CommitLogSegment. There are some restrictions on state transitions and this
+      * method is idempotent.
++     *
++     * @return the old cdc state
+      */
+-    public void setCDCState(CDCState newState)
++    public CDCState setCDCState(CDCState newState)
+     {
+         if (newState == cdcState)
+-            return;
++            return cdcState;
+ 
+         // Also synchronized in CDCSizeTracker.processNewSegment and .processDiscardedSegment
+         synchronized(cdcStateLock)
+@@ -703,7 +705,9 @@ public abstract class CommitLogSegment
+             if (cdcState == CDCState.FORBIDDEN && newState != CDCState.PERMITTED)
+                 throw new IllegalArgumentException("Only transition from FORBIDDEN to PERMITTED is allowed.");
+ 
++            CDCState oldState = cdcState;
+             cdcState = newState;
++            return oldState;
+         }
+     }
+ 
+diff --git a/src/java/org/apache/cassandra/db/commitlog/CommitLogSegmentManagerCDC.java b/src/java/org/apache/cassandra/db/commitlog/CommitLogSegmentManagerCDC.java
+index 66c8a39c76..b254b9b352 100644
+--- a/src/java/org/apache/cassandra/db/commitlog/CommitLogSegmentManagerCDC.java
++++ b/src/java/org/apache/cassandra/db/commitlog/CommitLogSegmentManagerCDC.java
+@@ -20,6 +20,7 @@ package org.apache.cassandra.db.commitlog;
+ 
+ import java.io.File;
+ import java.io.IOException;
++import java.nio.file.FileAlreadyExistsException;
+ import java.nio.file.FileVisitResult;
+ import java.nio.file.Files;
+ import java.nio.file.Path;
+@@ -35,6 +36,7 @@ import org.apache.cassandra.config.DatabaseDescriptor;
+ import org.apache.cassandra.db.Mutation;
+ import org.apache.cassandra.db.commitlog.CommitLogSegment.CDCState;
+ import org.apache.cassandra.exceptions.CDCWriteException;
++import org.apache.cassandra.io.FSWriteError;
+ import org.apache.cassandra.io.util.FileUtils;
+ import org.apache.cassandra.utils.DirectorySizeCalculator;
+ import org.apache.cassandra.utils.NoSpamLogger;
+@@ -47,7 +49,7 @@ public class CommitLogSegmentManagerCDC extends AbstractCommitLogSegmentManager
+     public CommitLogSegmentManagerCDC(final CommitLog commitLog, String storageDirectory)
+     {
+         super(commitLog, storageDirectory);
+-        cdcSizeTracker = new CDCSizeTracker(this, new File(DatabaseDescriptor.getCDCLogLocation()));
++        cdcSizeTracker = new CDCSizeTracker(new File(DatabaseDescriptor.getCDCLogLocation()));
+     }
+ 
+     @Override
+@@ -105,6 +107,7 @@ public class CommitLogSegmentManagerCDC extends AbstractCommitLogSegmentManager
+         CommitLogSegment segment = allocatingFrom();
+         CommitLogSegment.Allocation alloc;
+ 
++        permitSegmentMaybe(segment);
+         throwIfForbidden(mutation, segment);
+         while ( null == (alloc = segment.allocate(mutation, size)) )
+         {
+@@ -112,6 +115,7 @@ public class CommitLogSegmentManagerCDC extends AbstractCommitLogSegmentManager
+             advanceAllocatingFrom(segment);
+             segment = allocatingFrom();
+ 
++            permitSegmentMaybe(segment);
+             throwIfForbidden(mutation, segment);
+         }
+ 
+@@ -121,13 +125,35 @@ public class CommitLogSegmentManagerCDC extends AbstractCommitLogSegmentManager
+         return alloc;
+     }
+ 
++    // Permit a forbidden segment under the following conditions.
++    // - Non-blocking mode has just recently been enabled for CDC.
++    // - The CDC total space has droppped below the limit (e.g. CDC consumer cleans up).
++    private void permitSegmentMaybe(CommitLogSegment segment)
++    {
++        if (segment.getCDCState() != CDCState.FORBIDDEN)
++            return;
++
++        if (cdcSizeTracker.hasSpaceForNewSegment())
++        {
++            CDCState oldState = segment.setCDCState(CDCState.PERMITTED);
++
++            if (oldState == CDCState.FORBIDDEN)
++            {
++                FileUtils.createHardLink(segment.logFile, segment.getCDCFile());
++                cdcSizeTracker.addSize(DatabaseDescriptor.getCommitLogSegmentSize());
++            }
++        }
++    }
++
+     private void throwIfForbidden(Mutation mutation, CommitLogSegment segment) throws CDCWriteException
+     {
+         if (mutation.trackedByCDC() && segment.getCDCState() == CDCState.FORBIDDEN)
+         {
++            String logMsg = String.format("Rejecting mutation to keyspace %s. Free up space in %s by processing CDC logs. " +
++                                          "Total CDC bytes on disk is %s.",
++                                          mutation.getKeyspaceName(), DatabaseDescriptor.getCDCLogLocation(),
++                                          cdcSizeTracker.totalCDCSizeOnDisk());
+             cdcSizeTracker.submitOverflowSizeRecalculation();
+-            String logMsg = String.format("Rejecting mutation to keyspace %s. Free up space in %s by processing CDC logs.",
+-                mutation.getKeyspaceName(), DatabaseDescriptor.getCDCLogLocation());
+             NoSpamLogger.log(logger,
+                              NoSpamLogger.Level.WARN,
+                              10,
+@@ -140,15 +166,21 @@ public class CommitLogSegmentManagerCDC extends AbstractCommitLogSegmentManager
+     /**
+      * On segment creation, flag whether the segment should accept CDC mutations or not based on the total currently
+      * allocated unflushed CDC segments and the contents of cdc_raw
++     *
++     * Synchronized on this
+      */
++    @Override
+     public CommitLogSegment createSegment()
+     {
+         CommitLogSegment segment = CommitLogSegment.createSegment(commitLog, this);
+ 
+-        // Hard link file in cdc folder for realtime tracking
+-        FileUtils.createHardLink(segment.logFile, segment.getCDCFile());
+-
+         cdcSizeTracker.processNewSegment(segment);
++        // After processing, the state of the segment can either be PERMITTED or FORBIDDEN
++        if (segment.getCDCState() == CDCState.PERMITTED)
++        {
++            // Hard link file in cdc folder for realtime tracking
++            FileUtils.createHardLink(segment.logFile, segment.getCDCFile());
++        }
+         return segment;
+     }
+ 
+@@ -191,15 +223,13 @@ public class CommitLogSegmentManagerCDC extends AbstractCommitLogSegmentManager
+     {
+         private final RateLimiter rateLimiter = RateLimiter.create(1000.0 / DatabaseDescriptor.getCDCDiskCheckInterval());
+         private ExecutorService cdcSizeCalculationExecutor;
+-        private CommitLogSegmentManagerCDC segmentManager;
+ 
+         // Used instead of size during walk to remove chance of over-allocation
+         private volatile long sizeInProgress = 0;
+ 
+-        CDCSizeTracker(CommitLogSegmentManagerCDC segmentManager, File path)
++        CDCSizeTracker(File path)
+         {
+             super(path);
+-            this.segmentManager = segmentManager;
+         }
+ 
+         /**
+@@ -226,9 +256,9 @@ public class CommitLogSegmentManagerCDC extends AbstractCommitLogSegmentManager
+             // See synchronization in CommitLogSegment.setCDCState
+             synchronized(segment.cdcStateLock)
+             {
+-                segment.setCDCState(defaultSegmentSize() + totalCDCSizeOnDisk() > allowableCDCBytes()
+-                                    ? CDCState.FORBIDDEN
+-                                    : CDCState.PERMITTED);
++                segment.setCDCState(hasSpaceForNewSegment()
++                                    ? CDCState.PERMITTED
++                                    : CDCState.FORBIDDEN);
+                 if (segment.getCDCState() == CDCState.PERMITTED)
+                     size += defaultSegmentSize();
+             }
+@@ -253,7 +283,7 @@ public class CommitLogSegmentManagerCDC extends AbstractCommitLogSegmentManager
+             submitOverflowSizeRecalculation();
+         }
+ 
+-        private long allowableCDCBytes()
++        long allowableCDCBytes()
+         {
+             return (long)DatabaseDescriptor.getCDCSpaceInMB() * 1024 * 1024;
+         }
+@@ -262,7 +292,10 @@ public class CommitLogSegmentManagerCDC extends AbstractCommitLogSegmentManager
+         {
+             try
+             {
+-                cdcSizeCalculationExecutor.submit(() -> recalculateOverflowSize());
++                cdcSizeCalculationExecutor.submit(() -> {
++                    rateLimiter.acquire();
++                    calculateSize();
++                });
+             }
+             catch (RejectedExecutionException e)
+             {
+@@ -270,15 +303,6 @@ public class CommitLogSegmentManagerCDC extends AbstractCommitLogSegmentManager
+             }
+         }
+ 
+-        private void recalculateOverflowSize()
+-        {
+-            rateLimiter.acquire();
+-            calculateSize();
+-            CommitLogSegment allocatingFrom = segmentManager.allocatingFrom();
+-            if (allocatingFrom.getCDCState() == CDCState.FORBIDDEN)
+-                processNewSegment(allocatingFrom);
+-        }
+-
+         private int defaultSegmentSize()
+         {
+             return DatabaseDescriptor.getCommitLogSegmentSize();
+@@ -324,6 +348,11 @@ public class CommitLogSegmentManagerCDC extends AbstractCommitLogSegmentManager
+         {
+             return size;
+         }
++
++        private boolean hasSpaceForNewSegment()
++        {
++            return defaultSegmentSize() + totalCDCSizeOnDisk() <= allowableCDCBytes();
++        }
+     }
+ 
+     /**
+@@ -341,6 +370,10 @@ public class CommitLogSegmentManagerCDC extends AbstractCommitLogSegmentManager
+         }
+         catch (InterruptedException e) {}
+ 
++        // then update the state of the segment it is allocating from. In produciton, the state is updated during "allocate"
++        if (allocatingFrom().getCDCState() == CDCState.FORBIDDEN)
++            cdcSizeTracker.processNewSegment(allocatingFrom());
++
+         return cdcSizeTracker.totalCDCSizeOnDisk();
+     }
+ }
+diff --git a/src/java/org/apache/cassandra/db/commitlog/CommitLogSegmentManagerStandard.java b/src/java/org/apache/cassandra/db/commitlog/CommitLogSegmentManagerStandard.java
+index b9bd744da1..26821147ea 100644
+--- a/src/java/org/apache/cassandra/db/commitlog/CommitLogSegmentManagerStandard.java
++++ b/src/java/org/apache/cassandra/db/commitlog/CommitLogSegmentManagerStandard.java
+@@ -61,7 +61,8 @@ public class CommitLogSegmentManagerStandard extends AbstractCommitLogSegmentMan
+         return alloc;
+     }
+ 
+-   public CommitLogSegment createSegment()
++    @Override
++    public CommitLogSegment createSegment()
+     {
+         return CommitLogSegment.createSegment(commitLog, this);
+     }

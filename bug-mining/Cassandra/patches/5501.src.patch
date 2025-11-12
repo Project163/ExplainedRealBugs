@@ -1,0 +1,392 @@
+diff --git a/CHANGES.txt b/CHANGES.txt
+index 3b47c33806..b735ba5c83 100644
+--- a/CHANGES.txt
++++ b/CHANGES.txt
+@@ -1,4 +1,5 @@
+ 3.11.9
++ * Fix memory leak in CompressedChunkReader (CASSANDRA-15880)
+  * Don't attempt value skipping with mixed version cluster (CASSANDRA-15833)
+  * Avoid failing compactions with very large partitions (CASSANDRA-15164)
+  * Make sure LCS handles duplicate sstable added/removed notifications correctly (CASSANDRA-14103)
+diff --git a/src/java/org/apache/cassandra/db/commitlog/AbstractCommitLogSegmentManager.java b/src/java/org/apache/cassandra/db/commitlog/AbstractCommitLogSegmentManager.java
+index f92695fa6e..12dec60e80 100755
+--- a/src/java/org/apache/cassandra/db/commitlog/AbstractCommitLogSegmentManager.java
++++ b/src/java/org/apache/cassandra/db/commitlog/AbstractCommitLogSegmentManager.java
+@@ -34,6 +34,8 @@ import org.apache.cassandra.concurrent.NamedThreadFactory;
+ import org.apache.cassandra.config.DatabaseDescriptor;
+ import org.apache.cassandra.config.Schema;
+ import org.apache.cassandra.db.*;
++import org.apache.cassandra.io.compress.BufferType;
++import org.apache.cassandra.io.util.SimpleCachedBufferPool;
+ import org.apache.cassandra.utils.*;
+ import org.apache.cassandra.utils.concurrent.WaitQueue;
+ 
+@@ -85,8 +87,7 @@ public abstract class AbstractCommitLogSegmentManager
+     private final BooleanSupplier managerThreadWaitCondition = () -> (availableSegment == null && !atSegmentBufferLimit()) || shutdown;
+     private final WaitQueue managerThreadWaitQueue = new WaitQueue();
+ 
+-    private static final SimpleCachedBufferPool bufferPool =
+-        new SimpleCachedBufferPool(DatabaseDescriptor.getCommitLogMaxCompressionBuffersInPool(), DatabaseDescriptor.getCommitLogSegmentSize());
++    private volatile SimpleCachedBufferPool bufferPool;
+ 
+     AbstractCommitLogSegmentManager(final CommitLog commitLog, String storageDirectory)
+     {
+@@ -144,6 +145,16 @@ public abstract class AbstractCommitLogSegmentManager
+             }
+         };
+ 
++        // For encrypted segments we want to keep the compression buffers on-heap as we need those bytes for encryption,
++        // and we want to avoid copying from off-heap (compression buffer) to on-heap encryption APIs
++        BufferType bufferType = commitLog.configuration.useEncryption() || !commitLog.configuration.useCompression()
++                              ? BufferType.ON_HEAP
++                              : commitLog.configuration.getCompressor().preferredBufferType();
++
++        this.bufferPool = new SimpleCachedBufferPool(DatabaseDescriptor.getCommitLogMaxCompressionBuffersInPool(),
++                                                     DatabaseDescriptor.getCommitLogSegmentSize(),
++                                                     bufferType);
++
+         shutdown = false;
+         managerThread = NamedThreadFactory.createThread(runnable, "COMMIT-LOG-ALLOCATOR");
+         managerThread.start();
+@@ -483,7 +494,7 @@ public abstract class AbstractCommitLogSegmentManager
+         for (CommitLogSegment segment : activeSegments)
+             segment.close();
+ 
+-        bufferPool.shutdown();
++        bufferPool.emptyBufferPool();
+     }
+ 
+     /**
+diff --git a/src/java/org/apache/cassandra/db/commitlog/CompressedSegment.java b/src/java/org/apache/cassandra/db/commitlog/CompressedSegment.java
+index d5e61137d8..1d65fbec4e 100644
+--- a/src/java/org/apache/cassandra/db/commitlog/CompressedSegment.java
++++ b/src/java/org/apache/cassandra/db/commitlog/CompressedSegment.java
+@@ -45,12 +45,11 @@ public class CompressedSegment extends FileDirectSegment
+     {
+         super(commitLog, manager);
+         this.compressor = commitLog.configuration.getCompressor();
+-        manager.getBufferPool().setPreferredReusableBufferType(compressor.preferredBufferType());
+     }
+ 
+     ByteBuffer createBuffer(CommitLog commitLog)
+     {
+-        return manager.getBufferPool().createBuffer(commitLog.configuration.getCompressor().preferredBufferType());
++        return manager.getBufferPool().createBuffer();
+     }
+ 
+     @Override
+diff --git a/src/java/org/apache/cassandra/db/commitlog/EncryptedSegment.java b/src/java/org/apache/cassandra/db/commitlog/EncryptedSegment.java
+index 21b7c11fb0..a13f615e58 100644
+--- a/src/java/org/apache/cassandra/db/commitlog/EncryptedSegment.java
++++ b/src/java/org/apache/cassandra/db/commitlog/EncryptedSegment.java
+@@ -78,8 +78,6 @@ public class EncryptedSegment extends FileDirectSegment
+             throw new FSWriteError(e, logFile);
+         }
+         logger.debug("created a new encrypted commit log segment: {}", logFile);
+-        // Keep reusable buffers on-heap regardless of compression preference so we avoid copy off/on repeatedly during decryption
+-        manager.getBufferPool().setPreferredReusableBufferType(BufferType.ON_HEAP);
+     }
+ 
+     protected Map<String, String> additionalHeaderParameters()
+@@ -93,7 +91,7 @@ public class EncryptedSegment extends FileDirectSegment
+     {
+         // Note: we want to keep the compression buffers on-heap as we need those bytes for encryption,
+         // and we want to avoid copying from off-heap (compression buffer) to on-heap encryption APIs
+-        return manager.getBufferPool().createBuffer(BufferType.ON_HEAP);
++        return manager.getBufferPool().createBuffer();
+     }
+ 
+     void write(int startMarker, int nextMarker)
+diff --git a/src/java/org/apache/cassandra/io/util/CompressedChunkReader.java b/src/java/org/apache/cassandra/io/util/CompressedChunkReader.java
+index 177afb0de9..7250198148 100644
+--- a/src/java/org/apache/cassandra/io/util/CompressedChunkReader.java
++++ b/src/java/org/apache/cassandra/io/util/CompressedChunkReader.java
+@@ -84,22 +84,12 @@ public abstract class CompressedChunkReader extends AbstractReaderFileProxy impl
+     public static class Standard extends CompressedChunkReader
+     {
+         // we read the raw compressed bytes into this buffer, then uncompressed them into the provided one.
+-        private final ThreadLocal<ByteBuffer> compressedHolder;
++        ThreadLocalByteBufferHolder bufferHolder;
+ 
+         public Standard(ChannelProxy channel, CompressionMetadata metadata)
+         {
+             super(channel, metadata);
+-            compressedHolder = ThreadLocal.withInitial(this::allocateBuffer);
+-        }
+-
+-        public ByteBuffer allocateBuffer()
+-        {
+-            return allocateBuffer(metadata.compressor().initialCompressedBufferLength(metadata.chunkLength()));
+-        }
+-
+-        public ByteBuffer allocateBuffer(int size)
+-        {
+-            return metadata.compressor().preferredBufferType().allocate(size);
++            bufferHolder = new ThreadLocalByteBufferHolder(metadata.compressor().preferredBufferType());
+         }
+ 
+         @Override
+@@ -112,23 +102,12 @@ public abstract class CompressedChunkReader extends AbstractReaderFileProxy impl
+                 assert position <= fileLength;
+ 
+                 CompressionMetadata.Chunk chunk = metadata.chunkFor(position);
+-                ByteBuffer compressed = compressedHolder.get();
+ 
+                 boolean shouldCheckCrc = shouldCheckCrc();
+ 
+                 int length = shouldCheckCrc ? chunk.length + Integer.BYTES : chunk.length;
++                ByteBuffer compressed = bufferHolder.getBuffer(length);
+ 
+-                if (compressed.capacity() < length)
+-                {
+-                    compressed = allocateBuffer(length);
+-                    compressedHolder.set(compressed);
+-                }
+-                else
+-                {
+-                    compressed.clear();
+-                }
+-
+-                compressed.limit(length);
+                 if (channel.read(compressed, chunk.offset) != length)
+                     throw new CorruptBlockException(channel.filePath(), chunk);
+ 
+diff --git a/src/java/org/apache/cassandra/db/commitlog/SimpleCachedBufferPool.java b/src/java/org/apache/cassandra/io/util/SimpleCachedBufferPool.java
+similarity index 57%
+rename from src/java/org/apache/cassandra/db/commitlog/SimpleCachedBufferPool.java
+rename to src/java/org/apache/cassandra/io/util/SimpleCachedBufferPool.java
+index bfc0e32d59..b7550fa69a 100644
+--- a/src/java/org/apache/cassandra/db/commitlog/SimpleCachedBufferPool.java
++++ b/src/java/org/apache/cassandra/io/util/SimpleCachedBufferPool.java
+@@ -16,16 +16,14 @@
+  * limitations under the License.
+  */
+ 
+-package org.apache.cassandra.db.commitlog;
++package org.apache.cassandra.io.util;
+ 
+ import java.nio.ByteBuffer;
+ import java.util.Queue;
+-import java.util.concurrent.ConcurrentLinkedQueue;
+ import java.util.concurrent.atomic.AtomicInteger;
+ 
+-import io.netty.util.concurrent.FastThreadLocal;
+ import org.apache.cassandra.io.compress.BufferType;
+-import org.apache.cassandra.io.util.FileUtils;
++import org.jctools.queues.MpmcArrayQueue;
+ 
+ /**
+  * A very simple Bytebuffer pool with a fixed allocation size and a cached max allocation count. Will allow
+@@ -35,15 +33,13 @@ import org.apache.cassandra.io.util.FileUtils;
+  */
+ public class SimpleCachedBufferPool
+ {
+-    protected static final FastThreadLocal<ByteBuffer> reusableBufferHolder = new FastThreadLocal<ByteBuffer>()
+-    {
+-        protected ByteBuffer initialValue()
+-        {
+-            return ByteBuffer.allocate(0);
+-        }
+-    };
++    private final ThreadLocalByteBufferHolder bufferHolder;
+ 
+-    private Queue<ByteBuffer> bufferPool = new ConcurrentLinkedQueue<>();
++    private final Queue<ByteBuffer> bufferPool;
++
++    /**
++     * The number of buffers currently used.
++     */
+     private AtomicInteger usedBuffers = new AtomicInteger(0);
+ 
+     /**
+@@ -57,15 +53,19 @@ public class SimpleCachedBufferPool
+      */
+     private final int bufferSize;
+ 
+-    private BufferType preferredReusableBufferType = BufferType.ON_HEAP;
++    private final BufferType preferredReusableBufferType;
+ 
+-    public SimpleCachedBufferPool(int maxBufferPoolSize, int bufferSize)
++    public SimpleCachedBufferPool(int maxBufferPoolSize, int bufferSize, BufferType preferredReusableBufferType)
+     {
++        // We want to use a bounded queue to ensure that we do not pool more buffers than maxBufferPoolSize
++        this.bufferPool = new MpmcArrayQueue<>(maxBufferPoolSize);
+         this.maxBufferPoolSize = maxBufferPoolSize;
+         this.bufferSize = bufferSize;
++        this.preferredReusableBufferType = preferredReusableBufferType;
++        this.bufferHolder = new ThreadLocalByteBufferHolder(preferredReusableBufferType);
+     }
+ 
+-    public ByteBuffer createBuffer(BufferType bufferType)
++    public ByteBuffer createBuffer()
+     {
+         usedBuffers.incrementAndGet();
+         ByteBuffer buf = bufferPool.poll();
+@@ -74,41 +74,46 @@ public class SimpleCachedBufferPool
+             buf.clear();
+             return buf;
+         }
+-        return bufferType.allocate(bufferSize);
++        return preferredReusableBufferType.allocate(bufferSize);
+     }
+ 
+     public ByteBuffer getThreadLocalReusableBuffer(int size)
+     {
+-        ByteBuffer result = reusableBufferHolder.get();
+-        if (result.capacity() < size || BufferType.typeOf(result) != preferredReusableBufferType)
+-        {
+-            FileUtils.clean(result);
+-            result = preferredReusableBufferType.allocate(size);
+-            reusableBufferHolder.set(result);
+-        }
+-        return result;
+-    }
+-
+-    public void setPreferredReusableBufferType(BufferType type)
+-    {
+-        preferredReusableBufferType = type;
++        return bufferHolder.getBuffer(size);
+     }
+ 
+     public void releaseBuffer(ByteBuffer buffer)
+     {
++        assert buffer != null;
++        assert preferredReusableBufferType == BufferType.typeOf(buffer);
++
+         usedBuffers.decrementAndGet();
+ 
+-        if (bufferPool.size() < maxBufferPoolSize)
+-            bufferPool.add(buffer);
+-        else
++        // We use a bounded queue. By consequence if we have reached the maximum size for the buffer pool
++        // offer will return false and we know that we can simply get rid of the buffer.
++        if (!bufferPool.offer(buffer))
+             FileUtils.clean(buffer);
+     }
+ 
+-    public void shutdown()
++    /**
++     * Empties the buffer pool.
++     */
++    public void emptyBufferPool()
+     {
+-        bufferPool.clear();
++        ByteBuffer buffer = bufferPool.poll();
++        while(buffer != null)
++        {
++            FileUtils.clean(buffer);
++            buffer = bufferPool.poll();
++        }
+     }
+ 
++    /**
++     * Checks if the number of used buffers has exceeded the maximum number of cached buffers.
++     *
++     * @return {@code true} if the number of used buffers has exceeded the maximum number of cached buffers,
++     * {@code false} otherwise.
++     */
+     public boolean atLimit()
+     {
+         return usedBuffers.get() >= maxBufferPoolSize;
+@@ -119,9 +124,9 @@ public class SimpleCachedBufferPool
+     {
+         return new StringBuilder()
+                .append("SimpleBufferPool:")
+-               .append(" bufferCount:").append(usedBuffers.get())
+-               .append(", bufferSize:").append(maxBufferPoolSize)
+-               .append(", buffer size:").append(bufferSize)
++               .append(" usedBuffers:").append(usedBuffers.get())
++               .append(", maxBufferPoolSize:").append(maxBufferPoolSize)
++               .append(", bufferSize:").append(bufferSize)
+                .toString();
+     }
+ }
+diff --git a/src/java/org/apache/cassandra/io/util/ThreadLocalByteBufferHolder.java b/src/java/org/apache/cassandra/io/util/ThreadLocalByteBufferHolder.java
+new file mode 100644
+index 0000000000..392edbadd6
+--- /dev/null
++++ b/src/java/org/apache/cassandra/io/util/ThreadLocalByteBufferHolder.java
+@@ -0,0 +1,83 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.cassandra.io.util;
++
++import java.nio.ByteBuffer;
++import java.util.EnumMap;
++
++import io.netty.util.concurrent.FastThreadLocal;
++
++import org.apache.cassandra.io.compress.BufferType;
++
++/**
++ * Utility class that allow buffers to be reused by storing them in a thread local instance.
++ */
++public final class ThreadLocalByteBufferHolder
++{
++    private static final EnumMap<BufferType, FastThreadLocal<ByteBuffer>> reusableBBHolder = new EnumMap<>(BufferType.class);
++    // Convenience variable holding a ref to the current resuableBB to avoid map lookups
++    private final FastThreadLocal<ByteBuffer> reusableBB;
++
++    static
++    {
++        for (BufferType bbType : BufferType.values())
++        {
++            reusableBBHolder.put(bbType, new FastThreadLocal<ByteBuffer>()
++            {
++                protected ByteBuffer initialValue()
++                {
++                    return ByteBuffer.allocate(0);
++                }
++            });
++        }
++    };
++
++    /**
++     * The type of buffer that will be returned
++     */
++    private final BufferType bufferType;
++
++    public ThreadLocalByteBufferHolder(BufferType bufferType)
++    {
++        this.bufferType = bufferType;
++        this.reusableBB = reusableBBHolder.get(bufferType);
++    }
++
++    /**
++     * Returns the buffer for the current thread.
++     *
++     * <p>If the buffer for the current thread does not have a capacity large enough. A new buffer with the requested
++     *  size will be instatiated an will replace the existing one.</p>
++     *
++     * @param size the buffer size
++     * @return the buffer for the current thread.
++     */
++    public ByteBuffer getBuffer(int size)
++    {
++        ByteBuffer buffer = reusableBB.get();
++        if (buffer.capacity() < size)
++        {
++            FileUtils.clean(buffer);
++            buffer = bufferType.allocate(size);
++            reusableBB.set(buffer);
++        }
++        buffer.clear().limit(size);
++        return buffer;
++    }
++}

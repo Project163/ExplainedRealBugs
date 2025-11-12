@@ -1,0 +1,321 @@
+diff --git a/sql/core/src/main/java/org/apache/spark/sql/execution/UnsafeExternalRowSorter.java b/sql/core/src/main/java/org/apache/spark/sql/execution/UnsafeExternalRowSorter.java
+index 863d80b5cb9..3123f2187da 100644
+--- a/sql/core/src/main/java/org/apache/spark/sql/execution/UnsafeExternalRowSorter.java
++++ b/sql/core/src/main/java/org/apache/spark/sql/execution/UnsafeExternalRowSorter.java
+@@ -52,6 +52,12 @@ public final class UnsafeExternalRowSorter {
+   private final UnsafeExternalRowSorter.PrefixComputer prefixComputer;
+   private final UnsafeExternalSorter sorter;
+ 
++  // This flag makes sure the cleanupResource() has been called. After the cleanup work,
++  // iterator.next should always return false. Downstream operator triggers the resource
++  // cleanup while they found there's no need to keep the iterator any more.
++  // See more details in SPARK-21492.
++  private boolean isReleased = false;
++
+   public abstract static class PrefixComputer {
+ 
+     public static class Prefix {
+@@ -157,7 +163,8 @@ public final class UnsafeExternalRowSorter {
+     return sorter.getSortTimeNanos();
+   }
+ 
+-  private void cleanupResources() {
++  public void cleanupResources() {
++    isReleased = true;
+     sorter.cleanupResources();
+   }
+ 
+@@ -176,7 +183,7 @@ public final class UnsafeExternalRowSorter {
+ 
+         @Override
+         public boolean hasNext() {
+-          return sortedIterator.hasNext();
++          return !isReleased && sortedIterator.hasNext();
+         }
+ 
+         @Override
+diff --git a/sql/core/src/main/scala/org/apache/spark/sql/execution/SortExec.scala b/sql/core/src/main/scala/org/apache/spark/sql/execution/SortExec.scala
+index 0a955d6a752..32d21d05e5f 100644
+--- a/sql/core/src/main/scala/org/apache/spark/sql/execution/SortExec.scala
++++ b/sql/core/src/main/scala/org/apache/spark/sql/execution/SortExec.scala
+@@ -62,6 +62,14 @@ case class SortExec(
+     "peakMemory" -> SQLMetrics.createSizeMetric(sparkContext, "peak memory"),
+     "spillSize" -> SQLMetrics.createSizeMetric(sparkContext, "spill size"))
+ 
++  private[sql] var rowSorter: UnsafeExternalRowSorter = _
++
++  /**
++   * This method gets invoked only once for each SortExec instance to initialize an
++   * UnsafeExternalRowSorter, both `plan.execute` and code generation are using it.
++   * In the code generation code path, we need to call this function outside the class so we
++   * should make it public.
++   */
+   def createSorter(): UnsafeExternalRowSorter = {
+     val ordering = newOrdering(sortOrder, output)
+ 
+@@ -87,13 +95,13 @@ case class SortExec(
+     }
+ 
+     val pageSize = SparkEnv.get.memoryManager.pageSizeBytes
+-    val sorter = UnsafeExternalRowSorter.create(
++    rowSorter = UnsafeExternalRowSorter.create(
+       schema, ordering, prefixComparator, prefixComputer, pageSize, canUseRadixSort)
+ 
+     if (testSpillFrequency > 0) {
+-      sorter.setTestSpillFrequency(testSpillFrequency)
++      rowSorter.setTestSpillFrequency(testSpillFrequency)
+     }
+-    sorter
++    rowSorter
+   }
+ 
+   protected override def doExecute(): RDD[InternalRow] = {
+@@ -181,4 +189,17 @@ case class SortExec(
+        |$sorterVariable.insertRow((UnsafeRow)${row.value});
+      """.stripMargin
+   }
++
++  /**
++   * In SortExec, we overwrites cleanupResources to close UnsafeExternalRowSorter.
++   */
++  override protected[sql] def cleanupResources(): Unit = {
++    if (rowSorter != null) {
++      // There's possible for rowSorter is null here, for example, in the scenario of empty
++      // iterator in the current task, the downstream physical node(like SortMergeJoinExec) will
++      // trigger cleanupResources before rowSorter initialized in createSorter.
++      rowSorter.cleanupResources()
++    }
++    super.cleanupResources()
++  }
+ }
+diff --git a/sql/core/src/main/scala/org/apache/spark/sql/execution/SparkPlan.scala b/sql/core/src/main/scala/org/apache/spark/sql/execution/SparkPlan.scala
+index b4cdf9e16b7..125f76282e3 100644
+--- a/sql/core/src/main/scala/org/apache/spark/sql/execution/SparkPlan.scala
++++ b/sql/core/src/main/scala/org/apache/spark/sql/execution/SparkPlan.scala
+@@ -507,6 +507,15 @@ abstract class SparkPlan extends QueryPlan[SparkPlan] with Logging with Serializ
+     }
+     newOrdering(order, Seq.empty)
+   }
++
++  /**
++   * Cleans up the resources used by the physical operator (if any). In general, all the resources
++   * should be cleaned up when the task finishes but operators like SortMergeJoinExec and LimitExec
++   * may want eager cleanup to free up tight resources (e.g., memory).
++   */
++  protected[sql] def cleanupResources(): Unit = {
++    children.foreach(_.cleanupResources())
++  }
+ }
+ 
+ trait LeafExecNode extends SparkPlan {
+diff --git a/sql/core/src/main/scala/org/apache/spark/sql/execution/joins/SortMergeJoinExec.scala b/sql/core/src/main/scala/org/apache/spark/sql/execution/joins/SortMergeJoinExec.scala
+index 189727a9bc8..26fb0e5ffb1 100644
+--- a/sql/core/src/main/scala/org/apache/spark/sql/execution/joins/SortMergeJoinExec.scala
++++ b/sql/core/src/main/scala/org/apache/spark/sql/execution/joins/SortMergeJoinExec.scala
+@@ -191,7 +191,8 @@ case class SortMergeJoinExec(
+               RowIterator.fromScala(leftIter),
+               RowIterator.fromScala(rightIter),
+               inMemoryThreshold,
+-              spillThreshold
++              spillThreshold,
++              cleanupResources
+             )
+             private[this] val joinRow = new JoinedRow
+ 
+@@ -235,7 +236,8 @@ case class SortMergeJoinExec(
+             streamedIter = RowIterator.fromScala(leftIter),
+             bufferedIter = RowIterator.fromScala(rightIter),
+             inMemoryThreshold,
+-            spillThreshold
++            spillThreshold,
++            cleanupResources
+           )
+           val rightNullRow = new GenericInternalRow(right.output.length)
+           new LeftOuterIterator(
+@@ -249,7 +251,8 @@ case class SortMergeJoinExec(
+             streamedIter = RowIterator.fromScala(rightIter),
+             bufferedIter = RowIterator.fromScala(leftIter),
+             inMemoryThreshold,
+-            spillThreshold
++            spillThreshold,
++            cleanupResources
+           )
+           val leftNullRow = new GenericInternalRow(left.output.length)
+           new RightOuterIterator(
+@@ -283,7 +286,8 @@ case class SortMergeJoinExec(
+               RowIterator.fromScala(leftIter),
+               RowIterator.fromScala(rightIter),
+               inMemoryThreshold,
+-              spillThreshold
++              spillThreshold,
++              cleanupResources
+             )
+             private[this] val joinRow = new JoinedRow
+ 
+@@ -318,7 +322,8 @@ case class SortMergeJoinExec(
+               RowIterator.fromScala(leftIter),
+               RowIterator.fromScala(rightIter),
+               inMemoryThreshold,
+-              spillThreshold
++              spillThreshold,
++              cleanupResources
+             )
+             private[this] val joinRow = new JoinedRow
+ 
+@@ -360,7 +365,8 @@ case class SortMergeJoinExec(
+               RowIterator.fromScala(leftIter),
+               RowIterator.fromScala(rightIter),
+               inMemoryThreshold,
+-              spillThreshold
++              spillThreshold,
++              cleanupResources
+             )
+             private[this] val joinRow = new JoinedRow
+ 
+@@ -640,6 +646,9 @@ case class SortMergeJoinExec(
+       (evaluateVariables(leftVars), "")
+     }
+ 
++    val thisPlan = ctx.addReferenceObj("plan", this)
++    val eagerCleanup = s"$thisPlan.cleanupResources();"
++
+     s"""
+        |while (findNextInnerJoinRows($leftInput, $rightInput)) {
+        |  ${leftVarDecl.mkString("\n")}
+@@ -653,6 +662,7 @@ case class SortMergeJoinExec(
+        |  }
+        |  if (shouldStop()) return;
+        |}
++       |$eagerCleanup
+      """.stripMargin
+   }
+ }
+@@ -678,6 +688,7 @@ case class SortMergeJoinExec(
+  * @param inMemoryThreshold Threshold for number of rows guaranteed to be held in memory by
+  *                          internal buffer
+  * @param spillThreshold Threshold for number of rows to be spilled by internal buffer
++ * @param eagerCleanupResources the eager cleanup function to be invoked when no join row found
+  */
+ private[joins] class SortMergeJoinScanner(
+     streamedKeyGenerator: Projection,
+@@ -686,7 +697,8 @@ private[joins] class SortMergeJoinScanner(
+     streamedIter: RowIterator,
+     bufferedIter: RowIterator,
+     inMemoryThreshold: Int,
+-    spillThreshold: Int) {
++    spillThreshold: Int,
++    eagerCleanupResources: () => Unit) {
+   private[this] var streamedRow: InternalRow = _
+   private[this] var streamedRowKey: InternalRow = _
+   private[this] var bufferedRow: InternalRow = _
+@@ -710,7 +722,8 @@ private[joins] class SortMergeJoinScanner(
+   def getBufferedMatches: ExternalAppendOnlyUnsafeRowArray = bufferedMatches
+ 
+   /**
+-   * Advances both input iterators, stopping when we have found rows with matching join keys.
++   * Advances both input iterators, stopping when we have found rows with matching join keys. If no
++   * join rows found, try to do the eager resources cleanup.
+    * @return true if matching rows have been found and false otherwise. If this returns true, then
+    *         [[getStreamedRow]] and [[getBufferedMatches]] can be called to construct the join
+    *         results.
+@@ -720,7 +733,7 @@ private[joins] class SortMergeJoinScanner(
+       // Advance the streamed side of the join until we find the next row whose join key contains
+       // no nulls or we hit the end of the streamed iterator.
+     }
+-    if (streamedRow == null) {
++    val found = if (streamedRow == null) {
+       // We have consumed the entire streamed iterator, so there can be no more matches.
+       matchJoinKey = null
+       bufferedMatches.clear()
+@@ -760,17 +773,19 @@ private[joins] class SortMergeJoinScanner(
+         true
+       }
+     }
++    if (!found) eagerCleanupResources()
++    found
+   }
+ 
+   /**
+    * Advances the streamed input iterator and buffers all rows from the buffered input that
+-   * have matching keys.
++   * have matching keys. If no join rows found, try to do the eager resources cleanup.
+    * @return true if the streamed iterator returned a row, false otherwise. If this returns true,
+    *         then [[getStreamedRow]] and [[getBufferedMatches]] can be called to produce the outer
+    *         join results.
+    */
+   final def findNextOuterJoinRows(): Boolean = {
+-    if (!advancedStreamed()) {
++    val found = if (!advancedStreamed()) {
+       // We have consumed the entire streamed iterator, so there can be no more matches.
+       matchJoinKey = null
+       bufferedMatches.clear()
+@@ -800,6 +815,8 @@ private[joins] class SortMergeJoinScanner(
+       // If there is a streamed input then we always return true
+       true
+     }
++    if (!found) eagerCleanupResources()
++    found
+   }
+ 
+   // --- Private methods --------------------------------------------------------------------------
+diff --git a/sql/core/src/test/scala/org/apache/spark/sql/JoinSuite.scala b/sql/core/src/test/scala/org/apache/spark/sql/JoinSuite.scala
+index 72742644ff3..62f2d21e527 100644
+--- a/sql/core/src/test/scala/org/apache/spark/sql/JoinSuite.scala
++++ b/sql/core/src/test/scala/org/apache/spark/sql/JoinSuite.scala
+@@ -22,12 +22,14 @@ import java.util.Locale
+ import scala.collection.JavaConverters._
+ import scala.collection.mutable.ListBuffer
+ 
++import org.mockito.Mockito._
++
+ import org.apache.spark.TestUtils.{assertNotSpilled, assertSpilled}
+ import org.apache.spark.sql.catalyst.TableIdentifier
+ import org.apache.spark.sql.catalyst.analysis.UnresolvedRelation
+ import org.apache.spark.sql.catalyst.expressions.{Ascending, SortOrder}
+ import org.apache.spark.sql.catalyst.plans.logical.Filter
+-import org.apache.spark.sql.execution.{BinaryExecNode, FilterExec, SortExec}
++import org.apache.spark.sql.execution.{BinaryExecNode, FilterExec, SortExec, SparkPlan}
+ import org.apache.spark.sql.execution.joins._
+ import org.apache.spark.sql.execution.python.BatchEvalPythonExec
+ import org.apache.spark.sql.internal.SQLConf
+@@ -37,6 +39,23 @@ import org.apache.spark.sql.types.StructType
+ class JoinSuite extends QueryTest with SharedSparkSession {
+   import testImplicits._
+ 
++  private def attachCleanupResourceChecker(plan: SparkPlan): Unit = {
++    // SPARK-21492: Check cleanupResources are finally triggered in SortExec node for every
++    // test case
++    plan.foreachUp {
++      case s: SortExec =>
++        val sortExec = spy(s)
++        verify(sortExec, atLeastOnce).cleanupResources()
++        verify(sortExec.rowSorter, atLeastOnce).cleanupResources()
++      case _ =>
++    }
++  }
++
++  override protected def checkAnswer(df: => DataFrame, rows: Seq[Row]): Unit = {
++    attachCleanupResourceChecker(df.queryExecution.sparkPlan)
++    super.checkAnswer(df, rows)
++  }
++
+   setupTestData()
+ 
+   def statisticSizeInByte(df: DataFrame): BigInt = {
+@@ -1039,4 +1058,16 @@ class JoinSuite extends QueryTest with SharedSparkSession {
+ 
+     checkAnswer(df, Row(1, 2, 1, 2) :: Nil)
+   }
++
++  test("SPARK-21492: cleanupResource without code generation") {
++    withSQLConf(
++      SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "false",
++      SQLConf.SHUFFLE_PARTITIONS.key -> "1",
++      SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1") {
++      val df1 = spark.range(0, 10, 1, 2)
++      val df2 = spark.range(10).select($"id".as("b1"), (- $"id").as("b2"))
++      val res = df1.join(df2, $"id" === $"b1" && $"id" === $"b2").select($"b1", $"b2", $"id")
++      checkAnswer(res, Row(0, 0, 0))
++    }
++  }
+ }

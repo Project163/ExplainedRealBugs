@@ -1,0 +1,807 @@
+diff --git a/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/expressions/aggregate/interfaces.scala b/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/expressions/aggregate/interfaces.scala
+index 281734c6f14..8c70c86aa18 100644
+--- a/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/expressions/aggregate/interfaces.scala
++++ b/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/expressions/aggregate/interfaces.scala
+@@ -80,6 +80,14 @@ object AggregateExpression {
+       filter,
+       NamedExpression.newExprId)
+   }
++
++  def containsAggregate(expr: Expression): Boolean = {
++    expr.find(isAggregate).isDefined
++  }
++
++  def isAggregate(expr: Expression): Boolean = {
++    expr.isInstanceOf[AggregateExpression] || PythonUDF.isGroupedAggPandasUDF(expr)
++  }
+ }
+ 
+ /**
+diff --git a/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/optimizer/ComplexTypes.scala b/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/optimizer/ComplexTypes.scala
+index 0ff11ca49f3..8f1548a9788 100644
+--- a/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/optimizer/ComplexTypes.scala
++++ b/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/optimizer/ComplexTypes.scala
+@@ -18,7 +18,7 @@
+ package org.apache.spark.sql.catalyst.optimizer
+ 
+ import org.apache.spark.sql.catalyst.expressions._
+-import org.apache.spark.sql.catalyst.plans.logical.{Aggregate, LogicalPlan}
++import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
+ import org.apache.spark.sql.catalyst.rules.Rule
+ 
+ /**
+@@ -26,15 +26,6 @@ import org.apache.spark.sql.catalyst.rules.Rule
+  */
+ object SimplifyExtractValueOps extends Rule[LogicalPlan] {
+   override def apply(plan: LogicalPlan): LogicalPlan = plan transform {
+-    // One place where this optimization is invalid is an aggregation where the select
+-    // list expression is a function of a grouping expression:
+-    //
+-    // SELECT struct(a,b).a FROM tbl GROUP BY struct(a,b)
+-    //
+-    // cannot be simplified to SELECT a FROM tbl GROUP BY struct(a,b). So just skip this
+-    // optimization for Aggregates (although this misses some cases where the optimization
+-    // can be made).
+-    case a: Aggregate => a
+     case p => p.transformExpressionsUp {
+       // Remove redundant field extraction.
+       case GetStructField(createNamedStruct: CreateNamedStruct, ordinal, _) =>
+diff --git a/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/optimizer/Optimizer.scala b/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/optimizer/Optimizer.scala
+index 985705d07c0..07c86a7e09b 100644
+--- a/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/optimizer/Optimizer.scala
++++ b/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/optimizer/Optimizer.scala
+@@ -148,6 +148,7 @@ abstract class Optimizer(catalogManager: CatalogManager)
+       EliminateView,
+       ReplaceExpressions,
+       RewriteNonCorrelatedExists,
++      PullOutGroupingExpressions,
+       ComputeCurrentTime,
+       GetCurrentDatabaseAndCatalog(catalogManager)) ::
+     //////////////////////////////////////////////////////////////////////////////////////////
+@@ -267,7 +268,8 @@ abstract class Optimizer(catalogManager: CatalogManager)
+       RewriteCorrelatedScalarSubquery.ruleName ::
+       RewritePredicateSubquery.ruleName ::
+       NormalizeFloatingNumbers.ruleName ::
+-      ReplaceUpdateFieldsExpression.ruleName :: Nil
++      ReplaceUpdateFieldsExpression.ruleName ::
++      PullOutGroupingExpressions.ruleName :: Nil
+ 
+   /**
+    * Optimize all the subqueries inside expression.
+@@ -524,23 +526,19 @@ object RemoveRedundantAggregates extends Rule[LogicalPlan] with AliasHelper {
+   }
+ 
+   private def lowerIsRedundant(upper: Aggregate, lower: Aggregate): Boolean = {
+-    val upperHasNoAggregateExpressions = !upper.aggregateExpressions.exists(isAggregate)
++    val upperHasNoAggregateExpressions =
++      !upper.aggregateExpressions.exists(AggregateExpression.containsAggregate)
+ 
+     lazy val upperRefsOnlyDeterministicNonAgg = upper.references.subsetOf(AttributeSet(
+       lower
+         .aggregateExpressions
+         .filter(_.deterministic)
+-        .filter(!isAggregate(_))
++        .filterNot(AggregateExpression.containsAggregate)
+         .map(_.toAttribute)
+     ))
+ 
+     upperHasNoAggregateExpressions && upperRefsOnlyDeterministicNonAgg
+   }
+-
+-  private def isAggregate(expr: Expression): Boolean = {
+-    expr.find(e => e.isInstanceOf[AggregateExpression] ||
+-      PythonUDF.isGroupedAggPandasUDF(e)).isDefined
+-  }
+ }
+ 
+ /**
+diff --git a/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/optimizer/PullOutGroupingExpressions.scala b/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/optimizer/PullOutGroupingExpressions.scala
+new file mode 100644
+index 00000000000..a2f1ed66ad1
+--- /dev/null
++++ b/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/optimizer/PullOutGroupingExpressions.scala
+@@ -0,0 +1,79 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.spark.sql.catalyst.optimizer
++
++import scala.collection.mutable
++
++import org.apache.spark.sql.catalyst.expressions.{Alias, Expression, NamedExpression}
++import org.apache.spark.sql.catalyst.expressions.aggregate.AggregateExpression
++import org.apache.spark.sql.catalyst.plans.logical.{Aggregate, LogicalPlan, Project}
++import org.apache.spark.sql.catalyst.rules.Rule
++
++/**
++ * This rule ensures that [[Aggregate]] nodes doesn't contain complex grouping expressions in the
++ * optimization phase.
++ *
++ * Complex grouping expressions are pulled out to a [[Project]] node under [[Aggregate]] and are
++ * referenced in both grouping expressions and aggregate expressions without aggregate functions.
++ * These references ensure that optimization rules don't change the aggregate expressions to invalid
++ * ones that no longer refer to any grouping expressions and also simplify the expression
++ * transformations on the node (need to transform the expression only once).
++ *
++ * For example, in the following query Spark shouldn't optimize the aggregate expression
++ * `Not(IsNull(c))` to `IsNotNull(c)` as the grouping expression is `IsNull(c)`:
++ * SELECT not(c IS NULL)
++ * FROM t
++ * GROUP BY c IS NULL
++ * Instead, the aggregate expression references a `_groupingexpression` attribute:
++ * Aggregate [_groupingexpression#233], [NOT _groupingexpression#233 AS (NOT (c IS NULL))#230]
++ * +- Project [isnull(c#219) AS _groupingexpression#233]
++ *    +- LocalRelation [c#219]
++ */
++object PullOutGroupingExpressions extends Rule[LogicalPlan] {
++  override def apply(plan: LogicalPlan): LogicalPlan = {
++    plan transform {
++      case a: Aggregate if a.resolved =>
++        val complexGroupingExpressionMap = mutable.LinkedHashMap.empty[Expression, NamedExpression]
++        val newGroupingExpressions = a.groupingExpressions.map {
++          case e if !e.foldable && e.children.nonEmpty =>
++            complexGroupingExpressionMap
++              .getOrElseUpdate(e.canonicalized, Alias(e, s"_groupingexpression")())
++              .toAttribute
++          case o => o
++        }
++        if (complexGroupingExpressionMap.nonEmpty) {
++          def replaceComplexGroupingExpressions(e: Expression): Expression = {
++            e match {
++              case _ if AggregateExpression.isAggregate(e) => e
++              case _ if e.foldable => e
++              case _ if complexGroupingExpressionMap.contains(e.canonicalized) =>
++                complexGroupingExpressionMap.get(e.canonicalized).map(_.toAttribute).getOrElse(e)
++              case _ => e.mapChildren(replaceComplexGroupingExpressions)
++            }
++          }
++
++          val newAggregateExpressions = a.aggregateExpressions
++            .map(replaceComplexGroupingExpressions(_).asInstanceOf[NamedExpression])
++          val newChild = Project(a.child.output ++ complexGroupingExpressionMap.values, a.child)
++          Aggregate(newGroupingExpressions, newAggregateExpressions, newChild)
++        } else {
++          a
++        }
++    }
++  }
++}
+diff --git a/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/planning/patterns.scala b/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/planning/patterns.scala
+index c22a874779f..8def82eea6e 100644
+--- a/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/planning/patterns.scala
++++ b/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/planning/patterns.scala
+@@ -297,11 +297,9 @@ object PhysicalAggregation {
+       val aggregateExpressions = resultExpressions.flatMap { expr =>
+         expr.collect {
+           // addExpr() always returns false for non-deterministic expressions and do not add them.
+-          case agg: AggregateExpression
+-            if !equivalentAggregateExpressions.addExpr(agg) => agg
+-          case udf: PythonUDF
+-            if PythonUDF.isGroupedAggPandasUDF(udf) &&
+-              !equivalentAggregateExpressions.addExpr(udf) => udf
++          case a
++            if AggregateExpression.isAggregate(a) && !equivalentAggregateExpressions.addExpr(a) =>
++            a
+         }
+       }
+ 
+diff --git a/sql/catalyst/src/test/scala/org/apache/spark/sql/catalyst/optimizer/complexTypesSuite.scala b/sql/catalyst/src/test/scala/org/apache/spark/sql/catalyst/optimizer/complexTypesSuite.scala
+index dcd2fbbf005..00a4212f661 100644
+--- a/sql/catalyst/src/test/scala/org/apache/spark/sql/catalyst/optimizer/complexTypesSuite.scala
++++ b/sql/catalyst/src/test/scala/org/apache/spark/sql/catalyst/optimizer/complexTypesSuite.scala
+@@ -36,6 +36,8 @@ class ComplexTypesSuite extends PlanTest with ExpressionEvalHelper {
+ 
+   object Optimizer extends RuleExecutor[LogicalPlan] {
+     val batches =
++      Batch("Finish Analysis", Once,
++        PullOutGroupingExpressions) ::
+       Batch("collapse projections", FixedPoint(10),
+         CollapseProject) ::
+       Batch("Constant Folding", FixedPoint(10),
+@@ -57,7 +59,7 @@ class ComplexTypesSuite extends PlanTest with ExpressionEvalHelper {
+   private def checkRule(originalQuery: LogicalPlan, correctAnswer: LogicalPlan) = {
+     val optimized = Optimizer.execute(originalQuery.analyze)
+     assert(optimized.resolved, "optimized plans must be still resolvable")
+-    comparePlans(optimized, correctAnswer.analyze)
++    comparePlans(optimized, PullOutGroupingExpressions(correctAnswer.analyze))
+   }
+ 
+   test("explicit get from namedStruct") {
+@@ -405,14 +407,6 @@ class ComplexTypesSuite extends PlanTest with ExpressionEvalHelper {
+     val arrayAggRel = relation.groupBy(
+       CreateArray(Seq('nullable_id)))(GetArrayItem(CreateArray(Seq('nullable_id)), 0))
+     checkRule(arrayAggRel, arrayAggRel)
+-
+-    // This could be done if we had a more complex rule that checks that
+-    // the CreateMap does not come from key.
+-    val originalQuery = relation
+-      .groupBy('id)(
+-        GetMapValue(CreateMap(Seq('id, 'id + 1L)), 0L) as "a"
+-      )
+-    checkRule(originalQuery, originalQuery)
+   }
+ 
+   test("SPARK-23500: namedStruct and getField in the same Project #1") {
+diff --git a/sql/core/src/test/resources/sql-tests/inputs/group-by.sql b/sql/core/src/test/resources/sql-tests/inputs/group-by.sql
+index 6ee10147397..e2c3672a24d 100644
+--- a/sql/core/src/test/resources/sql-tests/inputs/group-by.sql
++++ b/sql/core/src/test/resources/sql-tests/inputs/group-by.sql
+@@ -179,3 +179,13 @@ SELECT count(*) FROM test_agg WHERE k = 1 or k = 2 or count(*) + 1L > 1L or max(
+ 
+ -- Aggregate with multiple distinct decimal columns
+ SELECT AVG(DISTINCT decimal_col), SUM(DISTINCT decimal_col) FROM VALUES (CAST(1 AS DECIMAL(9, 0))) t(decimal_col);
++
++-- SPARK-34581: Don't optimize out grouping expressions from aggregate expressions without aggregate function
++SELECT not(a IS NULL), count(*) AS c
++FROM testData
++GROUP BY a IS NULL;
++
++SELECT if(not(a IS NULL), rand(0), 1), count(*) AS c
++FROM testData
++GROUP BY a IS NULL;
++
+diff --git a/sql/core/src/test/resources/sql-tests/results/group-by.sql.out b/sql/core/src/test/resources/sql-tests/results/group-by.sql.out
+index 1d8c44c2912..b5471a785a2 100644
+--- a/sql/core/src/test/resources/sql-tests/results/group-by.sql.out
++++ b/sql/core/src/test/resources/sql-tests/results/group-by.sql.out
+@@ -1,5 +1,5 @@
+ -- Automatically generated by SQLQueryTestSuite
+--- Number of queries: 62
++-- Number of queries: 64
+ 
+ 
+ -- !query
+@@ -642,3 +642,25 @@ SELECT AVG(DISTINCT decimal_col), SUM(DISTINCT decimal_col) FROM VALUES (CAST(1
+ struct<avg(DISTINCT decimal_col):decimal(13,4),sum(DISTINCT decimal_col):decimal(19,0)>
+ -- !query output
+ 1.0000	1
++
++
++-- !query
++SELECT not(a IS NULL), count(*) AS c
++FROM testData
++GROUP BY a IS NULL
++-- !query schema
++struct<(NOT (a IS NULL)):boolean,c:bigint>
++-- !query output
++false	2
++true	7
++
++
++-- !query
++SELECT if(not(a IS NULL), rand(0), 1), count(*) AS c
++FROM testData
++GROUP BY a IS NULL
++-- !query schema
++struct<(IF((NOT (a IS NULL)), rand(0), 1)):double,c:bigint>
++-- !query output
++0.7604953758285915	7
++1.0	2
+diff --git a/sql/core/src/test/resources/tpcds-plan-stability/approved-plans-v1_4/q23a.sf100/explain.txt b/sql/core/src/test/resources/tpcds-plan-stability/approved-plans-v1_4/q23a.sf100/explain.txt
+index f42a7615324..95c669b74ad 100644
+--- a/sql/core/src/test/resources/tpcds-plan-stability/approved-plans-v1_4/q23a.sf100/explain.txt
++++ b/sql/core/src/test/resources/tpcds-plan-stability/approved-plans-v1_4/q23a.sf100/explain.txt
+@@ -199,19 +199,19 @@ Right keys [1]: [i_item_sk#16]
+ Join condition: None
+ 
+ (23) Project [codegen id : 8]
+-Output [3]: [d_date#12, i_item_sk#16, i_item_desc#17]
++Output [3]: [d_date#12, i_item_sk#16, substr(i_item_desc#17, 1, 30) AS _groupingexpression#19]
+ Input [4]: [ss_item_sk#8, d_date#12, i_item_sk#16, i_item_desc#17]
+ 
+ (24) HashAggregate [codegen id : 8]
+-Input [3]: [d_date#12, i_item_sk#16, i_item_desc#17]
+-Keys [3]: [substr(i_item_desc#17, 1, 30) AS substr(i_item_desc#17, 1, 30)#19, i_item_sk#16, d_date#12]
++Input [3]: [d_date#12, i_item_sk#16, _groupingexpression#19]
++Keys [3]: [_groupingexpression#19, i_item_sk#16, d_date#12]
+ Functions [1]: [partial_count(1)]
+ Aggregate Attributes [1]: [count#20]
+-Results [4]: [substr(i_item_desc#17, 1, 30)#19, i_item_sk#16, d_date#12, count#21]
++Results [4]: [_groupingexpression#19, i_item_sk#16, d_date#12, count#21]
+ 
+ (25) HashAggregate [codegen id : 8]
+-Input [4]: [substr(i_item_desc#17, 1, 30)#19, i_item_sk#16, d_date#12, count#21]
+-Keys [3]: [substr(i_item_desc#17, 1, 30)#19, i_item_sk#16, d_date#12]
++Input [4]: [_groupingexpression#19, i_item_sk#16, d_date#12, count#21]
++Keys [3]: [_groupingexpression#19, i_item_sk#16, d_date#12]
+ Functions [1]: [count(1)]
+ Aggregate Attributes [1]: [count(1)#22]
+ Results [2]: [i_item_sk#16 AS item_sk#23, count(1)#22 AS count(1)#24]
+@@ -406,19 +406,19 @@ Right keys [1]: [i_item_sk#56]
+ Join condition: None
+ 
+ (69) Project [codegen id : 25]
+-Output [3]: [d_date#55, i_item_sk#56, i_item_desc#57]
++Output [3]: [d_date#55, i_item_sk#56, substr(i_item_desc#57, 1, 30) AS _groupingexpression#58]
+ Input [4]: [ss_item_sk#54, d_date#55, i_item_sk#56, i_item_desc#57]
+ 
+ (70) HashAggregate [codegen id : 25]
+-Input [3]: [d_date#55, i_item_sk#56, i_item_desc#57]
+-Keys [3]: [substr(i_item_desc#57, 1, 30) AS substr(i_item_desc#57, 1, 30)#58, i_item_sk#56, d_date#55]
++Input [3]: [d_date#55, i_item_sk#56, _groupingexpression#58]
++Keys [3]: [_groupingexpression#58, i_item_sk#56, d_date#55]
+ Functions [1]: [partial_count(1)]
+ Aggregate Attributes [1]: [count#59]
+-Results [4]: [substr(i_item_desc#57, 1, 30)#58, i_item_sk#56, d_date#55, count#60]
++Results [4]: [_groupingexpression#58, i_item_sk#56, d_date#55, count#60]
+ 
+ (71) HashAggregate [codegen id : 25]
+-Input [4]: [substr(i_item_desc#57, 1, 30)#58, i_item_sk#56, d_date#55, count#60]
+-Keys [3]: [substr(i_item_desc#57, 1, 30)#58, i_item_sk#56, d_date#55]
++Input [4]: [_groupingexpression#58, i_item_sk#56, d_date#55, count#60]
++Keys [3]: [_groupingexpression#58, i_item_sk#56, d_date#55]
+ Functions [1]: [count(1)]
+ Aggregate Attributes [1]: [count(1)#61]
+ Results [2]: [i_item_sk#56 AS item_sk#23, count(1)#61 AS count(1)#62]
+diff --git a/sql/core/src/test/resources/tpcds-plan-stability/approved-plans-v1_4/q23a.sf100/simplified.txt b/sql/core/src/test/resources/tpcds-plan-stability/approved-plans-v1_4/q23a.sf100/simplified.txt
+index 1e3e8aaa3cb..91447859336 100644
+--- a/sql/core/src/test/resources/tpcds-plan-stability/approved-plans-v1_4/q23a.sf100/simplified.txt
++++ b/sql/core/src/test/resources/tpcds-plan-stability/approved-plans-v1_4/q23a.sf100/simplified.txt
+@@ -34,8 +34,8 @@ WholeStageCodegen (36)
+                                               Sort [item_sk]
+                                                 Project [item_sk]
+                                                   Filter [count(1)]
+-                                                    HashAggregate [substr(i_item_desc, 1, 30),i_item_sk,d_date,count] [count(1),item_sk,count(1),count]
+-                                                      HashAggregate [i_item_desc,i_item_sk,d_date] [count,substr(i_item_desc, 1, 30),count]
++                                                    HashAggregate [_groupingexpression,i_item_sk,d_date,count] [count(1),item_sk,count(1),count]
++                                                      HashAggregate [_groupingexpression,i_item_sk,d_date] [count,count]
+                                                         Project [d_date,i_item_sk,i_item_desc]
+                                                           SortMergeJoin [ss_item_sk,i_item_sk]
+                                                             InputAdapter
+@@ -177,8 +177,8 @@ WholeStageCodegen (36)
+                                               Sort [item_sk]
+                                                 Project [item_sk]
+                                                   Filter [count(1)]
+-                                                    HashAggregate [substr(i_item_desc, 1, 30),i_item_sk,d_date,count] [count(1),item_sk,count(1),count]
+-                                                      HashAggregate [i_item_desc,i_item_sk,d_date] [count,substr(i_item_desc, 1, 30),count]
++                                                    HashAggregate [_groupingexpression,i_item_sk,d_date,count] [count(1),item_sk,count(1),count]
++                                                      HashAggregate [_groupingexpression,i_item_sk,d_date] [count,count]
+                                                         Project [d_date,i_item_sk,i_item_desc]
+                                                           SortMergeJoin [ss_item_sk,i_item_sk]
+                                                             InputAdapter
+diff --git a/sql/core/src/test/resources/tpcds-plan-stability/approved-plans-v1_4/q23a/explain.txt b/sql/core/src/test/resources/tpcds-plan-stability/approved-plans-v1_4/q23a/explain.txt
+index 8c2aed03ce0..176463544e0 100644
+--- a/sql/core/src/test/resources/tpcds-plan-stability/approved-plans-v1_4/q23a/explain.txt
++++ b/sql/core/src/test/resources/tpcds-plan-stability/approved-plans-v1_4/q23a/explain.txt
+@@ -155,23 +155,23 @@ Right keys [1]: [i_item_sk#14]
+ Join condition: None
+ 
+ (18) Project [codegen id : 3]
+-Output [3]: [d_date#11, i_item_sk#14, i_item_desc#15]
++Output [3]: [d_date#11, i_item_sk#14, substr(i_item_desc#15, 1, 30) AS _groupingexpression#17]
+ Input [4]: [ss_item_sk#7, d_date#11, i_item_sk#14, i_item_desc#15]
+ 
+ (19) HashAggregate [codegen id : 3]
+-Input [3]: [d_date#11, i_item_sk#14, i_item_desc#15]
+-Keys [3]: [substr(i_item_desc#15, 1, 30) AS substr(i_item_desc#15, 1, 30)#17, i_item_sk#14, d_date#11]
++Input [3]: [d_date#11, i_item_sk#14, _groupingexpression#17]
++Keys [3]: [_groupingexpression#17, i_item_sk#14, d_date#11]
+ Functions [1]: [partial_count(1)]
+ Aggregate Attributes [1]: [count#18]
+-Results [4]: [substr(i_item_desc#15, 1, 30)#17, i_item_sk#14, d_date#11, count#19]
++Results [4]: [_groupingexpression#17, i_item_sk#14, d_date#11, count#19]
+ 
+ (20) Exchange
+-Input [4]: [substr(i_item_desc#15, 1, 30)#17, i_item_sk#14, d_date#11, count#19]
+-Arguments: hashpartitioning(substr(i_item_desc#15, 1, 30)#17, i_item_sk#14, d_date#11, 5), ENSURE_REQUIREMENTS, [id=#20]
++Input [4]: [_groupingexpression#17, i_item_sk#14, d_date#11, count#19]
++Arguments: hashpartitioning(_groupingexpression#17, i_item_sk#14, d_date#11, 5), ENSURE_REQUIREMENTS, [id=#20]
+ 
+ (21) HashAggregate [codegen id : 4]
+-Input [4]: [substr(i_item_desc#15, 1, 30)#17, i_item_sk#14, d_date#11, count#19]
+-Keys [3]: [substr(i_item_desc#15, 1, 30)#17, i_item_sk#14, d_date#11]
++Input [4]: [_groupingexpression#17, i_item_sk#14, d_date#11, count#19]
++Keys [3]: [_groupingexpression#17, i_item_sk#14, d_date#11]
+ Functions [1]: [count(1)]
+ Aggregate Attributes [1]: [count(1)#21]
+ Results [2]: [i_item_sk#14 AS item_sk#22, count(1)#21 AS count(1)#23]
+diff --git a/sql/core/src/test/resources/tpcds-plan-stability/approved-plans-v1_4/q23a/simplified.txt b/sql/core/src/test/resources/tpcds-plan-stability/approved-plans-v1_4/q23a/simplified.txt
+index 87f135b3fff..d89287382c5 100644
+--- a/sql/core/src/test/resources/tpcds-plan-stability/approved-plans-v1_4/q23a/simplified.txt
++++ b/sql/core/src/test/resources/tpcds-plan-stability/approved-plans-v1_4/q23a/simplified.txt
+@@ -29,11 +29,11 @@ WholeStageCodegen (24)
+                                               WholeStageCodegen (4)
+                                                 Project [item_sk]
+                                                   Filter [count(1)]
+-                                                    HashAggregate [substr(i_item_desc, 1, 30),i_item_sk,d_date,count] [count(1),item_sk,count(1),count]
++                                                    HashAggregate [_groupingexpression,i_item_sk,d_date,count] [count(1),item_sk,count(1),count]
+                                                       InputAdapter
+-                                                        Exchange [substr(i_item_desc, 1, 30),i_item_sk,d_date] #5
++                                                        Exchange [_groupingexpression,i_item_sk,d_date] #5
+                                                           WholeStageCodegen (3)
+-                                                            HashAggregate [i_item_desc,i_item_sk,d_date] [count,substr(i_item_desc, 1, 30),count]
++                                                            HashAggregate [_groupingexpression,i_item_sk,d_date] [count,count]
+                                                               Project [d_date,i_item_sk,i_item_desc]
+                                                                 BroadcastHashJoin [ss_item_sk,i_item_sk]
+                                                                   Project [ss_item_sk,d_date]
+diff --git a/sql/core/src/test/resources/tpcds-plan-stability/approved-plans-v1_4/q23b.sf100/explain.txt b/sql/core/src/test/resources/tpcds-plan-stability/approved-plans-v1_4/q23b.sf100/explain.txt
+index e75b223ea59..690dd1b6099 100644
+--- a/sql/core/src/test/resources/tpcds-plan-stability/approved-plans-v1_4/q23b.sf100/explain.txt
++++ b/sql/core/src/test/resources/tpcds-plan-stability/approved-plans-v1_4/q23b.sf100/explain.txt
+@@ -243,19 +243,19 @@ Right keys [1]: [i_item_sk#16]
+ Join condition: None
+ 
+ (24) Project [codegen id : 8]
+-Output [3]: [d_date#12, i_item_sk#16, i_item_desc#17]
++Output [3]: [d_date#12, i_item_sk#16, substr(i_item_desc#17, 1, 30) AS _groupingexpression#19]
+ Input [4]: [ss_item_sk#8, d_date#12, i_item_sk#16, i_item_desc#17]
+ 
+ (25) HashAggregate [codegen id : 8]
+-Input [3]: [d_date#12, i_item_sk#16, i_item_desc#17]
+-Keys [3]: [substr(i_item_desc#17, 1, 30) AS substr(i_item_desc#17, 1, 30)#19, i_item_sk#16, d_date#12]
++Input [3]: [d_date#12, i_item_sk#16, _groupingexpression#19]
++Keys [3]: [_groupingexpression#19, i_item_sk#16, d_date#12]
+ Functions [1]: [partial_count(1)]
+ Aggregate Attributes [1]: [count#20]
+-Results [4]: [substr(i_item_desc#17, 1, 30)#19, i_item_sk#16, d_date#12, count#21]
++Results [4]: [_groupingexpression#19, i_item_sk#16, d_date#12, count#21]
+ 
+ (26) HashAggregate [codegen id : 8]
+-Input [4]: [substr(i_item_desc#17, 1, 30)#19, i_item_sk#16, d_date#12, count#21]
+-Keys [3]: [substr(i_item_desc#17, 1, 30)#19, i_item_sk#16, d_date#12]
++Input [4]: [_groupingexpression#19, i_item_sk#16, d_date#12, count#21]
++Keys [3]: [_groupingexpression#19, i_item_sk#16, d_date#12]
+ Functions [1]: [count(1)]
+ Aggregate Attributes [1]: [count(1)#22]
+ Results [2]: [i_item_sk#16 AS item_sk#23, count(1)#22 AS count(1)#24]
+@@ -554,19 +554,19 @@ Right keys [1]: [i_item_sk#66]
+ Join condition: None
+ 
+ (92) Project [codegen id : 34]
+-Output [3]: [d_date#65, i_item_sk#66, i_item_desc#67]
++Output [3]: [d_date#65, i_item_sk#66, substr(i_item_desc#67, 1, 30) AS _groupingexpression#68]
+ Input [4]: [ss_item_sk#64, d_date#65, i_item_sk#66, i_item_desc#67]
+ 
+ (93) HashAggregate [codegen id : 34]
+-Input [3]: [d_date#65, i_item_sk#66, i_item_desc#67]
+-Keys [3]: [substr(i_item_desc#67, 1, 30) AS substr(i_item_desc#67, 1, 30)#68, i_item_sk#66, d_date#65]
++Input [3]: [d_date#65, i_item_sk#66, _groupingexpression#68]
++Keys [3]: [_groupingexpression#68, i_item_sk#66, d_date#65]
+ Functions [1]: [partial_count(1)]
+ Aggregate Attributes [1]: [count#69]
+-Results [4]: [substr(i_item_desc#67, 1, 30)#68, i_item_sk#66, d_date#65, count#70]
++Results [4]: [_groupingexpression#68, i_item_sk#66, d_date#65, count#70]
+ 
+ (94) HashAggregate [codegen id : 34]
+-Input [4]: [substr(i_item_desc#67, 1, 30)#68, i_item_sk#66, d_date#65, count#70]
+-Keys [3]: [substr(i_item_desc#67, 1, 30)#68, i_item_sk#66, d_date#65]
++Input [4]: [_groupingexpression#68, i_item_sk#66, d_date#65, count#70]
++Keys [3]: [_groupingexpression#68, i_item_sk#66, d_date#65]
+ Functions [1]: [count(1)]
+ Aggregate Attributes [1]: [count(1)#71]
+ Results [2]: [i_item_sk#66 AS item_sk#23, count(1)#71 AS count(1)#72]
+diff --git a/sql/core/src/test/resources/tpcds-plan-stability/approved-plans-v1_4/q23b.sf100/simplified.txt b/sql/core/src/test/resources/tpcds-plan-stability/approved-plans-v1_4/q23b.sf100/simplified.txt
+index 1962a53fa34..fec70a32589 100644
+--- a/sql/core/src/test/resources/tpcds-plan-stability/approved-plans-v1_4/q23b.sf100/simplified.txt
++++ b/sql/core/src/test/resources/tpcds-plan-stability/approved-plans-v1_4/q23b.sf100/simplified.txt
+@@ -37,8 +37,8 @@ TakeOrderedAndProject [c_last_name,c_first_name,sales]
+                                                   Sort [item_sk]
+                                                     Project [item_sk]
+                                                       Filter [count(1)]
+-                                                        HashAggregate [substr(i_item_desc, 1, 30),i_item_sk,d_date,count] [count(1),item_sk,count(1),count]
+-                                                          HashAggregate [i_item_desc,i_item_sk,d_date] [count,substr(i_item_desc, 1, 30),count]
++                                                        HashAggregate [_groupingexpression,i_item_sk,d_date,count] [count(1),item_sk,count(1),count]
++                                                          HashAggregate [_groupingexpression,i_item_sk,d_date] [count,count]
+                                                             Project [d_date,i_item_sk,i_item_desc]
+                                                               SortMergeJoin [ss_item_sk,i_item_sk]
+                                                                 InputAdapter
+@@ -219,8 +219,8 @@ TakeOrderedAndProject [c_last_name,c_first_name,sales]
+                                                   Sort [item_sk]
+                                                     Project [item_sk]
+                                                       Filter [count(1)]
+-                                                        HashAggregate [substr(i_item_desc, 1, 30),i_item_sk,d_date,count] [count(1),item_sk,count(1),count]
+-                                                          HashAggregate [i_item_desc,i_item_sk,d_date] [count,substr(i_item_desc, 1, 30),count]
++                                                        HashAggregate [_groupingexpression,i_item_sk,d_date,count] [count(1),item_sk,count(1),count]
++                                                          HashAggregate [_groupingexpression,i_item_sk,d_date] [count,count]
+                                                             Project [d_date,i_item_sk,i_item_desc]
+                                                               SortMergeJoin [ss_item_sk,i_item_sk]
+                                                                 InputAdapter
+diff --git a/sql/core/src/test/resources/tpcds-plan-stability/approved-plans-v1_4/q23b/explain.txt b/sql/core/src/test/resources/tpcds-plan-stability/approved-plans-v1_4/q23b/explain.txt
+index f5c64908c8f..5e06310b2ac 100644
+--- a/sql/core/src/test/resources/tpcds-plan-stability/approved-plans-v1_4/q23b/explain.txt
++++ b/sql/core/src/test/resources/tpcds-plan-stability/approved-plans-v1_4/q23b/explain.txt
+@@ -189,23 +189,23 @@ Right keys [1]: [i_item_sk#14]
+ Join condition: None
+ 
+ (19) Project [codegen id : 3]
+-Output [3]: [d_date#11, i_item_sk#14, i_item_desc#15]
++Output [3]: [d_date#11, i_item_sk#14, substr(i_item_desc#15, 1, 30) AS _groupingexpression#17]
+ Input [4]: [ss_item_sk#7, d_date#11, i_item_sk#14, i_item_desc#15]
+ 
+ (20) HashAggregate [codegen id : 3]
+-Input [3]: [d_date#11, i_item_sk#14, i_item_desc#15]
+-Keys [3]: [substr(i_item_desc#15, 1, 30) AS substr(i_item_desc#15, 1, 30)#17, i_item_sk#14, d_date#11]
++Input [3]: [d_date#11, i_item_sk#14, _groupingexpression#17]
++Keys [3]: [_groupingexpression#17, i_item_sk#14, d_date#11]
+ Functions [1]: [partial_count(1)]
+ Aggregate Attributes [1]: [count#18]
+-Results [4]: [substr(i_item_desc#15, 1, 30)#17, i_item_sk#14, d_date#11, count#19]
++Results [4]: [_groupingexpression#17, i_item_sk#14, d_date#11, count#19]
+ 
+ (21) Exchange
+-Input [4]: [substr(i_item_desc#15, 1, 30)#17, i_item_sk#14, d_date#11, count#19]
+-Arguments: hashpartitioning(substr(i_item_desc#15, 1, 30)#17, i_item_sk#14, d_date#11, 5), ENSURE_REQUIREMENTS, [id=#20]
++Input [4]: [_groupingexpression#17, i_item_sk#14, d_date#11, count#19]
++Arguments: hashpartitioning(_groupingexpression#17, i_item_sk#14, d_date#11, 5), ENSURE_REQUIREMENTS, [id=#20]
+ 
+ (22) HashAggregate [codegen id : 4]
+-Input [4]: [substr(i_item_desc#15, 1, 30)#17, i_item_sk#14, d_date#11, count#19]
+-Keys [3]: [substr(i_item_desc#15, 1, 30)#17, i_item_sk#14, d_date#11]
++Input [4]: [_groupingexpression#17, i_item_sk#14, d_date#11, count#19]
++Keys [3]: [_groupingexpression#17, i_item_sk#14, d_date#11]
+ Functions [1]: [count(1)]
+ Aggregate Attributes [1]: [count(1)#21]
+ Results [2]: [i_item_sk#14 AS item_sk#22, count(1)#21 AS count(1)#23]
+diff --git a/sql/core/src/test/resources/tpcds-plan-stability/approved-plans-v1_4/q23b/simplified.txt b/sql/core/src/test/resources/tpcds-plan-stability/approved-plans-v1_4/q23b/simplified.txt
+index a18328434b6..ac7e33fbc0f 100644
+--- a/sql/core/src/test/resources/tpcds-plan-stability/approved-plans-v1_4/q23b/simplified.txt
++++ b/sql/core/src/test/resources/tpcds-plan-stability/approved-plans-v1_4/q23b/simplified.txt
+@@ -30,11 +30,11 @@ TakeOrderedAndProject [c_last_name,c_first_name,sales]
+                                               WholeStageCodegen (4)
+                                                 Project [item_sk]
+                                                   Filter [count(1)]
+-                                                    HashAggregate [substr(i_item_desc, 1, 30),i_item_sk,d_date,count] [count(1),item_sk,count(1),count]
++                                                    HashAggregate [_groupingexpression,i_item_sk,d_date,count] [count(1),item_sk,count(1),count]
+                                                       InputAdapter
+-                                                        Exchange [substr(i_item_desc, 1, 30),i_item_sk,d_date] #5
++                                                        Exchange [_groupingexpression,i_item_sk,d_date] #5
+                                                           WholeStageCodegen (3)
+-                                                            HashAggregate [i_item_desc,i_item_sk,d_date] [count,substr(i_item_desc, 1, 30),count]
++                                                            HashAggregate [_groupingexpression,i_item_sk,d_date] [count,count]
+                                                               Project [d_date,i_item_sk,i_item_desc]
+                                                                 BroadcastHashJoin [ss_item_sk,i_item_sk]
+                                                                   Project [ss_item_sk,d_date]
+diff --git a/sql/core/src/test/resources/tpcds-plan-stability/approved-plans-v1_4/q62.sf100/explain.txt b/sql/core/src/test/resources/tpcds-plan-stability/approved-plans-v1_4/q62.sf100/explain.txt
+index 41462a73891..0c82f6182c2 100644
+--- a/sql/core/src/test/resources/tpcds-plan-stability/approved-plans-v1_4/q62.sf100/explain.txt
++++ b/sql/core/src/test/resources/tpcds-plan-stability/approved-plans-v1_4/q62.sf100/explain.txt
+@@ -156,26 +156,26 @@ Right keys [1]: [w_warehouse_sk#15]
+ Join condition: None
+ 
+ (28) Project [codegen id : 5]
+-Output [5]: [ws_ship_date_sk#1, ws_sold_date_sk#5, w_warehouse_name#16, sm_type#13, web_name#10]
++Output [5]: [ws_ship_date_sk#1, ws_sold_date_sk#5, sm_type#13, web_name#10, substr(w_warehouse_name#16, 1, 20) AS _groupingexpression#18]
+ Input [7]: [ws_ship_date_sk#1, ws_warehouse_sk#4, ws_sold_date_sk#5, web_name#10, sm_type#13, w_warehouse_sk#15, w_warehouse_name#16]
+ 
+ (29) HashAggregate [codegen id : 5]
+-Input [5]: [ws_ship_date_sk#1, ws_sold_date_sk#5, w_warehouse_name#16, sm_type#13, web_name#10]
+-Keys [3]: [substr(w_warehouse_name#16, 1, 20) AS substr(w_warehouse_name#16, 1, 20)#18, sm_type#13, web_name#10]
++Input [5]: [ws_ship_date_sk#1, ws_sold_date_sk#5, sm_type#13, web_name#10, _groupingexpression#18]
++Keys [3]: [_groupingexpression#18, sm_type#13, web_name#10]
+ Functions [5]: [partial_sum(CASE WHEN ((ws_ship_date_sk#1 - ws_sold_date_sk#5) <= 30) THEN 1 ELSE 0 END), partial_sum(CASE WHEN (((ws_ship_date_sk#1 - ws_sold_date_sk#5) > 30) AND ((ws_ship_date_sk#1 - ws_sold_date_sk#5) <= 60)) THEN 1 ELSE 0 END), partial_sum(CASE WHEN (((ws_ship_date_sk#1 - ws_sold_date_sk#5) > 60) AND ((ws_ship_date_sk#1 - ws_sold_date_sk#5) <= 90)) THEN 1 ELSE 0 END), partial_sum(CASE WHEN (((ws_ship_date_sk#1 - ws_sold_date_sk#5) > 90) AND ((ws_ship_date_sk#1 - ws_sold_date_sk#5) <= 120)) THEN 1 ELSE 0 END), partial_sum(CASE WHEN ((ws_ship_date_sk#1 - ws_sold_date_sk#5) > 120) THEN 1 ELSE 0 END)]
+ Aggregate Attributes [5]: [sum#19, sum#20, sum#21, sum#22, sum#23]
+-Results [8]: [substr(w_warehouse_name#16, 1, 20)#18, sm_type#13, web_name#10, sum#24, sum#25, sum#26, sum#27, sum#28]
++Results [8]: [_groupingexpression#18, sm_type#13, web_name#10, sum#24, sum#25, sum#26, sum#27, sum#28]
+ 
+ (30) Exchange
+-Input [8]: [substr(w_warehouse_name#16, 1, 20)#18, sm_type#13, web_name#10, sum#24, sum#25, sum#26, sum#27, sum#28]
+-Arguments: hashpartitioning(substr(w_warehouse_name#16, 1, 20)#18, sm_type#13, web_name#10, 5), ENSURE_REQUIREMENTS, [id=#29]
++Input [8]: [_groupingexpression#18, sm_type#13, web_name#10, sum#24, sum#25, sum#26, sum#27, sum#28]
++Arguments: hashpartitioning(_groupingexpression#18, sm_type#13, web_name#10, 5), ENSURE_REQUIREMENTS, [id=#29]
+ 
+ (31) HashAggregate [codegen id : 6]
+-Input [8]: [substr(w_warehouse_name#16, 1, 20)#18, sm_type#13, web_name#10, sum#24, sum#25, sum#26, sum#27, sum#28]
+-Keys [3]: [substr(w_warehouse_name#16, 1, 20)#18, sm_type#13, web_name#10]
++Input [8]: [_groupingexpression#18, sm_type#13, web_name#10, sum#24, sum#25, sum#26, sum#27, sum#28]
++Keys [3]: [_groupingexpression#18, sm_type#13, web_name#10]
+ Functions [5]: [sum(CASE WHEN ((ws_ship_date_sk#1 - ws_sold_date_sk#5) <= 30) THEN 1 ELSE 0 END), sum(CASE WHEN (((ws_ship_date_sk#1 - ws_sold_date_sk#5) > 30) AND ((ws_ship_date_sk#1 - ws_sold_date_sk#5) <= 60)) THEN 1 ELSE 0 END), sum(CASE WHEN (((ws_ship_date_sk#1 - ws_sold_date_sk#5) > 60) AND ((ws_ship_date_sk#1 - ws_sold_date_sk#5) <= 90)) THEN 1 ELSE 0 END), sum(CASE WHEN (((ws_ship_date_sk#1 - ws_sold_date_sk#5) > 90) AND ((ws_ship_date_sk#1 - ws_sold_date_sk#5) <= 120)) THEN 1 ELSE 0 END), sum(CASE WHEN ((ws_ship_date_sk#1 - ws_sold_date_sk#5) > 120) THEN 1 ELSE 0 END)]
+ Aggregate Attributes [5]: [sum(CASE WHEN ((ws_ship_date_sk#1 - ws_sold_date_sk#5) <= 30) THEN 1 ELSE 0 END)#30, sum(CASE WHEN (((ws_ship_date_sk#1 - ws_sold_date_sk#5) > 30) AND ((ws_ship_date_sk#1 - ws_sold_date_sk#5) <= 60)) THEN 1 ELSE 0 END)#31, sum(CASE WHEN (((ws_ship_date_sk#1 - ws_sold_date_sk#5) > 60) AND ((ws_ship_date_sk#1 - ws_sold_date_sk#5) <= 90)) THEN 1 ELSE 0 END)#32, sum(CASE WHEN (((ws_ship_date_sk#1 - ws_sold_date_sk#5) > 90) AND ((ws_ship_date_sk#1 - ws_sold_date_sk#5) <= 120)) THEN 1 ELSE 0 END)#33, sum(CASE WHEN ((ws_ship_date_sk#1 - ws_sold_date_sk#5) > 120) THEN 1 ELSE 0 END)#34]
+-Results [8]: [substr(w_warehouse_name#16, 1, 20)#18 AS substr(w_warehouse_name, 1, 20)#35, sm_type#13, web_name#10, sum(CASE WHEN ((ws_ship_date_sk#1 - ws_sold_date_sk#5) <= 30) THEN 1 ELSE 0 END)#30 AS 30 days #36, sum(CASE WHEN (((ws_ship_date_sk#1 - ws_sold_date_sk#5) > 30) AND ((ws_ship_date_sk#1 - ws_sold_date_sk#5) <= 60)) THEN 1 ELSE 0 END)#31 AS 31 - 60 days #37, sum(CASE WHEN (((ws_ship_date_sk#1 - ws_sold_date_sk#5) > 60) AND ((ws_ship_date_sk#1 - ws_sold_date_sk#5) <= 90)) THEN 1 ELSE 0 END)#32 AS 61 - 90 days #38, sum(CASE WHEN (((ws_ship_date_sk#1 - ws_sold_date_sk#5) > 90) AND ((ws_ship_date_sk#1 - ws_sold_date_sk#5) <= 120)) THEN 1 ELSE 0 END)#33 AS 91 - 120 days #39, sum(CASE WHEN ((ws_ship_date_sk#1 - ws_sold_date_sk#5) > 120) THEN 1 ELSE 0 END)#34 AS >120 days #40]
++Results [8]: [_groupingexpression#18 AS substr(w_warehouse_name, 1, 20)#35, sm_type#13, web_name#10, sum(CASE WHEN ((ws_ship_date_sk#1 - ws_sold_date_sk#5) <= 30) THEN 1 ELSE 0 END)#30 AS 30 days #36, sum(CASE WHEN (((ws_ship_date_sk#1 - ws_sold_date_sk#5) > 30) AND ((ws_ship_date_sk#1 - ws_sold_date_sk#5) <= 60)) THEN 1 ELSE 0 END)#31 AS 31 - 60 days #37, sum(CASE WHEN (((ws_ship_date_sk#1 - ws_sold_date_sk#5) > 60) AND ((ws_ship_date_sk#1 - ws_sold_date_sk#5) <= 90)) THEN 1 ELSE 0 END)#32 AS 61 - 90 days #38, sum(CASE WHEN (((ws_ship_date_sk#1 - ws_sold_date_sk#5) > 90) AND ((ws_ship_date_sk#1 - ws_sold_date_sk#5) <= 120)) THEN 1 ELSE 0 END)#33 AS 91 - 120 days #39, sum(CASE WHEN ((ws_ship_date_sk#1 - ws_sold_date_sk#5) > 120) THEN 1 ELSE 0 END)#34 AS >120 days #40]
+ 
+ (32) TakeOrderedAndProject
+ Input [8]: [substr(w_warehouse_name, 1, 20)#35, sm_type#13, web_name#10, 30 days #36, 31 - 60 days #37, 61 - 90 days #38, 91 - 120 days #39, >120 days #40]
+diff --git a/sql/core/src/test/resources/tpcds-plan-stability/approved-plans-v1_4/q62.sf100/simplified.txt b/sql/core/src/test/resources/tpcds-plan-stability/approved-plans-v1_4/q62.sf100/simplified.txt
+index bb6e9a032b6..5d48a8701ab 100644
+--- a/sql/core/src/test/resources/tpcds-plan-stability/approved-plans-v1_4/q62.sf100/simplified.txt
++++ b/sql/core/src/test/resources/tpcds-plan-stability/approved-plans-v1_4/q62.sf100/simplified.txt
+@@ -1,11 +1,11 @@
+ TakeOrderedAndProject [substr(w_warehouse_name, 1, 20),sm_type,web_name,30 days ,31 - 60 days ,61 - 90 days ,91 - 120 days ,>120 days ]
+   WholeStageCodegen (6)
+-    HashAggregate [substr(w_warehouse_name, 1, 20),sm_type,web_name,sum,sum,sum,sum,sum] [sum(CASE WHEN ((ws_ship_date_sk - ws_sold_date_sk) <= 30) THEN 1 ELSE 0 END),sum(CASE WHEN (((ws_ship_date_sk - ws_sold_date_sk) > 30) AND ((ws_ship_date_sk - ws_sold_date_sk) <= 60)) THEN 1 ELSE 0 END),sum(CASE WHEN (((ws_ship_date_sk - ws_sold_date_sk) > 60) AND ((ws_ship_date_sk - ws_sold_date_sk) <= 90)) THEN 1 ELSE 0 END),sum(CASE WHEN (((ws_ship_date_sk - ws_sold_date_sk) > 90) AND ((ws_ship_date_sk - ws_sold_date_sk) <= 120)) THEN 1 ELSE 0 END),sum(CASE WHEN ((ws_ship_date_sk - ws_sold_date_sk) > 120) THEN 1 ELSE 0 END),substr(w_warehouse_name, 1, 20),30 days ,31 - 60 days ,61 - 90 days ,91 - 120 days ,>120 days ,sum,sum,sum,sum,sum]
++    HashAggregate [_groupingexpression,sm_type,web_name,sum,sum,sum,sum,sum] [sum(CASE WHEN ((ws_ship_date_sk - ws_sold_date_sk) <= 30) THEN 1 ELSE 0 END),sum(CASE WHEN (((ws_ship_date_sk - ws_sold_date_sk) > 30) AND ((ws_ship_date_sk - ws_sold_date_sk) <= 60)) THEN 1 ELSE 0 END),sum(CASE WHEN (((ws_ship_date_sk - ws_sold_date_sk) > 60) AND ((ws_ship_date_sk - ws_sold_date_sk) <= 90)) THEN 1 ELSE 0 END),sum(CASE WHEN (((ws_ship_date_sk - ws_sold_date_sk) > 90) AND ((ws_ship_date_sk - ws_sold_date_sk) <= 120)) THEN 1 ELSE 0 END),sum(CASE WHEN ((ws_ship_date_sk - ws_sold_date_sk) > 120) THEN 1 ELSE 0 END),substr(w_warehouse_name, 1, 20),30 days ,31 - 60 days ,61 - 90 days ,91 - 120 days ,>120 days ,sum,sum,sum,sum,sum]
+       InputAdapter
+-        Exchange [substr(w_warehouse_name, 1, 20),sm_type,web_name] #1
++        Exchange [_groupingexpression,sm_type,web_name] #1
+           WholeStageCodegen (5)
+-            HashAggregate [w_warehouse_name,sm_type,web_name,ws_ship_date_sk,ws_sold_date_sk] [sum,sum,sum,sum,sum,substr(w_warehouse_name, 1, 20),sum,sum,sum,sum,sum]
+-              Project [ws_ship_date_sk,ws_sold_date_sk,w_warehouse_name,sm_type,web_name]
++            HashAggregate [_groupingexpression,sm_type,web_name,ws_ship_date_sk,ws_sold_date_sk] [sum,sum,sum,sum,sum,sum,sum,sum,sum,sum]
++              Project [ws_ship_date_sk,ws_sold_date_sk,sm_type,web_name,w_warehouse_name]
+                 BroadcastHashJoin [ws_warehouse_sk,w_warehouse_sk]
+                   Project [ws_ship_date_sk,ws_warehouse_sk,ws_sold_date_sk,web_name,sm_type]
+                     BroadcastHashJoin [ws_ship_mode_sk,sm_ship_mode_sk]
+diff --git a/sql/core/src/test/resources/tpcds-plan-stability/approved-plans-v1_4/q62/explain.txt b/sql/core/src/test/resources/tpcds-plan-stability/approved-plans-v1_4/q62/explain.txt
+index b5aa53f2de1..752025ebea0 100644
+--- a/sql/core/src/test/resources/tpcds-plan-stability/approved-plans-v1_4/q62/explain.txt
++++ b/sql/core/src/test/resources/tpcds-plan-stability/approved-plans-v1_4/q62/explain.txt
+@@ -156,26 +156,26 @@ Right keys [1]: [d_date_sk#15]
+ Join condition: None
+ 
+ (28) Project [codegen id : 5]
+-Output [5]: [ws_ship_date_sk#1, ws_sold_date_sk#5, w_warehouse_name#7, sm_type#10, web_name#13]
++Output [5]: [ws_ship_date_sk#1, ws_sold_date_sk#5, sm_type#10, web_name#13, substr(w_warehouse_name#7, 1, 20) AS _groupingexpression#18]
+ Input [6]: [ws_ship_date_sk#1, ws_sold_date_sk#5, w_warehouse_name#7, sm_type#10, web_name#13, d_date_sk#15]
+ 
+ (29) HashAggregate [codegen id : 5]
+-Input [5]: [ws_ship_date_sk#1, ws_sold_date_sk#5, w_warehouse_name#7, sm_type#10, web_name#13]
+-Keys [3]: [substr(w_warehouse_name#7, 1, 20) AS substr(w_warehouse_name#7, 1, 20)#18, sm_type#10, web_name#13]
++Input [5]: [ws_ship_date_sk#1, ws_sold_date_sk#5, sm_type#10, web_name#13, _groupingexpression#18]
++Keys [3]: [_groupingexpression#18, sm_type#10, web_name#13]
+ Functions [5]: [partial_sum(CASE WHEN ((ws_ship_date_sk#1 - ws_sold_date_sk#5) <= 30) THEN 1 ELSE 0 END), partial_sum(CASE WHEN (((ws_ship_date_sk#1 - ws_sold_date_sk#5) > 30) AND ((ws_ship_date_sk#1 - ws_sold_date_sk#5) <= 60)) THEN 1 ELSE 0 END), partial_sum(CASE WHEN (((ws_ship_date_sk#1 - ws_sold_date_sk#5) > 60) AND ((ws_ship_date_sk#1 - ws_sold_date_sk#5) <= 90)) THEN 1 ELSE 0 END), partial_sum(CASE WHEN (((ws_ship_date_sk#1 - ws_sold_date_sk#5) > 90) AND ((ws_ship_date_sk#1 - ws_sold_date_sk#5) <= 120)) THEN 1 ELSE 0 END), partial_sum(CASE WHEN ((ws_ship_date_sk#1 - ws_sold_date_sk#5) > 120) THEN 1 ELSE 0 END)]
+ Aggregate Attributes [5]: [sum#19, sum#20, sum#21, sum#22, sum#23]
+-Results [8]: [substr(w_warehouse_name#7, 1, 20)#18, sm_type#10, web_name#13, sum#24, sum#25, sum#26, sum#27, sum#28]
++Results [8]: [_groupingexpression#18, sm_type#10, web_name#13, sum#24, sum#25, sum#26, sum#27, sum#28]
+ 
+ (30) Exchange
+-Input [8]: [substr(w_warehouse_name#7, 1, 20)#18, sm_type#10, web_name#13, sum#24, sum#25, sum#26, sum#27, sum#28]
+-Arguments: hashpartitioning(substr(w_warehouse_name#7, 1, 20)#18, sm_type#10, web_name#13, 5), ENSURE_REQUIREMENTS, [id=#29]
++Input [8]: [_groupingexpression#18, sm_type#10, web_name#13, sum#24, sum#25, sum#26, sum#27, sum#28]
++Arguments: hashpartitioning(_groupingexpression#18, sm_type#10, web_name#13, 5), ENSURE_REQUIREMENTS, [id=#29]
+ 
+ (31) HashAggregate [codegen id : 6]
+-Input [8]: [substr(w_warehouse_name#7, 1, 20)#18, sm_type#10, web_name#13, sum#24, sum#25, sum#26, sum#27, sum#28]
+-Keys [3]: [substr(w_warehouse_name#7, 1, 20)#18, sm_type#10, web_name#13]
++Input [8]: [_groupingexpression#18, sm_type#10, web_name#13, sum#24, sum#25, sum#26, sum#27, sum#28]
++Keys [3]: [_groupingexpression#18, sm_type#10, web_name#13]
+ Functions [5]: [sum(CASE WHEN ((ws_ship_date_sk#1 - ws_sold_date_sk#5) <= 30) THEN 1 ELSE 0 END), sum(CASE WHEN (((ws_ship_date_sk#1 - ws_sold_date_sk#5) > 30) AND ((ws_ship_date_sk#1 - ws_sold_date_sk#5) <= 60)) THEN 1 ELSE 0 END), sum(CASE WHEN (((ws_ship_date_sk#1 - ws_sold_date_sk#5) > 60) AND ((ws_ship_date_sk#1 - ws_sold_date_sk#5) <= 90)) THEN 1 ELSE 0 END), sum(CASE WHEN (((ws_ship_date_sk#1 - ws_sold_date_sk#5) > 90) AND ((ws_ship_date_sk#1 - ws_sold_date_sk#5) <= 120)) THEN 1 ELSE 0 END), sum(CASE WHEN ((ws_ship_date_sk#1 - ws_sold_date_sk#5) > 120) THEN 1 ELSE 0 END)]
+ Aggregate Attributes [5]: [sum(CASE WHEN ((ws_ship_date_sk#1 - ws_sold_date_sk#5) <= 30) THEN 1 ELSE 0 END)#30, sum(CASE WHEN (((ws_ship_date_sk#1 - ws_sold_date_sk#5) > 30) AND ((ws_ship_date_sk#1 - ws_sold_date_sk#5) <= 60)) THEN 1 ELSE 0 END)#31, sum(CASE WHEN (((ws_ship_date_sk#1 - ws_sold_date_sk#5) > 60) AND ((ws_ship_date_sk#1 - ws_sold_date_sk#5) <= 90)) THEN 1 ELSE 0 END)#32, sum(CASE WHEN (((ws_ship_date_sk#1 - ws_sold_date_sk#5) > 90) AND ((ws_ship_date_sk#1 - ws_sold_date_sk#5) <= 120)) THEN 1 ELSE 0 END)#33, sum(CASE WHEN ((ws_ship_date_sk#1 - ws_sold_date_sk#5) > 120) THEN 1 ELSE 0 END)#34]
+-Results [8]: [substr(w_warehouse_name#7, 1, 20)#18 AS substr(w_warehouse_name, 1, 20)#35, sm_type#10, web_name#13, sum(CASE WHEN ((ws_ship_date_sk#1 - ws_sold_date_sk#5) <= 30) THEN 1 ELSE 0 END)#30 AS 30 days #36, sum(CASE WHEN (((ws_ship_date_sk#1 - ws_sold_date_sk#5) > 30) AND ((ws_ship_date_sk#1 - ws_sold_date_sk#5) <= 60)) THEN 1 ELSE 0 END)#31 AS 31 - 60 days #37, sum(CASE WHEN (((ws_ship_date_sk#1 - ws_sold_date_sk#5) > 60) AND ((ws_ship_date_sk#1 - ws_sold_date_sk#5) <= 90)) THEN 1 ELSE 0 END)#32 AS 61 - 90 days #38, sum(CASE WHEN (((ws_ship_date_sk#1 - ws_sold_date_sk#5) > 90) AND ((ws_ship_date_sk#1 - ws_sold_date_sk#5) <= 120)) THEN 1 ELSE 0 END)#33 AS 91 - 120 days #39, sum(CASE WHEN ((ws_ship_date_sk#1 - ws_sold_date_sk#5) > 120) THEN 1 ELSE 0 END)#34 AS >120 days #40]
++Results [8]: [_groupingexpression#18 AS substr(w_warehouse_name, 1, 20)#35, sm_type#10, web_name#13, sum(CASE WHEN ((ws_ship_date_sk#1 - ws_sold_date_sk#5) <= 30) THEN 1 ELSE 0 END)#30 AS 30 days #36, sum(CASE WHEN (((ws_ship_date_sk#1 - ws_sold_date_sk#5) > 30) AND ((ws_ship_date_sk#1 - ws_sold_date_sk#5) <= 60)) THEN 1 ELSE 0 END)#31 AS 31 - 60 days #37, sum(CASE WHEN (((ws_ship_date_sk#1 - ws_sold_date_sk#5) > 60) AND ((ws_ship_date_sk#1 - ws_sold_date_sk#5) <= 90)) THEN 1 ELSE 0 END)#32 AS 61 - 90 days #38, sum(CASE WHEN (((ws_ship_date_sk#1 - ws_sold_date_sk#5) > 90) AND ((ws_ship_date_sk#1 - ws_sold_date_sk#5) <= 120)) THEN 1 ELSE 0 END)#33 AS 91 - 120 days #39, sum(CASE WHEN ((ws_ship_date_sk#1 - ws_sold_date_sk#5) > 120) THEN 1 ELSE 0 END)#34 AS >120 days #40]
+ 
+ (32) TakeOrderedAndProject
+ Input [8]: [substr(w_warehouse_name, 1, 20)#35, sm_type#10, web_name#13, 30 days #36, 31 - 60 days #37, 61 - 90 days #38, 91 - 120 days #39, >120 days #40]
+diff --git a/sql/core/src/test/resources/tpcds-plan-stability/approved-plans-v1_4/q62/simplified.txt b/sql/core/src/test/resources/tpcds-plan-stability/approved-plans-v1_4/q62/simplified.txt
+index ab0242a856d..7b67c51892d 100644
+--- a/sql/core/src/test/resources/tpcds-plan-stability/approved-plans-v1_4/q62/simplified.txt
++++ b/sql/core/src/test/resources/tpcds-plan-stability/approved-plans-v1_4/q62/simplified.txt
+@@ -1,11 +1,11 @@
+ TakeOrderedAndProject [substr(w_warehouse_name, 1, 20),sm_type,web_name,30 days ,31 - 60 days ,61 - 90 days ,91 - 120 days ,>120 days ]
+   WholeStageCodegen (6)
+-    HashAggregate [substr(w_warehouse_name, 1, 20),sm_type,web_name,sum,sum,sum,sum,sum] [sum(CASE WHEN ((ws_ship_date_sk - ws_sold_date_sk) <= 30) THEN 1 ELSE 0 END),sum(CASE WHEN (((ws_ship_date_sk - ws_sold_date_sk) > 30) AND ((ws_ship_date_sk - ws_sold_date_sk) <= 60)) THEN 1 ELSE 0 END),sum(CASE WHEN (((ws_ship_date_sk - ws_sold_date_sk) > 60) AND ((ws_ship_date_sk - ws_sold_date_sk) <= 90)) THEN 1 ELSE 0 END),sum(CASE WHEN (((ws_ship_date_sk - ws_sold_date_sk) > 90) AND ((ws_ship_date_sk - ws_sold_date_sk) <= 120)) THEN 1 ELSE 0 END),sum(CASE WHEN ((ws_ship_date_sk - ws_sold_date_sk) > 120) THEN 1 ELSE 0 END),substr(w_warehouse_name, 1, 20),30 days ,31 - 60 days ,61 - 90 days ,91 - 120 days ,>120 days ,sum,sum,sum,sum,sum]
++    HashAggregate [_groupingexpression,sm_type,web_name,sum,sum,sum,sum,sum] [sum(CASE WHEN ((ws_ship_date_sk - ws_sold_date_sk) <= 30) THEN 1 ELSE 0 END),sum(CASE WHEN (((ws_ship_date_sk - ws_sold_date_sk) > 30) AND ((ws_ship_date_sk - ws_sold_date_sk) <= 60)) THEN 1 ELSE 0 END),sum(CASE WHEN (((ws_ship_date_sk - ws_sold_date_sk) > 60) AND ((ws_ship_date_sk - ws_sold_date_sk) <= 90)) THEN 1 ELSE 0 END),sum(CASE WHEN (((ws_ship_date_sk - ws_sold_date_sk) > 90) AND ((ws_ship_date_sk - ws_sold_date_sk) <= 120)) THEN 1 ELSE 0 END),sum(CASE WHEN ((ws_ship_date_sk - ws_sold_date_sk) > 120) THEN 1 ELSE 0 END),substr(w_warehouse_name, 1, 20),30 days ,31 - 60 days ,61 - 90 days ,91 - 120 days ,>120 days ,sum,sum,sum,sum,sum]
+       InputAdapter
+-        Exchange [substr(w_warehouse_name, 1, 20),sm_type,web_name] #1
++        Exchange [_groupingexpression,sm_type,web_name] #1
+           WholeStageCodegen (5)
+-            HashAggregate [w_warehouse_name,sm_type,web_name,ws_ship_date_sk,ws_sold_date_sk] [sum,sum,sum,sum,sum,substr(w_warehouse_name, 1, 20),sum,sum,sum,sum,sum]
+-              Project [ws_ship_date_sk,ws_sold_date_sk,w_warehouse_name,sm_type,web_name]
++            HashAggregate [_groupingexpression,sm_type,web_name,ws_ship_date_sk,ws_sold_date_sk] [sum,sum,sum,sum,sum,sum,sum,sum,sum,sum]
++              Project [ws_ship_date_sk,ws_sold_date_sk,sm_type,web_name,w_warehouse_name]
+                 BroadcastHashJoin [ws_ship_date_sk,d_date_sk]
+                   Project [ws_ship_date_sk,ws_sold_date_sk,w_warehouse_name,sm_type,web_name]
+                     BroadcastHashJoin [ws_web_site_sk,web_site_sk]
+diff --git a/sql/core/src/test/resources/tpcds-plan-stability/approved-plans-v1_4/q99.sf100/explain.txt b/sql/core/src/test/resources/tpcds-plan-stability/approved-plans-v1_4/q99.sf100/explain.txt
+index 9d653586e51..1b955ee3bd9 100644
+--- a/sql/core/src/test/resources/tpcds-plan-stability/approved-plans-v1_4/q99.sf100/explain.txt
++++ b/sql/core/src/test/resources/tpcds-plan-stability/approved-plans-v1_4/q99.sf100/explain.txt
+@@ -156,26 +156,26 @@ Right keys [1]: [w_warehouse_sk#15]
+ Join condition: None
+ 
+ (28) Project [codegen id : 5]
+-Output [5]: [cs_ship_date_sk#1, cs_sold_date_sk#5, w_warehouse_name#16, sm_type#10, cc_name#13]
++Output [5]: [cs_ship_date_sk#1, cs_sold_date_sk#5, sm_type#10, cc_name#13, substr(w_warehouse_name#16, 1, 20) AS _groupingexpression#18]
+ Input [7]: [cs_ship_date_sk#1, cs_warehouse_sk#4, cs_sold_date_sk#5, sm_type#10, cc_name#13, w_warehouse_sk#15, w_warehouse_name#16]
+ 
+ (29) HashAggregate [codegen id : 5]
+-Input [5]: [cs_ship_date_sk#1, cs_sold_date_sk#5, w_warehouse_name#16, sm_type#10, cc_name#13]
+-Keys [3]: [substr(w_warehouse_name#16, 1, 20) AS substr(w_warehouse_name#16, 1, 20)#18, sm_type#10, cc_name#13]
++Input [5]: [cs_ship_date_sk#1, cs_sold_date_sk#5, sm_type#10, cc_name#13, _groupingexpression#18]
++Keys [3]: [_groupingexpression#18, sm_type#10, cc_name#13]
+ Functions [5]: [partial_sum(CASE WHEN ((cs_ship_date_sk#1 - cs_sold_date_sk#5) <= 30) THEN 1 ELSE 0 END), partial_sum(CASE WHEN (((cs_ship_date_sk#1 - cs_sold_date_sk#5) > 30) AND ((cs_ship_date_sk#1 - cs_sold_date_sk#5) <= 60)) THEN 1 ELSE 0 END), partial_sum(CASE WHEN (((cs_ship_date_sk#1 - cs_sold_date_sk#5) > 60) AND ((cs_ship_date_sk#1 - cs_sold_date_sk#5) <= 90)) THEN 1 ELSE 0 END), partial_sum(CASE WHEN (((cs_ship_date_sk#1 - cs_sold_date_sk#5) > 90) AND ((cs_ship_date_sk#1 - cs_sold_date_sk#5) <= 120)) THEN 1 ELSE 0 END), partial_sum(CASE WHEN ((cs_ship_date_sk#1 - cs_sold_date_sk#5) > 120) THEN 1 ELSE 0 END)]
+ Aggregate Attributes [5]: [sum#19, sum#20, sum#21, sum#22, sum#23]
+-Results [8]: [substr(w_warehouse_name#16, 1, 20)#18, sm_type#10, cc_name#13, sum#24, sum#25, sum#26, sum#27, sum#28]
++Results [8]: [_groupingexpression#18, sm_type#10, cc_name#13, sum#24, sum#25, sum#26, sum#27, sum#28]
+ 
+ (30) Exchange
+-Input [8]: [substr(w_warehouse_name#16, 1, 20)#18, sm_type#10, cc_name#13, sum#24, sum#25, sum#26, sum#27, sum#28]
+-Arguments: hashpartitioning(substr(w_warehouse_name#16, 1, 20)#18, sm_type#10, cc_name#13, 5), ENSURE_REQUIREMENTS, [id=#29]
++Input [8]: [_groupingexpression#18, sm_type#10, cc_name#13, sum#24, sum#25, sum#26, sum#27, sum#28]
++Arguments: hashpartitioning(_groupingexpression#18, sm_type#10, cc_name#13, 5), ENSURE_REQUIREMENTS, [id=#29]
+ 
+ (31) HashAggregate [codegen id : 6]
+-Input [8]: [substr(w_warehouse_name#16, 1, 20)#18, sm_type#10, cc_name#13, sum#24, sum#25, sum#26, sum#27, sum#28]
+-Keys [3]: [substr(w_warehouse_name#16, 1, 20)#18, sm_type#10, cc_name#13]
++Input [8]: [_groupingexpression#18, sm_type#10, cc_name#13, sum#24, sum#25, sum#26, sum#27, sum#28]
++Keys [3]: [_groupingexpression#18, sm_type#10, cc_name#13]
+ Functions [5]: [sum(CASE WHEN ((cs_ship_date_sk#1 - cs_sold_date_sk#5) <= 30) THEN 1 ELSE 0 END), sum(CASE WHEN (((cs_ship_date_sk#1 - cs_sold_date_sk#5) > 30) AND ((cs_ship_date_sk#1 - cs_sold_date_sk#5) <= 60)) THEN 1 ELSE 0 END), sum(CASE WHEN (((cs_ship_date_sk#1 - cs_sold_date_sk#5) > 60) AND ((cs_ship_date_sk#1 - cs_sold_date_sk#5) <= 90)) THEN 1 ELSE 0 END), sum(CASE WHEN (((cs_ship_date_sk#1 - cs_sold_date_sk#5) > 90) AND ((cs_ship_date_sk#1 - cs_sold_date_sk#5) <= 120)) THEN 1 ELSE 0 END), sum(CASE WHEN ((cs_ship_date_sk#1 - cs_sold_date_sk#5) > 120) THEN 1 ELSE 0 END)]
+ Aggregate Attributes [5]: [sum(CASE WHEN ((cs_ship_date_sk#1 - cs_sold_date_sk#5) <= 30) THEN 1 ELSE 0 END)#30, sum(CASE WHEN (((cs_ship_date_sk#1 - cs_sold_date_sk#5) > 30) AND ((cs_ship_date_sk#1 - cs_sold_date_sk#5) <= 60)) THEN 1 ELSE 0 END)#31, sum(CASE WHEN (((cs_ship_date_sk#1 - cs_sold_date_sk#5) > 60) AND ((cs_ship_date_sk#1 - cs_sold_date_sk#5) <= 90)) THEN 1 ELSE 0 END)#32, sum(CASE WHEN (((cs_ship_date_sk#1 - cs_sold_date_sk#5) > 90) AND ((cs_ship_date_sk#1 - cs_sold_date_sk#5) <= 120)) THEN 1 ELSE 0 END)#33, sum(CASE WHEN ((cs_ship_date_sk#1 - cs_sold_date_sk#5) > 120) THEN 1 ELSE 0 END)#34]
+-Results [8]: [substr(w_warehouse_name#16, 1, 20)#18 AS substr(w_warehouse_name, 1, 20)#35, sm_type#10, cc_name#13, sum(CASE WHEN ((cs_ship_date_sk#1 - cs_sold_date_sk#5) <= 30) THEN 1 ELSE 0 END)#30 AS 30 days #36, sum(CASE WHEN (((cs_ship_date_sk#1 - cs_sold_date_sk#5) > 30) AND ((cs_ship_date_sk#1 - cs_sold_date_sk#5) <= 60)) THEN 1 ELSE 0 END)#31 AS 31 - 60 days #37, sum(CASE WHEN (((cs_ship_date_sk#1 - cs_sold_date_sk#5) > 60) AND ((cs_ship_date_sk#1 - cs_sold_date_sk#5) <= 90)) THEN 1 ELSE 0 END)#32 AS 61 - 90 days #38, sum(CASE WHEN (((cs_ship_date_sk#1 - cs_sold_date_sk#5) > 90) AND ((cs_ship_date_sk#1 - cs_sold_date_sk#5) <= 120)) THEN 1 ELSE 0 END)#33 AS 91 - 120 days #39, sum(CASE WHEN ((cs_ship_date_sk#1 - cs_sold_date_sk#5) > 120) THEN 1 ELSE 0 END)#34 AS >120 days #40]
++Results [8]: [_groupingexpression#18 AS substr(w_warehouse_name, 1, 20)#35, sm_type#10, cc_name#13, sum(CASE WHEN ((cs_ship_date_sk#1 - cs_sold_date_sk#5) <= 30) THEN 1 ELSE 0 END)#30 AS 30 days #36, sum(CASE WHEN (((cs_ship_date_sk#1 - cs_sold_date_sk#5) > 30) AND ((cs_ship_date_sk#1 - cs_sold_date_sk#5) <= 60)) THEN 1 ELSE 0 END)#31 AS 31 - 60 days #37, sum(CASE WHEN (((cs_ship_date_sk#1 - cs_sold_date_sk#5) > 60) AND ((cs_ship_date_sk#1 - cs_sold_date_sk#5) <= 90)) THEN 1 ELSE 0 END)#32 AS 61 - 90 days #38, sum(CASE WHEN (((cs_ship_date_sk#1 - cs_sold_date_sk#5) > 90) AND ((cs_ship_date_sk#1 - cs_sold_date_sk#5) <= 120)) THEN 1 ELSE 0 END)#33 AS 91 - 120 days #39, sum(CASE WHEN ((cs_ship_date_sk#1 - cs_sold_date_sk#5) > 120) THEN 1 ELSE 0 END)#34 AS >120 days #40]
+ 
+ (32) TakeOrderedAndProject
+ Input [8]: [substr(w_warehouse_name, 1, 20)#35, sm_type#10, cc_name#13, 30 days #36, 31 - 60 days #37, 61 - 90 days #38, 91 - 120 days #39, >120 days #40]
+diff --git a/sql/core/src/test/resources/tpcds-plan-stability/approved-plans-v1_4/q99.sf100/simplified.txt b/sql/core/src/test/resources/tpcds-plan-stability/approved-plans-v1_4/q99.sf100/simplified.txt
+index 32643210384..f8abda81b72 100644
+--- a/sql/core/src/test/resources/tpcds-plan-stability/approved-plans-v1_4/q99.sf100/simplified.txt
++++ b/sql/core/src/test/resources/tpcds-plan-stability/approved-plans-v1_4/q99.sf100/simplified.txt
+@@ -1,11 +1,11 @@
+ TakeOrderedAndProject [substr(w_warehouse_name, 1, 20),sm_type,cc_name,30 days ,31 - 60 days ,61 - 90 days ,91 - 120 days ,>120 days ]
+   WholeStageCodegen (6)
+-    HashAggregate [substr(w_warehouse_name, 1, 20),sm_type,cc_name,sum,sum,sum,sum,sum] [sum(CASE WHEN ((cs_ship_date_sk - cs_sold_date_sk) <= 30) THEN 1 ELSE 0 END),sum(CASE WHEN (((cs_ship_date_sk - cs_sold_date_sk) > 30) AND ((cs_ship_date_sk - cs_sold_date_sk) <= 60)) THEN 1 ELSE 0 END),sum(CASE WHEN (((cs_ship_date_sk - cs_sold_date_sk) > 60) AND ((cs_ship_date_sk - cs_sold_date_sk) <= 90)) THEN 1 ELSE 0 END),sum(CASE WHEN (((cs_ship_date_sk - cs_sold_date_sk) > 90) AND ((cs_ship_date_sk - cs_sold_date_sk) <= 120)) THEN 1 ELSE 0 END),sum(CASE WHEN ((cs_ship_date_sk - cs_sold_date_sk) > 120) THEN 1 ELSE 0 END),substr(w_warehouse_name, 1, 20),30 days ,31 - 60 days ,61 - 90 days ,91 - 120 days ,>120 days ,sum,sum,sum,sum,sum]
++    HashAggregate [_groupingexpression,sm_type,cc_name,sum,sum,sum,sum,sum] [sum(CASE WHEN ((cs_ship_date_sk - cs_sold_date_sk) <= 30) THEN 1 ELSE 0 END),sum(CASE WHEN (((cs_ship_date_sk - cs_sold_date_sk) > 30) AND ((cs_ship_date_sk - cs_sold_date_sk) <= 60)) THEN 1 ELSE 0 END),sum(CASE WHEN (((cs_ship_date_sk - cs_sold_date_sk) > 60) AND ((cs_ship_date_sk - cs_sold_date_sk) <= 90)) THEN 1 ELSE 0 END),sum(CASE WHEN (((cs_ship_date_sk - cs_sold_date_sk) > 90) AND ((cs_ship_date_sk - cs_sold_date_sk) <= 120)) THEN 1 ELSE 0 END),sum(CASE WHEN ((cs_ship_date_sk - cs_sold_date_sk) > 120) THEN 1 ELSE 0 END),substr(w_warehouse_name, 1, 20),30 days ,31 - 60 days ,61 - 90 days ,91 - 120 days ,>120 days ,sum,sum,sum,sum,sum]
+       InputAdapter
+-        Exchange [substr(w_warehouse_name, 1, 20),sm_type,cc_name] #1
++        Exchange [_groupingexpression,sm_type,cc_name] #1
+           WholeStageCodegen (5)
+-            HashAggregate [w_warehouse_name,sm_type,cc_name,cs_ship_date_sk,cs_sold_date_sk] [sum,sum,sum,sum,sum,substr(w_warehouse_name, 1, 20),sum,sum,sum,sum,sum]
+-              Project [cs_ship_date_sk,cs_sold_date_sk,w_warehouse_name,sm_type,cc_name]
++            HashAggregate [_groupingexpression,sm_type,cc_name,cs_ship_date_sk,cs_sold_date_sk] [sum,sum,sum,sum,sum,sum,sum,sum,sum,sum]
++              Project [cs_ship_date_sk,cs_sold_date_sk,sm_type,cc_name,w_warehouse_name]
+                 BroadcastHashJoin [cs_warehouse_sk,w_warehouse_sk]
+                   Project [cs_ship_date_sk,cs_warehouse_sk,cs_sold_date_sk,sm_type,cc_name]
+                     BroadcastHashJoin [cs_call_center_sk,cc_call_center_sk]
+diff --git a/sql/core/src/test/resources/tpcds-plan-stability/approved-plans-v1_4/q99/explain.txt b/sql/core/src/test/resources/tpcds-plan-stability/approved-plans-v1_4/q99/explain.txt
+index c05e9595220..14316235398 100644
+--- a/sql/core/src/test/resources/tpcds-plan-stability/approved-plans-v1_4/q99/explain.txt
++++ b/sql/core/src/test/resources/tpcds-plan-stability/approved-plans-v1_4/q99/explain.txt
+@@ -156,26 +156,26 @@ Right keys [1]: [d_date_sk#15]
+ Join condition: None
+ 
+ (28) Project [codegen id : 5]
+-Output [5]: [cs_ship_date_sk#1, cs_sold_date_sk#5, w_warehouse_name#7, sm_type#10, cc_name#13]
++Output [5]: [cs_ship_date_sk#1, cs_sold_date_sk#5, sm_type#10, cc_name#13, substr(w_warehouse_name#7, 1, 20) AS _groupingexpression#18]
+ Input [6]: [cs_ship_date_sk#1, cs_sold_date_sk#5, w_warehouse_name#7, sm_type#10, cc_name#13, d_date_sk#15]
+ 
+ (29) HashAggregate [codegen id : 5]
+-Input [5]: [cs_ship_date_sk#1, cs_sold_date_sk#5, w_warehouse_name#7, sm_type#10, cc_name#13]
+-Keys [3]: [substr(w_warehouse_name#7, 1, 20) AS substr(w_warehouse_name#7, 1, 20)#18, sm_type#10, cc_name#13]
++Input [5]: [cs_ship_date_sk#1, cs_sold_date_sk#5, sm_type#10, cc_name#13, _groupingexpression#18]
++Keys [3]: [_groupingexpression#18, sm_type#10, cc_name#13]
+ Functions [5]: [partial_sum(CASE WHEN ((cs_ship_date_sk#1 - cs_sold_date_sk#5) <= 30) THEN 1 ELSE 0 END), partial_sum(CASE WHEN (((cs_ship_date_sk#1 - cs_sold_date_sk#5) > 30) AND ((cs_ship_date_sk#1 - cs_sold_date_sk#5) <= 60)) THEN 1 ELSE 0 END), partial_sum(CASE WHEN (((cs_ship_date_sk#1 - cs_sold_date_sk#5) > 60) AND ((cs_ship_date_sk#1 - cs_sold_date_sk#5) <= 90)) THEN 1 ELSE 0 END), partial_sum(CASE WHEN (((cs_ship_date_sk#1 - cs_sold_date_sk#5) > 90) AND ((cs_ship_date_sk#1 - cs_sold_date_sk#5) <= 120)) THEN 1 ELSE 0 END), partial_sum(CASE WHEN ((cs_ship_date_sk#1 - cs_sold_date_sk#5) > 120) THEN 1 ELSE 0 END)]
+ Aggregate Attributes [5]: [sum#19, sum#20, sum#21, sum#22, sum#23]
+-Results [8]: [substr(w_warehouse_name#7, 1, 20)#18, sm_type#10, cc_name#13, sum#24, sum#25, sum#26, sum#27, sum#28]
++Results [8]: [_groupingexpression#18, sm_type#10, cc_name#13, sum#24, sum#25, sum#26, sum#27, sum#28]
+ 
+ (30) Exchange
+-Input [8]: [substr(w_warehouse_name#7, 1, 20)#18, sm_type#10, cc_name#13, sum#24, sum#25, sum#26, sum#27, sum#28]
+-Arguments: hashpartitioning(substr(w_warehouse_name#7, 1, 20)#18, sm_type#10, cc_name#13, 5), ENSURE_REQUIREMENTS, [id=#29]
++Input [8]: [_groupingexpression#18, sm_type#10, cc_name#13, sum#24, sum#25, sum#26, sum#27, sum#28]
++Arguments: hashpartitioning(_groupingexpression#18, sm_type#10, cc_name#13, 5), ENSURE_REQUIREMENTS, [id=#29]
+ 
+ (31) HashAggregate [codegen id : 6]
+-Input [8]: [substr(w_warehouse_name#7, 1, 20)#18, sm_type#10, cc_name#13, sum#24, sum#25, sum#26, sum#27, sum#28]
+-Keys [3]: [substr(w_warehouse_name#7, 1, 20)#18, sm_type#10, cc_name#13]
++Input [8]: [_groupingexpression#18, sm_type#10, cc_name#13, sum#24, sum#25, sum#26, sum#27, sum#28]
++Keys [3]: [_groupingexpression#18, sm_type#10, cc_name#13]
+ Functions [5]: [sum(CASE WHEN ((cs_ship_date_sk#1 - cs_sold_date_sk#5) <= 30) THEN 1 ELSE 0 END), sum(CASE WHEN (((cs_ship_date_sk#1 - cs_sold_date_sk#5) > 30) AND ((cs_ship_date_sk#1 - cs_sold_date_sk#5) <= 60)) THEN 1 ELSE 0 END), sum(CASE WHEN (((cs_ship_date_sk#1 - cs_sold_date_sk#5) > 60) AND ((cs_ship_date_sk#1 - cs_sold_date_sk#5) <= 90)) THEN 1 ELSE 0 END), sum(CASE WHEN (((cs_ship_date_sk#1 - cs_sold_date_sk#5) > 90) AND ((cs_ship_date_sk#1 - cs_sold_date_sk#5) <= 120)) THEN 1 ELSE 0 END), sum(CASE WHEN ((cs_ship_date_sk#1 - cs_sold_date_sk#5) > 120) THEN 1 ELSE 0 END)]
+ Aggregate Attributes [5]: [sum(CASE WHEN ((cs_ship_date_sk#1 - cs_sold_date_sk#5) <= 30) THEN 1 ELSE 0 END)#30, sum(CASE WHEN (((cs_ship_date_sk#1 - cs_sold_date_sk#5) > 30) AND ((cs_ship_date_sk#1 - cs_sold_date_sk#5) <= 60)) THEN 1 ELSE 0 END)#31, sum(CASE WHEN (((cs_ship_date_sk#1 - cs_sold_date_sk#5) > 60) AND ((cs_ship_date_sk#1 - cs_sold_date_sk#5) <= 90)) THEN 1 ELSE 0 END)#32, sum(CASE WHEN (((cs_ship_date_sk#1 - cs_sold_date_sk#5) > 90) AND ((cs_ship_date_sk#1 - cs_sold_date_sk#5) <= 120)) THEN 1 ELSE 0 END)#33, sum(CASE WHEN ((cs_ship_date_sk#1 - cs_sold_date_sk#5) > 120) THEN 1 ELSE 0 END)#34]
+-Results [8]: [substr(w_warehouse_name#7, 1, 20)#18 AS substr(w_warehouse_name, 1, 20)#35, sm_type#10, cc_name#13, sum(CASE WHEN ((cs_ship_date_sk#1 - cs_sold_date_sk#5) <= 30) THEN 1 ELSE 0 END)#30 AS 30 days #36, sum(CASE WHEN (((cs_ship_date_sk#1 - cs_sold_date_sk#5) > 30) AND ((cs_ship_date_sk#1 - cs_sold_date_sk#5) <= 60)) THEN 1 ELSE 0 END)#31 AS 31 - 60 days #37, sum(CASE WHEN (((cs_ship_date_sk#1 - cs_sold_date_sk#5) > 60) AND ((cs_ship_date_sk#1 - cs_sold_date_sk#5) <= 90)) THEN 1 ELSE 0 END)#32 AS 61 - 90 days #38, sum(CASE WHEN (((cs_ship_date_sk#1 - cs_sold_date_sk#5) > 90) AND ((cs_ship_date_sk#1 - cs_sold_date_sk#5) <= 120)) THEN 1 ELSE 0 END)#33 AS 91 - 120 days #39, sum(CASE WHEN ((cs_ship_date_sk#1 - cs_sold_date_sk#5) > 120) THEN 1 ELSE 0 END)#34 AS >120 days #40]
++Results [8]: [_groupingexpression#18 AS substr(w_warehouse_name, 1, 20)#35, sm_type#10, cc_name#13, sum(CASE WHEN ((cs_ship_date_sk#1 - cs_sold_date_sk#5) <= 30) THEN 1 ELSE 0 END)#30 AS 30 days #36, sum(CASE WHEN (((cs_ship_date_sk#1 - cs_sold_date_sk#5) > 30) AND ((cs_ship_date_sk#1 - cs_sold_date_sk#5) <= 60)) THEN 1 ELSE 0 END)#31 AS 31 - 60 days #37, sum(CASE WHEN (((cs_ship_date_sk#1 - cs_sold_date_sk#5) > 60) AND ((cs_ship_date_sk#1 - cs_sold_date_sk#5) <= 90)) THEN 1 ELSE 0 END)#32 AS 61 - 90 days #38, sum(CASE WHEN (((cs_ship_date_sk#1 - cs_sold_date_sk#5) > 90) AND ((cs_ship_date_sk#1 - cs_sold_date_sk#5) <= 120)) THEN 1 ELSE 0 END)#33 AS 91 - 120 days #39, sum(CASE WHEN ((cs_ship_date_sk#1 - cs_sold_date_sk#5) > 120) THEN 1 ELSE 0 END)#34 AS >120 days #40]
+ 
+ (32) TakeOrderedAndProject
+ Input [8]: [substr(w_warehouse_name, 1, 20)#35, sm_type#10, cc_name#13, 30 days #36, 31 - 60 days #37, 61 - 90 days #38, 91 - 120 days #39, >120 days #40]
+diff --git a/sql/core/src/test/resources/tpcds-plan-stability/approved-plans-v1_4/q99/simplified.txt b/sql/core/src/test/resources/tpcds-plan-stability/approved-plans-v1_4/q99/simplified.txt
+index d47817665de..8c9e90042e5 100644
+--- a/sql/core/src/test/resources/tpcds-plan-stability/approved-plans-v1_4/q99/simplified.txt
++++ b/sql/core/src/test/resources/tpcds-plan-stability/approved-plans-v1_4/q99/simplified.txt
+@@ -1,11 +1,11 @@
+ TakeOrderedAndProject [substr(w_warehouse_name, 1, 20),sm_type,cc_name,30 days ,31 - 60 days ,61 - 90 days ,91 - 120 days ,>120 days ]
+   WholeStageCodegen (6)
+-    HashAggregate [substr(w_warehouse_name, 1, 20),sm_type,cc_name,sum,sum,sum,sum,sum] [sum(CASE WHEN ((cs_ship_date_sk - cs_sold_date_sk) <= 30) THEN 1 ELSE 0 END),sum(CASE WHEN (((cs_ship_date_sk - cs_sold_date_sk) > 30) AND ((cs_ship_date_sk - cs_sold_date_sk) <= 60)) THEN 1 ELSE 0 END),sum(CASE WHEN (((cs_ship_date_sk - cs_sold_date_sk) > 60) AND ((cs_ship_date_sk - cs_sold_date_sk) <= 90)) THEN 1 ELSE 0 END),sum(CASE WHEN (((cs_ship_date_sk - cs_sold_date_sk) > 90) AND ((cs_ship_date_sk - cs_sold_date_sk) <= 120)) THEN 1 ELSE 0 END),sum(CASE WHEN ((cs_ship_date_sk - cs_sold_date_sk) > 120) THEN 1 ELSE 0 END),substr(w_warehouse_name, 1, 20),30 days ,31 - 60 days ,61 - 90 days ,91 - 120 days ,>120 days ,sum,sum,sum,sum,sum]
++    HashAggregate [_groupingexpression,sm_type,cc_name,sum,sum,sum,sum,sum] [sum(CASE WHEN ((cs_ship_date_sk - cs_sold_date_sk) <= 30) THEN 1 ELSE 0 END),sum(CASE WHEN (((cs_ship_date_sk - cs_sold_date_sk) > 30) AND ((cs_ship_date_sk - cs_sold_date_sk) <= 60)) THEN 1 ELSE 0 END),sum(CASE WHEN (((cs_ship_date_sk - cs_sold_date_sk) > 60) AND ((cs_ship_date_sk - cs_sold_date_sk) <= 90)) THEN 1 ELSE 0 END),sum(CASE WHEN (((cs_ship_date_sk - cs_sold_date_sk) > 90) AND ((cs_ship_date_sk - cs_sold_date_sk) <= 120)) THEN 1 ELSE 0 END),sum(CASE WHEN ((cs_ship_date_sk - cs_sold_date_sk) > 120) THEN 1 ELSE 0 END),substr(w_warehouse_name, 1, 20),30 days ,31 - 60 days ,61 - 90 days ,91 - 120 days ,>120 days ,sum,sum,sum,sum,sum]
+       InputAdapter
+-        Exchange [substr(w_warehouse_name, 1, 20),sm_type,cc_name] #1
++        Exchange [_groupingexpression,sm_type,cc_name] #1
+           WholeStageCodegen (5)
+-            HashAggregate [w_warehouse_name,sm_type,cc_name,cs_ship_date_sk,cs_sold_date_sk] [sum,sum,sum,sum,sum,substr(w_warehouse_name, 1, 20),sum,sum,sum,sum,sum]
+-              Project [cs_ship_date_sk,cs_sold_date_sk,w_warehouse_name,sm_type,cc_name]
++            HashAggregate [_groupingexpression,sm_type,cc_name,cs_ship_date_sk,cs_sold_date_sk] [sum,sum,sum,sum,sum,sum,sum,sum,sum,sum]
++              Project [cs_ship_date_sk,cs_sold_date_sk,sm_type,cc_name,w_warehouse_name]
+                 BroadcastHashJoin [cs_ship_date_sk,d_date_sk]
+                   Project [cs_ship_date_sk,cs_sold_date_sk,w_warehouse_name,sm_type,cc_name]
+                     BroadcastHashJoin [cs_call_center_sk,cc_call_center_sk]

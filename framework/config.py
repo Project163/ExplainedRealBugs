@@ -7,7 +7,7 @@ SCRIPT_DIR = os.path.abspath(os.path.dirname(__file__))
 OUTPUT_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, '..', 'bug-mining'))
 CACHE_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, 'cache'))
 
-# added shared issues directory
+# Added shared issues directory
 # .../cache/shared_issues/jira_SLING/issues.txt
 SHARED_ISSUES_DIR = os.path.abspath(os.path.join(CACHE_DIR, 'shared_issues'))
 

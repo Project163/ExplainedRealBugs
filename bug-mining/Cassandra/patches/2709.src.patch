@@ -1,0 +1,216 @@
+diff --git a/CHANGES.txt b/CHANGES.txt
+index 399cb01b17..e9dca70061 100644
+--- a/CHANGES.txt
++++ b/CHANGES.txt
+@@ -35,6 +35,7 @@
+    (CASSANDRA-6867)
+  * Add CqlRecordReader using native pagination (CASSANDRA-6311)
+  * Add QueryHandler interface (CASSANDRA-6659)
++ * Track liveRatio per-memtable, not per-CF (CASSANDRA-6945)
+ Merged from 1.2:
+  * Add UNLOGGED, COUNTER options to BATCH documentation (CASSANDRA-6816)
+  * add extra SSL cipher suites (CASSANDRA-6613)
+diff --git a/src/java/org/apache/cassandra/db/ColumnFamilyStore.java b/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
+index b58329e7db..792c155110 100644
+--- a/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
++++ b/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
+@@ -25,7 +25,6 @@ import java.nio.ByteBuffer;
+ import java.util.*;
+ import java.util.concurrent.*;
+ import java.util.concurrent.atomic.AtomicInteger;
+-import java.util.concurrent.atomic.AtomicLong;
+ import java.util.regex.Pattern;
+ import javax.management.*;
+ 
+@@ -105,11 +104,6 @@ public class ColumnFamilyStore implements ColumnFamilyStoreMBean
+ 
+     public final Directories directories;
+ 
+-    /** ratio of in-memory memtable size, to serialized size */
+-    volatile double liveRatio = 10.0; // reasonable default until we compute what it is based on actual data
+-    /** ops count last time we computed liveRatio */
+-    private final AtomicLong liveRatioComputedAt = new AtomicLong(32);
+-
+     public final ColumnFamilyMetrics metric;
+     public volatile long sampleLatencyNanos;
+ 
+@@ -899,20 +893,7 @@ public class ColumnFamilyStore implements ColumnFamilyStoreMBean
+         mt.put(key, columnFamily, indexer);
+         maybeUpdateRowCache(key);
+         metric.writeLatency.addNano(System.nanoTime() - start);
+-
+-        // recompute liveRatio, if we have doubled the number of ops since last calculated
+-        while (true)
+-        {
+-            long last = liveRatioComputedAt.get();
+-            long operations = metric.writeLatency.latency.count();
+-            if (operations < 2 * last)
+-                break;
+-            if (liveRatioComputedAt.compareAndSet(last, operations))
+-            {
+-                logger.debug("computing liveRatio of {} at {} ops", this, operations);
+-                mt.updateLiveRatio();
+-            }
+-        }
++        mt.maybeUpdateLiveRatio();
+     }
+ 
+     /**
+diff --git a/src/java/org/apache/cassandra/db/DataTracker.java b/src/java/org/apache/cassandra/db/DataTracker.java
+index a1de8e5322..a9eef980f7 100644
+--- a/src/java/org/apache/cassandra/db/DataTracker.java
++++ b/src/java/org/apache/cassandra/db/DataTracker.java
+@@ -30,7 +30,6 @@ import org.slf4j.LoggerFactory;
+ import org.apache.cassandra.config.DatabaseDescriptor;
+ import org.apache.cassandra.db.compaction.OperationType;
+ import org.apache.cassandra.dht.AbstractBounds;
+-import org.apache.cassandra.io.sstable.Descriptor;
+ import org.apache.cassandra.io.sstable.SSTableReader;
+ import org.apache.cassandra.io.util.FileUtils;
+ import org.apache.cassandra.metrics.StorageMetrics;
+@@ -110,7 +109,7 @@ public class DataTracker
+     public Memtable switchMemtable()
+     {
+         // atomically change the current memtable
+-        Memtable newMemtable = new Memtable(cfstore);
++        Memtable newMemtable = new Memtable(cfstore, view.get().memtable);
+         Memtable toFlushMemtable;
+         View currentView, newView;
+         do
+@@ -131,7 +130,7 @@ public class DataTracker
+      */
+     public void renewMemtable()
+     {
+-        Memtable newMemtable = new Memtable(cfstore);
++        Memtable newMemtable = new Memtable(cfstore, view.get().memtable);
+         View currentView, newView;
+         do
+         {
+@@ -322,7 +321,7 @@ public class DataTracker
+     /** (Re)initializes the tracker, purging all references. */
+     void init()
+     {
+-        view.set(new View(new Memtable(cfstore),
++        view.set(new View(new Memtable(cfstore, null),
+                           Collections.<Memtable>emptySet(),
+                           Collections.<SSTableReader>emptySet(),
+                           Collections.<SSTableReader>emptySet(),
+diff --git a/src/java/org/apache/cassandra/db/Memtable.java b/src/java/org/apache/cassandra/db/Memtable.java
+index 1d2677957c..b26b7cd572 100644
+--- a/src/java/org/apache/cassandra/db/Memtable.java
++++ b/src/java/org/apache/cassandra/db/Memtable.java
+@@ -46,6 +46,18 @@ public class Memtable
+ {
+     private static final Logger logger = LoggerFactory.getLogger(Memtable.class);
+ 
++    // size in memory can never be less than serialized size.
++    private static final double MIN_SANE_LIVE_RATIO = 1.0;
++    // max liveratio seen w/ 1-byte columns on a 64-bit jvm was 19. If it gets higher than 64 something is probably broken.
++    private static final double MAX_SANE_LIVE_RATIO = 64.0;
++    // reasonable initial live ratio used until we compute one.
++    private static final double INITIAL_LIVE_RATIO = 10.0;
++
++    // ratio of in-memory memtable size, to serialized size
++    private volatile double liveRatio = INITIAL_LIVE_RATIO;
++    // ops count last time we computed liveRatio
++    private final AtomicLong liveRatioComputedAt = new AtomicLong(32);
++
+     /*
+      * switchMemtable puts Memtable.getSortedContents on the writer executor.  When the write is complete,
+      * we turn the writer into an SSTableReader and add it to ssTables where it is available for reads.
+@@ -66,11 +78,6 @@ public class Memtable
+                                                new NamedThreadFactory("FlushWriter"),
+                                                "internal");
+ 
+-    // size in memory can never be less than serialized size
+-    private static final double MIN_SANE_LIVE_RATIO = 1.0;
+-    // max liveratio seen w/ 1-byte columns on a 64-bit jvm was 19. If it gets higher than 64 something is probably broken.
+-    private static final double MAX_SANE_LIVE_RATIO = 64.0;
+-
+     // We need to take steps to avoid retaining inactive membtables in memory, because counting is slow (can be
+     // minutes, for a large memtable and a busy server).  A strictly FIFO Memtable queue could keep memtables
+     // alive waiting for metering after they're flushed and would otherwise be GC'd.  Instead, the approach we take
+@@ -113,12 +120,20 @@ public class Memtable
+     // memtable was created with the new or old comparator.
+     public final AbstractType initialComparator;
+ 
+-    public Memtable(ColumnFamilyStore cfs)
++    public Memtable(ColumnFamilyStore cfs, Memtable previous)
+     {
+         this.cfs = cfs;
+         this.initialComparator = cfs.metadata.comparator;
+         this.cfs.scheduleFlush();
+ 
++        // Inherit liveRatio and liveRatioCompareAt from the previous memtable, if available,
++        // to minimise recalculation frequency as much as possible.
++        if (previous != null)
++        {
++            liveRatio = previous.liveRatio;
++            liveRatioComputedAt.set(previous.liveRatioComputedAt.get() / 2);
++        }
++
+         Callable<Set<Object>> provider = new Callable<Set<Object>>()
+         {
+             public Set<Object> call() throws Exception
+@@ -134,7 +149,7 @@ public class Memtable
+ 
+     public long getLiveSize()
+     {
+-        long estimatedSize = (long) (currentSize.get() * cfs.liveRatio);
++        long estimatedSize = (long) (currentSize.get() * liveRatio);
+ 
+         // liveRatio is just an estimate; we can get a lower bound directly from the allocator
+         if (estimatedSize < allocator.getMinimumSize())
+@@ -158,6 +173,23 @@ public class Memtable
+         resolve(key, columnFamily, indexer);
+     }
+ 
++    public void maybeUpdateLiveRatio()
++    {
++        // recompute liveRatio, if we have doubled the number of ops since last calculated
++        while (true)
++        {
++            long last = liveRatioComputedAt.get();
++            long operations = currentOperations.get();
++            if (operations < 2 * last)
++                break;
++            if (liveRatioComputedAt.compareAndSet(last, operations))
++            {
++                logger.debug("computing liveRatio of {} at {} ops", this, operations);
++                updateLiveRatio();
++            }
++        }
++    }
++
+     public void updateLiveRatio() throws RuntimeException
+     {
+         if (!MemoryMeter.isInitialized())
+@@ -165,7 +197,7 @@ public class Memtable
+             // hack for openjdk.  we log a warning about this in the startup script too.
+             logger.error("MemoryMeter uninitialized (jamm not specified as java agent); assuming liveRatio of {}.  "
+                          + " Usually this means cassandra-env.sh disabled jamm because you are using a buggy JRE; "
+-                         + " upgrade to the Sun JRE instead", cfs.liveRatio);
++                         + " upgrade to the Sun JRE instead", liveRatio);
+             return;
+         }
+ 
+@@ -440,14 +472,14 @@ public class Memtable
+                 }
+ 
+                 // we want to be very conservative about our estimate, since the penalty for guessing low is OOM
+-                // death.  thus, higher estimates are believed immediately; lower ones are averaged w/ the old
+-                if (newRatio > cfs.liveRatio)
+-                    cfs.liveRatio = newRatio;
++                // death. thus, higher estimates are believed immediately; lower ones are averaged w/ the old
++                if (newRatio > memtable.liveRatio)
++                    memtable.liveRatio = newRatio;
+                 else
+-                    cfs.liveRatio = (cfs.liveRatio + newRatio) / 2.0;
++                    memtable.liveRatio = (memtable.liveRatio + newRatio) / 2.0;
+ 
+                 logger.info("{} liveRatio is {} (just-counted was {}).  calculation took {}ms for {} cells",
+-                            cfs, cfs.liveRatio, newRatio, TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start), objects);
++                            cfs, memtable.liveRatio, newRatio, TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start), objects);
+             }
+             finally
+             {

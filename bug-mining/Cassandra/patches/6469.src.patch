@@ -1,0 +1,2754 @@
+diff --git a/CHANGES.txt b/CHANGES.txt
+index 04d75e5e0a..3e2fa40c1e 100644
+--- a/CHANGES.txt
++++ b/CHANGES.txt
+@@ -1,4 +1,6 @@
+ 5.1
++ * Improve handling of transient replicas during range movements (CASSANDRA-19344)
++ * Enable debounced internode log requests to be cancelled at shutdown (CASSANDRA-19514)
+  * Correctly set last modified epoch when combining multistep operations into a single step (CASSANDRA-19538)
+  * Add new TriggersPolicy configuration to allow operators to disable triggers (CASSANDRA-19532)
+  * Use Transformation.Kind.id in local and distributed log tables (CASSANDRA-19516)
+diff --git a/src/java/org/apache/cassandra/tcm/ownership/PlacementForRange.java b/src/java/org/apache/cassandra/tcm/ownership/PlacementForRange.java
+index baa7719d13..0169279d3e 100644
+--- a/src/java/org/apache/cassandra/tcm/ownership/PlacementForRange.java
++++ b/src/java/org/apache/cassandra/tcm/ownership/PlacementForRange.java
+@@ -321,17 +321,51 @@ public class PlacementForRange
+                                                (t, v) -> {
+                                                    EndpointsForRange old = v.get();
+                                                    return VersionedEndpoints.forRange(Epoch.max(v.lastModified(), replicas.lastModified()),
+-                                                                                      replicas.get()
+-                                                                                              .newBuilder(replicas.size() + old.size())
+-                                                                                              .addAll(old)
+-                                                                                              .addAll(replicas.get(), ReplicaCollection.Builder.Conflict.ALL)
+-                                                                                              .build());
++                                                                                      combine(old, replicas.get()));
+                                                });
+             if (group == null)
+                 replicaGroups.put(replicas.range(), replicas);
+             return this;
+         }
+ 
++        /**
++         * Combine two replica groups, assuming one is the current group and the other is the proposed.
++         * During range movements this is used when calculating the maximal placement, which combines the current and
++         * future replica groups. This special cases the merging of two replica groups to make sure that when a replica
++         * moves from transient to full, it starts to act as a FULL write replica as early as possible.
++         *
++         * Where an endpoint is present in both groups, prefer the proposed iff it is a FULL replica. During a
++         * multi-step operation (join/leave/move), we want any change from transient to full to happen as early
++         * as possible so that a replica whose ownership is modified in this way becomes FULL for writes before it
++         * becomes FULL for reads. This works as additions to write replica groups are applied before any other
++         * placement changes (i.e. in START_[JOIN|LEAVE|MOVE]).
++         *
++         * @param prev Initial set of replicas for a given range
++         * @param next Proposed set of replicas for the same range.
++         * @return The union of the two groups
++         */
++        private EndpointsForRange combine(EndpointsForRange prev, EndpointsForRange next)
++        {
++            Map<InetAddressAndPort, Replica> e1 = prev.byEndpoint();
++            Map<InetAddressAndPort, Replica> e2 = next.byEndpoint();
++            EndpointsForRange.Builder combined = prev.newBuilder(prev.size() + next.size());
++            e1.forEach((e, r1) -> {
++                Replica r2 = e2.get(e);
++                if (null == r2)          // not present in next
++                    combined.add(r1);
++                else if (r2.isFull())    // prefer replica from next, if it is moving from transient to full
++                    combined.add(r2);
++                else
++                    combined.add(r1);    // replica is moving from full to transient, or staying the same
++            });
++            // any new replicas not in prev
++            e2.forEach((e, r2) -> {
++                if (!combined.contains(e))
++                    combined.add(r2);
++            });
++            return combined.build();
++        }
++
+         public Builder withReplicaGroups(Iterable<VersionedEndpoints.ForRange> replicas)
+         {
+             replicas.forEach(this::withReplicaGroup);
+diff --git a/src/java/org/apache/cassandra/tcm/ownership/PlacementTransitionPlan.java b/src/java/org/apache/cassandra/tcm/ownership/PlacementTransitionPlan.java
+index edb22919dc..1d95df4122 100644
+--- a/src/java/org/apache/cassandra/tcm/ownership/PlacementTransitionPlan.java
++++ b/src/java/org/apache/cassandra/tcm/ownership/PlacementTransitionPlan.java
+@@ -18,6 +18,22 @@
+ 
+ package org.apache.cassandra.tcm.ownership;
+ 
++import java.util.HashSet;
++import java.util.Map;
++import java.util.Set;
++import javax.annotation.Nullable;
++
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++import org.apache.cassandra.dht.Range;
++import org.apache.cassandra.dht.Token;
++import org.apache.cassandra.locator.InetAddressAndPort;
++import org.apache.cassandra.locator.RangesAtEndpoint;
++import org.apache.cassandra.locator.Replica;
++import org.apache.cassandra.schema.ReplicationParams;
++import org.apache.cassandra.tcm.Epoch;
++import org.apache.cassandra.tcm.Transformation;
+ import org.apache.cassandra.tcm.sequences.LockedRanges;
+ 
+ /**
+@@ -32,6 +48,8 @@ import org.apache.cassandra.tcm.sequences.LockedRanges;
+  */
+ public class PlacementTransitionPlan
+ {
++    private static final Logger logger = LoggerFactory.getLogger(MovementMap.class);
++
+     public final PlacementDeltas toSplit;
+     public final PlacementDeltas toMaximal;
+     public final PlacementDeltas toFinal;
+@@ -125,4 +143,77 @@ public class PlacementTransitionPlan
+                ", compiled=" + (addToWrites == null) +
+                '}';
+     }
++
++
++    /**
++     * Makes sure that a newly added read replica for a range already exists as a write replica
++     *
++     * We should never add both read & write replicas for the same range at the same time (or read replica before write)
++     *
++     * Also makes sure that we don't add a full read replica while the same write replica is only transient - we should
++     * always make the write replica full before adding the read replica.
++     *
++     * We split and merge ranges, so in the previous placements we could have full write replicas (a, b], (b, c], but then
++     * add a full read replica (a, c].
++     *
++     * @return null if everything is good, otherwise a Transformation.Result rejection containing information about the bad replica
++     */
++    @Nullable
++    public static void assertPreExistingWriteReplica(DataPlacements placements, PlacementTransitionPlan transitionPlan)
++    {
++        assertPreExistingWriteReplica(placements,
++                                      transitionPlan.toSplit,
++                                      transitionPlan.addToWrites(),
++                                      transitionPlan.moveReads(),
++                                      transitionPlan.removeFromWrites());
++    }
++
++    @Nullable
++    public static void assertPreExistingWriteReplica(DataPlacements placements, PlacementDeltas ... deltasInOrder)
++    {
++        for (PlacementDeltas deltas : deltasInOrder)
++        {
++            for (Map.Entry<ReplicationParams, PlacementDeltas.PlacementDelta> entry : deltas)
++            {
++                ReplicationParams params = entry.getKey();
++                PlacementDeltas.PlacementDelta delta = entry.getValue();
++                for (Map.Entry<InetAddressAndPort, RangesAtEndpoint> addedRead : delta.reads.additions.entrySet())
++                {
++                    RangesAtEndpoint addedReadReplicas = addedRead.getValue();
++                    RangesAtEndpoint existingWriteReplicas = placements.get(params).writes.byEndpoint().get(addedRead.getKey());
++                    // we're adding read replicas - they should always exist as write replicas before doing that
++                    // BUT we split and merge ranges so we need to check containment both ways
++                    for (Replica newReadReplica : addedReadReplicas)
++                    {
++                        if (existingWriteReplicas.contains(newReadReplica))
++                            continue;
++                        boolean contained = false;
++                        Set<Range<Token>> intersectingRanges = new HashSet<>();
++                        for (Replica writeReplica : existingWriteReplicas)
++                        {
++                            if (writeReplica.isFull() == newReadReplica.isFull() || (writeReplica.isFull() && newReadReplica.isTransient()))
++                            {
++                                if (writeReplica.range().contains(newReadReplica.range()))
++                                {
++                                    contained = true;
++                                    break;
++                                }
++                                else if (writeReplica.range().intersects(newReadReplica.range()))
++                                {
++                                    intersectingRanges.add(writeReplica.range());
++                                }
++                            }
++                        }
++                        if (!contained && Range.normalize(intersectingRanges).stream().noneMatch(writeReplica -> writeReplica.contains(newReadReplica.range())))
++                        {
++                            String message = "When adding a read replica, that replica needs to exist as a write replica before that: " + newReadReplica + '\n' + placements.get(params) + '\n' + delta;
++                            logger.warn(message);
++                            throw new Transformation.RejectedTransformationException(message);
++                        }
++                    }
++                }
++            }
++            placements = deltas.apply(Epoch.FIRST, placements);
++        }
++    }
+ }
+diff --git a/src/java/org/apache/cassandra/tcm/sequences/Move.java b/src/java/org/apache/cassandra/tcm/sequences/Move.java
+index b5750e5e93..898cfabc3b 100644
+--- a/src/java/org/apache/cassandra/tcm/sequences/Move.java
++++ b/src/java/org/apache/cassandra/tcm/sequences/Move.java
+@@ -28,7 +28,6 @@ import java.util.concurrent.ExecutionException;
+ import java.util.concurrent.atomic.AtomicBoolean;
+ 
+ import com.google.common.annotations.VisibleForTesting;
+-import com.google.common.collect.Iterables;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
+@@ -337,8 +336,7 @@ public class Move extends MultiStepOperation<Epoch>
+             RangesByEndpoint targets = delta.writes.additions;
+             PlacementForRange oldOwners = placements.get(params).reads;
+             EndpointsByReplica.Builder movements = new EndpointsByReplica.Builder();
+-            Iterables.concat(targets.flattenValues(),
+-                             transientToFullReplicas(midDeltas.get(params)).flattenValues()).forEach(destination -> {
++            targets.flattenValues().forEach(destination -> {
+                 SourceHolder sources = new SourceHolder(fd, destination, toSplitRanges.get(params), strictConsistency);
+                 AtomicBoolean needsRelaxedSources = new AtomicBoolean();
+                 // first, try to find strict sources for the ranges we need to stream - these are the ranges that
+@@ -441,23 +439,6 @@ public class Move extends MultiStepOperation<Epoch>
+         }
+     }
+ 
+-    private static RangesByEndpoint transientToFullReplicas(PlacementDeltas.PlacementDelta midDelta)
+-    {
+-        RangesByEndpoint.Builder builder = new RangesByEndpoint.Builder();
+-        midDelta.reads.additions.flattenValues().forEach((newReplica) -> {
+-            if (newReplica.isFull())
+-            {
+-                RangesAtEndpoint removals = midDelta.reads.removals.get(newReplica.endpoint());
+-                if (removals != null)
+-                {
+-                    Replica removed = removals.byRange().get(newReplica.range());
+-                    if (removed != null && removed.isTransient())
+-                        builder.put(newReplica.endpoint(), newReplica);
+-                }
+-            }
+-        });
+-        return builder.build();
+-    }
+     private static int nextToIndex(Transformation.Kind next)
+     {
+         switch (next)
+diff --git a/src/java/org/apache/cassandra/tcm/sequences/RemoveNodeStreams.java b/src/java/org/apache/cassandra/tcm/sequences/RemoveNodeStreams.java
+index d286a0f3e7..b5951b6183 100644
+--- a/src/java/org/apache/cassandra/tcm/sequences/RemoveNodeStreams.java
++++ b/src/java/org/apache/cassandra/tcm/sequences/RemoveNodeStreams.java
+@@ -29,7 +29,6 @@ import org.apache.cassandra.locator.EndpointsByReplica;
+ import org.apache.cassandra.locator.EndpointsForRange;
+ import org.apache.cassandra.locator.InetAddressAndPort;
+ import org.apache.cassandra.locator.RangesByEndpoint;
+-import org.apache.cassandra.locator.Replica;
+ import org.apache.cassandra.locator.ReplicaCollection;
+ import org.apache.cassandra.locator.SystemStrategy;
+ import org.apache.cassandra.net.Message;
+@@ -57,9 +56,7 @@ public class RemoveNodeStreams implements LeaveStreams
+         ClusterMetadata metadata = ClusterMetadata.current();
+         MovementMap movements = movementMap(metadata.directory.endpoint(leaving),
+                                             metadata,
+-                                            startLeave,
+-                                            midLeave,
+-                                            finishLeave);
++                                            startLeave);
+         movements.forEach((params, eps) -> logger.info("Removenode movements: {}: {}", params, eps));
+         String operationId = leaving.toUUID().toString();
+         responseTracker = DataMovements.instance.registerMovements(RESTORE_REPLICA_COUNT, operationId, movements);
+@@ -110,7 +107,7 @@ public class RemoveNodeStreams implements LeaveStreams
+      * create a map where the key is the destination, and the values are possible sources
+      * @return
+      */
+-    private static MovementMap movementMap(InetAddressAndPort leaving, ClusterMetadata metadata, PlacementDeltas startDelta, PlacementDeltas midDelta, PlacementDeltas finishDelta)
++    private static MovementMap movementMap(InetAddressAndPort leaving, ClusterMetadata metadata, PlacementDeltas startDelta)
+     {
+         MovementMap.Builder allMovements = MovementMap.builder();
+         // map of dest->src* movements, keyed by replication settings. During unbootstrap, this will be used to construct
+@@ -122,6 +119,7 @@ public class RemoveNodeStreams implements LeaveStreams
+ 
+             EndpointsByReplica.Builder movements = new EndpointsByReplica.Builder();
+             RangesByEndpoint startWriteAdditions = startDelta.get(params).writes.additions;
++            RangesByEndpoint startWriteRemovals = startDelta.get(params).writes.removals;
+             // find current placements from the metadata, we need to stream from replicas that are not changed and are therefore not in the deltas
+             PlacementForRange currentPlacements = metadata.placements.get(params).reads;
+             startWriteAdditions.flattenValues()
+@@ -131,33 +129,12 @@ public class RemoveNodeStreams implements LeaveStreams
+                                        if (!replica.endpoint().equals(leaving) && !replica.endpoint().equals(newReplica.endpoint()))
+                                            candidateBuilder.add(replica, ReplicaCollection.Builder.Conflict.NONE);
+                                    });
+-                                   movements.putAll(newReplica, candidateBuilder.build(), ReplicaCollection.Builder.Conflict.NONE);
++                                   EndpointsForRange sources = candidateBuilder.build();
++                                   // log if newReplica is an existing transient replica moving to a full replica
++                                   if (startWriteRemovals.get(newReplica.endpoint()).contains(newReplica.range(), false))
++                                       logger.debug("Streaming transient -> full conversion to {} from {}", newReplica.endpoint(), sources);
++                                   movements.putAll(newReplica, sources, ReplicaCollection.Builder.Conflict.NONE);
+                                });
+-            // and check if any replicas went from transient -> full:
+-            for (Replica removal : finishDelta.get(params).writes.removals.flattenValues())
+-            {
+-                if (removal.isTransient())
+-                {
+-                    // if a replica (ignoring transientness) is being added as a read replica in midJoin, but removed as
+-                    // a write replica in finishJoin (the "removal" replica) it means it must have changed from transient
+-                    // to full (or the other way round)
+-                    RangesByEndpoint midReadAdditions = midDelta.get(params).reads.additions;
+-                    Replica toStream = midReadAdditions.get(removal.endpoint()).byRange().get(removal.range());
+-                    if (toStream != null && toStream.isFull())
+-                    {
+-                        logger.debug("Conversion from transient to full replica {} -> {}", removal, toStream);
+-                        EndpointsForRange.Builder candidateBuilder = new EndpointsForRange.Builder(removal.range());
+-                        currentPlacements.forRange(removal.range()).get().forEach(replica -> {
+-                            if (!replica.endpoint().equals(leaving) && !replica.endpoint().equals(removal.endpoint()))
+-                                candidateBuilder.add(replica, ReplicaCollection.Builder.Conflict.NONE);
+-                        });
+-                        EndpointsForRange sources = candidateBuilder.build();
+-                        logger.debug("Streaming transient -> full conversion to {} from {}", removal, sources);
+-                        // `removal` is losing this transient range, but gaining the same full range, meaning we need to stream it in.
+-                        movements.putAll(removal, sources, ReplicaCollection.Builder.Conflict.NONE);
+-                    }
+-                }
+-            }
+             allMovements.put(params, movements.build());
+         });
+         return allMovements.build();
+diff --git a/src/java/org/apache/cassandra/tcm/sequences/UnbootstrapStreams.java b/src/java/org/apache/cassandra/tcm/sequences/UnbootstrapStreams.java
+index defba882c7..e62cf77dfa 100644
+--- a/src/java/org/apache/cassandra/tcm/sequences/UnbootstrapStreams.java
++++ b/src/java/org/apache/cassandra/tcm/sequences/UnbootstrapStreams.java
+@@ -66,7 +66,6 @@ public class UnbootstrapStreams implements LeaveStreams
+     {
+         MovementMap movements = movementMap(ClusterMetadata.current().directory.endpoint(leaving),
+                                             startLeave,
+-                                            midLeave,
+                                             finishLeave);
+         movements.forEach((params, eps) -> logger.info("Unbootstrap movements: {}: {}", params, eps));
+         started.set(true);
+@@ -81,7 +80,7 @@ public class UnbootstrapStreams implements LeaveStreams
+         }
+     }
+ 
+-    private static MovementMap movementMap(InetAddressAndPort leaving, PlacementDeltas startDelta, PlacementDeltas midDelta, PlacementDeltas finishDelta)
++    private static MovementMap movementMap(InetAddressAndPort leaving, PlacementDeltas startDelta, PlacementDeltas finishDelta)
+     {
+         MovementMap.Builder allMovements = MovementMap.builder();
+         // map of src->dest movements, keyed by replication settings. During unbootstrap, this will be used to construct
+@@ -100,23 +99,13 @@ public class UnbootstrapStreams implements LeaveStreams
+             // removals to produce a src->dest mapping.
+             EndpointsByReplica.Builder movements = new EndpointsByReplica.Builder();
+             RangesByEndpoint startWriteAdditions = startDelta.get(params).writes.additions;
++            RangesByEndpoint startWriteRemovals = startDelta.get(params).writes.removals;
+             startWriteAdditions.flattenValues()
+-                               .forEach(newReplica -> movements.put(oldReplicas.get(newReplica.range()), newReplica));
+-            // next, check if any replicas went from being transient to full, if so we need to stream to them;
+-            Iterable<Replica> removalReplicas = delta.writes.removals.flattenValues();
+-            for (Replica removal : removalReplicas)
+-            {
+-                if (removal.isTransient())
+-                {
+-                    Replica destination = midDelta.get(params).reads.additions.get(removal.endpoint()).byRange().get(removal.range());
+-                    if (destination != null && destination.isFull())
+-                    {
+-                        logger.info("Conversion from transient to full replica {} -> {}", removal, destination);
+-                        Replica source = oldReplicas.get(removal.range());
+-                        movements.put(source, destination);
+-                    }
+-                }
+-            }
++                               .forEach(newReplica -> {
++                                   if (startWriteRemovals.get(newReplica.endpoint()).contains(newReplica.range(), false))
++                                       logger.debug("Streaming transient -> full conversion to {} from {}", newReplica, oldReplicas.get(newReplica.range()));
++                                   movements.put(oldReplicas.get(newReplica.range()), newReplica);
++                               });
+             allMovements.put(params, movements.build());
+         });
+         return allMovements.build();
+diff --git a/src/java/org/apache/cassandra/tcm/transformations/PrepareJoin.java b/src/java/org/apache/cassandra/tcm/transformations/PrepareJoin.java
+index 662f96eabc..a684e76d50 100644
+--- a/src/java/org/apache/cassandra/tcm/transformations/PrepareJoin.java
++++ b/src/java/org/apache/cassandra/tcm/transformations/PrepareJoin.java
+@@ -23,8 +23,6 @@ import java.util.HashSet;
+ import java.util.Set;
+ 
+ import com.google.common.collect.ImmutableSet;
+-import org.slf4j.Logger;
+-import org.slf4j.LoggerFactory;
+ 
+ import org.apache.cassandra.db.TypeSizes;
+ import org.apache.cassandra.dht.IPartitioner;
+@@ -87,8 +85,6 @@ import static org.apache.cassandra.exceptions.ExceptionCode.INVALID;
+  */
+ public class PrepareJoin implements Transformation
+ {
+-    private static final Logger logger = LoggerFactory.getLogger(PrepareJoin.class);
+-
+     public static final Serializer<PrepareJoin> serializer = new Serializer<PrepareJoin>()
+     {
+         public PrepareJoin construct(NodeId nodeId, Set<Token> tokens, PlacementProvider placementProvider, boolean joinTokenRing, boolean streamData)
+@@ -156,6 +152,8 @@ public class PrepareJoin implements Transformation
+                                                              transitionPlan.toSplit,
+                                                              startJoin, midJoin, finishJoin,
+                                                              joinTokenRing, streamData);
++        if (!prev.tokenMap.isEmpty())
++            assertPreExistingWriteReplica(prev.placements, transitionPlan);
+ 
+         LockedRanges newLockedRanges = prev.lockedRanges.lock(lockKey, rangesToLock);
+         DataPlacements startingPlacements = transitionPlan.toSplit.apply(prev.nextEpoch(), prev.placements);
+@@ -167,6 +165,11 @@ public class PrepareJoin implements Transformation
+         return Transformation.success(proposed, rangesToLock);
+     }
+ 
++    void assertPreExistingWriteReplica(DataPlacements placements, PlacementTransitionPlan transitionPlan)
++    {
++        PlacementTransitionPlan.assertPreExistingWriteReplica(placements, transitionPlan);
++    }
++
+     public static abstract class Serializer<T extends PrepareJoin> implements AsymmetricMetadataSerializer<Transformation, T>
+     {
+         public void serialize(Transformation t, DataOutputPlus out, Version version) throws IOException
+diff --git a/src/java/org/apache/cassandra/tcm/transformations/PrepareLeave.java b/src/java/org/apache/cassandra/tcm/transformations/PrepareLeave.java
+index c19edc393d..e8512b1ce9 100644
+--- a/src/java/org/apache/cassandra/tcm/transformations/PrepareLeave.java
++++ b/src/java/org/apache/cassandra/tcm/transformations/PrepareLeave.java
+@@ -115,6 +115,7 @@ public class PrepareLeave implements Transformation
+         PlacementDeltas startDelta = transitionPlan.addToWrites();
+         PlacementDeltas midDelta = transitionPlan.moveReads();
+         PlacementDeltas finishDelta = transitionPlan.removeFromWrites();
++        PlacementTransitionPlan.assertPreExistingWriteReplica(prev.placements, transitionPlan);
+ 
+         LockedRanges.Key unlockKey = LockedRanges.keyFor(proposed.epoch);
+ 
+diff --git a/src/java/org/apache/cassandra/tcm/transformations/PrepareMove.java b/src/java/org/apache/cassandra/tcm/transformations/PrepareMove.java
+index fdd82c3a6c..42d276b816 100644
+--- a/src/java/org/apache/cassandra/tcm/transformations/PrepareMove.java
++++ b/src/java/org/apache/cassandra/tcm/transformations/PrepareMove.java
+@@ -109,6 +109,7 @@ public class PrepareMove implements Transformation
+         StartMove startMove = new StartMove(nodeId, transitionPlan.addToWrites(), lockKey);
+         MidMove midMove = new MidMove(nodeId, transitionPlan.moveReads(), lockKey);
+         FinishMove finishMove = new FinishMove(nodeId, tokens, transitionPlan.removeFromWrites(), lockKey);
++        PlacementTransitionPlan.assertPreExistingWriteReplica(prev.placements, transitionPlan);
+ 
+         Move sequence = Move.newSequence(prev.nextEpoch(),
+                                          lockKey,
+diff --git a/src/java/org/apache/cassandra/tcm/transformations/PrepareReplace.java b/src/java/org/apache/cassandra/tcm/transformations/PrepareReplace.java
+index d1bcdb7518..809ce9b95f 100644
+--- a/src/java/org/apache/cassandra/tcm/transformations/PrepareReplace.java
++++ b/src/java/org/apache/cassandra/tcm/transformations/PrepareReplace.java
+@@ -130,6 +130,7 @@ public class PrepareReplace implements Transformation
+         StartReplace start = new StartReplace(replaced, replacement, addNewNodeToWrites.build(), unlockKey);
+         MidReplace mid = new MidReplace(replaced, replacement, addNewNodeToReads.build(), unlockKey);
+         FinishReplace finish = new FinishReplace(replaced, replacement, removeOldNodeFromWrites.build(), unlockKey);
++        PlacementTransitionPlan.assertPreExistingWriteReplica(prev.placements, start.delta, mid.delta, finish.delta);
+ 
+         Set<Token> tokens = new HashSet<>(prev.tokenMap.tokens(replaced));
+         BootstrapAndReplace plan = BootstrapAndReplace.newSequence(prev.nextEpoch(),
+diff --git a/src/java/org/apache/cassandra/tcm/transformations/UnsafeJoin.java b/src/java/org/apache/cassandra/tcm/transformations/UnsafeJoin.java
+index 34f1826574..5d29ab3287 100644
+--- a/src/java/org/apache/cassandra/tcm/transformations/UnsafeJoin.java
++++ b/src/java/org/apache/cassandra/tcm/transformations/UnsafeJoin.java
+@@ -24,7 +24,9 @@ import org.apache.cassandra.dht.Token;
+ import org.apache.cassandra.tcm.ClusterMetadata;
+ import org.apache.cassandra.tcm.ClusterMetadataService;
+ import org.apache.cassandra.tcm.membership.NodeId;
++import org.apache.cassandra.tcm.ownership.DataPlacements;
+ import org.apache.cassandra.tcm.ownership.PlacementProvider;
++import org.apache.cassandra.tcm.ownership.PlacementTransitionPlan;
+ import org.apache.cassandra.tcm.sequences.BootstrapAndJoin;
+ import org.apache.cassandra.tcm.sequences.LockedRanges;
+ 
+@@ -82,4 +84,7 @@ public class UnsafeJoin extends PrepareJoin
+         UnsafeJoin join = new UnsafeJoin(nodeId, tokens, ClusterMetadataService.instance().placementProvider());
+         ClusterMetadataService.instance().commit(join);
+     }
++
++    @Override
++    void assertPreExistingWriteReplica(DataPlacements placements, PlacementTransitionPlan transitionPlan) {}
+ }
+diff --git a/test/distributed/org/apache/cassandra/distributed/test/TransientRangeMovement2Test.java b/test/distributed/org/apache/cassandra/distributed/test/TransientRangeMovement2Test.java
+index 238fca419c..2a4898884e 100644
+--- a/test/distributed/org/apache/cassandra/distributed/test/TransientRangeMovement2Test.java
++++ b/test/distributed/org/apache/cassandra/distributed/test/TransientRangeMovement2Test.java
+@@ -19,6 +19,7 @@
+ package org.apache.cassandra.distributed.test;
+ 
+ import java.io.IOException;
++import java.util.concurrent.Callable;
+ import java.util.concurrent.ExecutionException;
+ 
+ import org.junit.Test;
+@@ -28,9 +29,16 @@ import org.apache.cassandra.distributed.api.Feature;
+ import org.apache.cassandra.distributed.api.IInstanceConfig;
+ import org.apache.cassandra.distributed.api.IInvokableInstance;
+ import org.apache.cassandra.distributed.shared.NetworkTopology;
++import org.apache.cassandra.tcm.Epoch;
++import org.apache.cassandra.tcm.transformations.PrepareMove;
+ import org.apache.cassandra.utils.Pair;
+ 
+ import static com.google.common.collect.Lists.newArrayList;
++import static org.apache.cassandra.distributed.shared.ClusterUtils.pauseBeforeCommit;
++import static org.apache.cassandra.distributed.shared.ClusterUtils.pauseBeforeEnacting;
++import static org.apache.cassandra.distributed.shared.ClusterUtils.unpauseCommits;
++import static org.apache.cassandra.distributed.shared.ClusterUtils.unpauseEnactment;
++import static org.apache.cassandra.distributed.shared.ClusterUtils.waitForCMSToQuiesce;
+ import static org.apache.cassandra.distributed.test.TransientRangeMovementTest.OPPTokens;
+ import static org.apache.cassandra.distributed.test.TransientRangeMovementTest.assertAllContained;
+ import static org.apache.cassandra.distributed.test.TransientRangeMovementTest.localStrs;
+@@ -40,7 +48,7 @@ import static org.apache.cassandra.distributed.test.TransientRangeMovementTest.p
+ public class TransientRangeMovement2Test extends TestBaseImpl
+ {
+     @Test
+-    public void testMoveBackward() throws IOException, ExecutionException, InterruptedException
++    public void testMoveBackward() throws Exception
+     {
+         try (Cluster cluster = init(Cluster.build(4)
+                                            .withTokenSupplier(new OPPTokens())
+@@ -51,9 +59,30 @@ public class TransientRangeMovement2Test extends TestBaseImpl
+                                            .start()))
+         {
+             populate(cluster);
+-            cluster.get(3).nodetoolResult("move", "25").asserts().success();
+-            cluster.forEach(i -> i.nodetoolResult("cleanup").asserts().success());
++            // At the start, node1 is a TRANSIENT replica for (20,30] and FULL for (30, 40], (40,] & (,10]. When moving
++            // node3 to token 25, node1 becomes a FULL replica for (25, 40], effectively going from TRANSIENT to FULL
++            // for (25,30]. A T->F transition will always cause data for that range to be streamed to the transitioning
++            // node, which happens after StartMove and before MidMove. Running cleanup before node1 considers itself a
++            // FULL replica would remove any of the newly streamed data which is marked repaired. To avoid this, we
++            // ensure that any T->F transition is applied for writes as part of the StartMove. Have the CMS node (node1)
++            // pause before the MidMove step is committed, at which point we know that streaming has completed.
++            Callable<Epoch> pending = pauseBeforeCommit(cluster.get(1), (e) -> e instanceof PrepareMove.MidMove);
++            Thread t = new Thread(() -> cluster.get(3).nodetoolResult("move", "25").asserts().success());
++            t.start();
++
++            // To gate/prevent node1 from proceeding with committing MidMove, instruct it to pause before enacting it.
++            // This will allow us to run cleanup before the effects of the MidMove are visible on node1.
++            Epoch pauseBeforeEnacting = pending.call().nextEpoch();
++            Callable<?> beforeEnacted = pauseBeforeEnacting(cluster.get(1), pauseBeforeEnacting);
++            unpauseCommits(cluster.get(1));
++            beforeEnacted.call();
+ 
++            cluster.forEach(i -> i.nodetoolResult("cleanup").asserts().success());
++            unpauseEnactment(cluster.get(1));
++            waitForCMSToQuiesce(cluster, cluster.get(1));
++            t.join();
++            // run cleanup again now that every instance has completed the move operation
++            cluster.forEach(i -> i.nodetoolResult("cleanup").asserts().success());
+             assertAllContained(localStrs(cluster.get(1)),
+                                newArrayList("22", "24"),
+                                Pair.create("00", "10"),
+@@ -72,7 +101,7 @@ public class TransientRangeMovement2Test extends TestBaseImpl
+     }
+ 
+     @Test
+-    public void testMoveForward() throws IOException, ExecutionException, InterruptedException
++    public void testMoveForward() throws Exception
+     {
+ 
+         try (Cluster cluster = init(Cluster.build(4)
+@@ -85,8 +114,24 @@ public class TransientRangeMovement2Test extends TestBaseImpl
+                                            .start()))
+         {
+             populate(cluster);
+-            cluster.get(1).nodetoolResult("move", "15").asserts().success();
+-            cluster.forEach((i) -> i.nodetoolResult("cleanup").asserts().success());
++            // Have the CMS node pause before the step MidMove is committed - this doesn't break without the CASSANDRA-19344 fix, but leaving
++            // pausing + cleanup in.
++            Callable<Epoch> pending = pauseBeforeCommit(cluster.get(1), (e) -> e instanceof PrepareMove.MidMove);
++
++            new Thread(() -> cluster.get(1).nodetoolResult("move", "15").asserts().success()).start();
++            Epoch pauseBeforeEnacting = pending.call().nextEpoch();
++
++            Callable<?> beforeEnacted = pauseBeforeEnacting(cluster.get(3), pauseBeforeEnacting);
++            unpauseCommits(cluster.get(1));
++            beforeEnacted.call();
++
++            // before node3 completes the move, run cleanup (but its actually node1 where the corruption occurs).
++            cluster.forEach(i -> i.nodetoolResult("cleanup").asserts().success());
++
++            unpauseEnactment(cluster.get(3));
++            waitForCMSToQuiesce(cluster, cluster.get(1));
++
++            cluster.forEach(i -> i.nodetoolResult("cleanup").asserts().success());
+             assertAllContained(localStrs(cluster.get(1)),
+                                newArrayList("22", "24", "26", "28", "30"),
+                                Pair.create("00", "15"),
+@@ -104,8 +149,6 @@ public class TransientRangeMovement2Test extends TestBaseImpl
+         }
+     }
+ 
+-
+-
+     @Test
+     public void testRebuild() throws ExecutionException, InterruptedException, IOException
+     {
+diff --git a/test/distributed/org/apache/cassandra/distributed/test/TransientRangeMovementTest.java b/test/distributed/org/apache/cassandra/distributed/test/TransientRangeMovementTest.java
+index c1236cc2ad..7f1759ae98 100644
+--- a/test/distributed/org/apache/cassandra/distributed/test/TransientRangeMovementTest.java
++++ b/test/distributed/org/apache/cassandra/distributed/test/TransientRangeMovementTest.java
+@@ -25,7 +25,9 @@ import java.util.Collection;
+ import java.util.Collections;
+ import java.util.List;
+ import java.util.Set;
++import java.util.concurrent.Callable;
+ import java.util.concurrent.ExecutionException;
++import java.util.function.Function;
+ 
+ import com.google.common.collect.Sets;
+ import org.junit.Test;
+@@ -38,15 +40,23 @@ import org.apache.cassandra.distributed.api.IInvokableInstance;
+ import org.apache.cassandra.distributed.api.TokenSupplier;
+ import org.apache.cassandra.distributed.shared.NetworkTopology;
+ import org.apache.cassandra.tcm.ClusterMetadata;
++import org.apache.cassandra.tcm.Epoch;
++import org.apache.cassandra.tcm.transformations.PrepareLeave;
+ import org.apache.cassandra.utils.Pair;
+ 
+ import static com.google.common.collect.Lists.newArrayList;
+ import static org.apache.cassandra.config.CassandraRelevantProperties.BOOTSTRAP_SKIP_SCHEMA_CHECK;
+ import static org.apache.cassandra.distributed.shared.ClusterUtils.awaitRingJoin;
++import static org.apache.cassandra.distributed.shared.ClusterUtils.pauseBeforeCommit;
++import static org.apache.cassandra.distributed.shared.ClusterUtils.pauseBeforeEnacting;
+ import static org.apache.cassandra.distributed.shared.ClusterUtils.replaceHostAndStart;
+ import static org.apache.cassandra.distributed.shared.ClusterUtils.stopUnchecked;
++import static org.apache.cassandra.distributed.shared.ClusterUtils.unpauseCommits;
++import static org.apache.cassandra.distributed.shared.ClusterUtils.unpauseEnactment;
++import static org.apache.cassandra.distributed.shared.ClusterUtils.waitForCMSToQuiesce;
+ import static org.junit.Assert.assertFalse;
+ import static org.junit.Assert.assertTrue;
++import static org.junit.Assert.fail;
+ 
+ @SuppressWarnings("unchecked")
+ public class TransientRangeMovementTest extends TestBaseImpl
+@@ -126,37 +136,32 @@ public class TransientRangeMovementTest extends TestBaseImpl
+     }
+ 
+     @Test
+-    public void testLeave() throws IOException, ExecutionException, InterruptedException
++    public void testLeave() throws Exception
+     {
+-
+-        try (Cluster cluster = init(Cluster.build(4)
+-                                           .withTokenSupplier(new OPPTokens())
+-                                           .withNodeIdTopology(NetworkTopology.singleDcNetworkTopology(4, "dc0", "rack0"))
+-                                           .withConfig(conf -> conf.set("transient_replication_enabled","true")
+-                                                                   .set("partitioner", "OrderPreservingPartitioner") // just makes it easier to read the tokens in the log
+-                                                                   .with(Feature.NETWORK, Feature.GOSSIP))
+-                                           .start()))
+-        {
+-            populate(cluster);
+-            cluster.get(4).nodetoolResult("decommission", "--force").asserts().success();
+-            cluster.forEach(i -> i.nodetoolResult("cleanup"));
+-            assertAllContained(localStrs(cluster.get(1)),
+-                               newArrayList("12", "14", "16", "18", "20"),
+-                               Pair.create("00", "10"),
+-                               Pair.create("21", "50"));
+-            assertAllContained(localStrs(cluster.get(2)),
+-                               newArrayList("22", "24", "26", "28", "30"),
+-                               Pair.create("00", "20"),
+-                               Pair.create("31", "50"));
+-            assertAllContained(localStrs(cluster.get(3)),
+-                               newArrayList("00", "02", "04", "06", "08", "10",
+-                                                  "32", "34", "36", "38", "40", "42", "44", "46", "48"),
+-                               Pair.create("11", "30"));
+-        }
++        testDecommissionOrRemove(cluster -> () -> {
++            new Thread(() -> cluster.get(4).nodetoolResult("decommission", "--force").asserts().success()).start();
++        });
+     }
+ 
+     @Test
+-    public void testRemoveNode() throws IOException, ExecutionException, InterruptedException
++    public void testRemoveNode() throws Exception
++    {
++        testDecommissionOrRemove(cluster -> () -> {
++            String nodeId = cluster.get(4).callOnInstance(() -> ClusterMetadata.current().myNodeId().toUUID().toString());
++            try
++            {
++                cluster.get(4).shutdown().get();
++            }
++            catch (Exception e)
++            {
++                e.printStackTrace();
++                fail("Unexpected exception during shutdown of node4");
++            }
++            new Thread(() -> cluster.get(1).nodetoolResult("removenode", nodeId, "--force").asserts().success()).start();
++        });
++    }
++
++    private void testDecommissionOrRemove(Function<Cluster, Runnable> decommissionOrLeave) throws Exception
+     {
+         try (Cluster cluster = init(Cluster.build(4)
+                                            .withTokenSupplier(new OPPTokens())
+@@ -168,14 +173,33 @@ public class TransientRangeMovementTest extends TestBaseImpl
+                                            .start()))
+         {
+             populate(cluster);
+-            String nodeId = cluster.get(4).callOnInstance(() -> ClusterMetadata.current().myNodeId().toUUID().toString());
+-            cluster.get(4).shutdown().get();
+-            cluster.get(1).nodetoolResult("removenode", nodeId, "--force").asserts().success();
++
++            // Have the CMS node pause before the FINISH_LEAVE step is committed, so we can make a note of the _next_
++            // epoch (i.e. when the FINISH_LEAVE will be enacted). Then we can pause one replica before enacting it
++            Callable<Epoch> pending = pauseBeforeCommit(cluster.get(1), (e) -> e instanceof PrepareLeave.FinishLeave);
++
++            // Trigger the removal of node4
++            decommissionOrLeave.apply(cluster).run();
++            Epoch pauseBeforeEnacting = pending.call().nextEpoch();
++
++            // Unpause the CMS. It will commit the FINISH_LEAVE, but instance 2 will wait before enacting it
++            Callable<?> beforeEnacted = pauseBeforeEnacting(cluster.get(2), pauseBeforeEnacting);
++            unpauseCommits(cluster.get(1));
++            beforeEnacted.call();
++
++            // Before node2 completes the removal of node4, run cleanup. Prior to CASSANDRA-19XXX node2 would not yet
++            // have become a FULL write replica of all the ranges it should be, so some keys would be remove prematurely
++            // causing the subsequent assertions to fail
+             cluster.forEach(i -> {
+                 if (i.config().num() != 4)
+                     i.nodetoolResult("cleanup").asserts().success();
+             });
+ 
++            // Unpause node2 so it completes the removal of node4
++            unpauseEnactment(cluster.get(2));
++            waitForCMSToQuiesce(cluster, cluster.get(1));
++            cluster.get(2).nodetoolResult("cleanup").asserts().success();
++
+             assertAllContained(localStrs(cluster.get(1)),
+                                newArrayList("12", "14", "16", "18", "20"),
+                                Pair.create("00", "10"),
+@@ -200,7 +224,7 @@ public class TransientRangeMovementTest extends TestBaseImpl
+         {
+             String key = toStr(i);
+             if (contained(key, ranges))
+-                assertTrue("NOT IN CURRENT: " + key + " -- " + Arrays.toString(ranges), cur.remove(key));
++                assertTrue("NOT IN CURRENT: " + key + " -- " + Arrays.toString(ranges) + " -- " + current, cur.remove(key));
+             else if (expectTransient.remove(key))
+                 cur.remove(key);
+             else
+@@ -263,7 +287,9 @@ public class TransientRangeMovementTest extends TestBaseImpl
+         cluster.schemaChange("create table tr.x (id varchar primary key) with read_repair = 'NONE'");
+         for (int i = 0; i < 50; i++)
+             cluster.coordinator(1).execute("insert into tr.x (id) values (?)", ConsistencyLevel.QUORUM, toStr(i));
++
+         cluster.forEach((i) -> i.nodetoolResult("repair", "-pr", "tr").asserts().success());
++
+         cluster.get(1).shutdown().get();
+         for (int i = 0; i < 50; i += 2)
+             cluster.coordinator(2).execute("insert into tr.x (id) values (?)", ConsistencyLevel.QUORUM, toStr(i));
+diff --git a/test/distributed/org/apache/cassandra/distributed/test/log/CoordinatorPathTest.java b/test/distributed/org/apache/cassandra/distributed/test/log/CoordinatorPathTest.java
+index ce5c5800d4..388185e8d2 100644
+--- a/test/distributed/org/apache/cassandra/distributed/test/log/CoordinatorPathTest.java
++++ b/test/distributed/org/apache/cassandra/distributed/test/log/CoordinatorPathTest.java
+@@ -27,6 +27,7 @@ import java.util.function.BooleanSupplier;
+ import java.util.function.Function;
+ import java.util.stream.Collectors;
+ 
++import org.apache.cassandra.harry.sut.TokenPlacementModel.Replica;
+ import org.junit.Assert;
+ import org.junit.Test;
+ 
+@@ -44,7 +45,6 @@ import org.apache.cassandra.db.ReadResponse;
+ import org.apache.cassandra.distributed.api.ConsistencyLevel;
+ import org.apache.cassandra.harry.HarryHelper;
+ import org.apache.cassandra.harry.sut.TokenPlacementModel;
+-import org.apache.cassandra.harry.sut.TokenPlacementModel.Node;
+ import org.apache.cassandra.net.Message;
+ import org.apache.cassandra.net.NoPayload;
+ import org.apache.cassandra.net.Verb;
+@@ -91,11 +91,11 @@ public class CoordinatorPathTest extends CoordinatorPathTestBase
+                     continue;
+ 
+                 simulatedCluster.waitForQuiescense();
+-                List<Node> replicas = simulatedCluster.state.get().writePlacementsFor(token);
++                List<Replica> replicas = simulatedCluster.state.get().writePlacementsFor(token);
+                 // At most 2 replicas should respond, so that when the pending node is added, results would be insufficient for recomputed blockFor
+                 BooleanSupplier shouldRespond = atMostResponses(simulatedCluster.state.get().isWriteTargetFor(token, simulatedCluster.node(1).matcher) ? 1 : 2);
+                 List<WaitingAction<?,?>> waiting = simulatedCluster
+-                                                   .filter((n) -> replicas.stream().anyMatch(n.matcher) && n.node.idx() != 1)
++                                                   .filter((n) -> replicas.stream().map(Replica::node).anyMatch(n.matcher) && n.node.idx() != 1)
+                                                    .map((nodeToBlockOn) -> nodeToBlockOn.blockOnReplica((node) -> new MutationAction(node, shouldRespond)))
+                                                    .collect(Collectors.toList());
+ 
+@@ -163,10 +163,10 @@ public class CoordinatorPathTest extends CoordinatorPathTestBase
+ 
+                 simulatedCluster.waitForQuiescense();
+ 
+-                List<Node> replicas = simulatedCluster.state.get().readReplicasFor(token(pk));
++                List<Replica> replicas = simulatedCluster.state.get().readReplicasFor(token(pk));
+                 Function<Integer, BooleanSupplier> shouldRespond = respondFrom(1, 4);
+                 List<WaitingAction<?,?>> waiting = simulatedCluster
+-                                                   .filter((n) -> replicas.stream().anyMatch(n.matcher) && n.node.idx() != 1)
++                                                   .filter((n) -> replicas.stream().map(Replica::node).anyMatch(n.matcher) && n.node.idx() != 1)
+                                                    .map((nodeToBlockOn) -> nodeToBlockOn.blockOnReplica((node) -> new ReadAction(node, shouldRespond.apply(nodeToBlockOn.node.idx()))))
+                                                    .collect(Collectors.toList());
+ 
+diff --git a/test/distributed/org/apache/cassandra/distributed/test/log/MetadataChangeSimulationTest.java b/test/distributed/org/apache/cassandra/distributed/test/log/MetadataChangeSimulationTest.java
+index f8e88098d9..8ece3dc7c8 100644
+--- a/test/distributed/org/apache/cassandra/distributed/test/log/MetadataChangeSimulationTest.java
++++ b/test/distributed/org/apache/cassandra/distributed/test/log/MetadataChangeSimulationTest.java
+@@ -35,9 +35,13 @@ import java.util.function.Supplier;
+ import java.util.stream.Collectors;
+ 
+ import com.google.common.collect.Sets;
++import org.apache.cassandra.harry.sut.TokenPlacementModel.DCReplicas;
+ import org.junit.Assert;
+ import org.junit.Test;
+ 
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
+ import org.apache.cassandra.config.DatabaseDescriptor;
+ import org.apache.cassandra.dht.IPartitioner;
+ import org.apache.cassandra.dht.Murmur3Partitioner;
+@@ -76,12 +80,18 @@ import static org.apache.cassandra.harry.sut.TokenPlacementModel.nodeFactoryHuma
+ 
+ public class MetadataChangeSimulationTest extends CMSTestBase
+ {
++    private static final Logger logger = LoggerFactory.getLogger(MetadataChangeSimulationTest.class);
++    private static final long seed;
++    private static final Random rng;
+     static
+     {
++        seed = System.nanoTime();
++        logger.info("SEED: {}", seed);
++        rng = new Random(seed);
+         DatabaseDescriptor.setPartitionerUnsafe(Murmur3Partitioner.instance);
++        DatabaseDescriptor.setTransientReplicationEnabledUnsafe(true);
+     }
+ 
+-    private static final Random rng = new Random(1);
+ 
+     @Test
+     public void simulateNTS() throws Throwable
+@@ -93,7 +103,12 @@ public class MetadataChangeSimulationTest extends CMSTestBase
+         for (int concurrency : new int[]{ 1, 3, 5 })
+         {
+             for (int rf : new int[]{ 2, 3, 5 })
+-                simulate(50, 0, new NtsReplicationFactor(3, rf), concurrency);
++            {
++                for (int trans = 0; trans < rf; trans++)
++                {
++                    simulate(50, 0, new NtsReplicationFactor(3, rf, trans), concurrency);
++                }
++            }
+         }
+     }
+ 
+@@ -103,10 +118,28 @@ public class MetadataChangeSimulationTest extends CMSTestBase
+         for (int concurrency : new int[]{ 1, 3, 5 })
+         {
+             for (int rf : new int[]{ 2, 3, 5 })
+-                simulate(50, 0, new SimpleReplicationFactor(rf), concurrency);
++            {
++                for (int trans = 0; trans < rf; trans++)
++                {
++                    simulate(50, 0, new SimpleReplicationFactor(rf, trans), concurrency);
++                }
++            }
+         }
+     }
+ 
++    @Test
++    public void simulateSimpleOneTransient() throws Throwable
++    {
++        DatabaseDescriptor.setTransientReplicationEnabledUnsafe(true);
++        simulate(50, 0, new SimpleReplicationFactor(5, 2), 1);
++    }
++
++    @Test
++    public void simulateSimpleOneNonTransient() throws Throwable
++    {
++        simulate(50, 0, new SimpleReplicationFactor(3), 1);
++    }
++
+     @Test
+     public void testMoveReal() throws Throwable
+     {
+@@ -362,8 +395,7 @@ public class MetadataChangeSimulationTest extends CMSTestBase
+ 
+     public void simulate(int toBootstrap, int minSteps, ReplicationFactor rf, int concurrency) throws Throwable
+     {
+-        System.out.printf("RUNNING SIMULATION. TO BOOTSTRAP: %s, RF: %s, CONCURRENCY: %s%n",
+-                          toBootstrap, rf, concurrency);
++        logger.info("RUNNING SIMULATION WITH SEED {}. TO BOOTSTRAP: {}, RF: {}, CONCURRENCY: {}", seed, toBootstrap, rf, concurrency);
+         long startTime = System.currentTimeMillis();
+         ModelChecker<ModelState, CMSSut> modelChecker = new ModelChecker<>();
+         ClusterMetadataService.unsetInstance();
+@@ -372,9 +404,9 @@ public class MetadataChangeSimulationTest extends CMSTestBase
+                     // Sequentially bootstrap rf nodes first
+                     .step((state, sut) -> state.currentNodes.isEmpty(),
+                           (state, sut, entropySource) -> {
+-                              for (Map.Entry<String, Integer> e : rf.asMap().entrySet())
++                              for (Map.Entry<String, DCReplicas> e : rf.asMap().entrySet())
+                               {
+-                                  int dcRf = e.getValue();
++                                  int dcRf = e.getValue().totalCount;
+                                   int dc = Integer.parseInt(e.getKey().replace("datacenter", ""));
+ 
+                                   for (int i = 0; i < dcRf + 1; i++)
+@@ -468,10 +500,10 @@ public class MetadataChangeSimulationTest extends CMSTestBase
+                         {
+                             validatePlacementsFinal(sut, state);
+                             sut.close();
+-                            System.out.printf("(RF: %d, CONCURRENCY: %d, RUN TIME: %dms) - " +
+-                                              "REGISTERED: %d, CURRENT SIZE: %d, REJECTED %d, INFLIGHT: %d" +
+-                                              "FINISHED  (join,replace,leave,move): %s" +
+-                                              "CANCELLED (join,replace,leave,move): %s%n",
++                            logger.info("(RF: {}, CONCURRENCY: {}, RUN TIME: {}ms) - " +
++                                              "REGISTERED: {}, CURRENT SIZE: {}, REJECTED {}, INFLIGHT: {} " +
++                                              "FINISHED  (join,replace,leave,move): {} " +
++                                              "CANCELLED (join,replace,leave,move): {} ",
+                                               sut.rf.total(), concurrency, System.currentTimeMillis() - startTime,
+                                               state.uniqueNodes, state.currentNodes.size(), state.rejected, state.inFlightOperations.size(),
+                                               Arrays.toString(state.finished),
+@@ -505,7 +537,7 @@ public class MetadataChangeSimulationTest extends CMSTestBase
+         {
+             ModelState state = ModelState.empty(nodeFactory(), 300, 1);
+ 
+-            for (Map.Entry<String, Integer> e : rf.asMap().entrySet())
++            for (Map.Entry<String, DCReplicas> e : rf.asMap().entrySet())
+             {
+                 int dc = Integer.parseInt(e.getKey().replace("datacenter", ""));
+ 
+@@ -639,7 +671,7 @@ public class MetadataChangeSimulationTest extends CMSTestBase
+             for (SimulatedOperation op : modelState.inFlightOperations)
+                 candidates.removeAll(Arrays.asList(op.nodes));
+ 
+-            int rf = modelState.simulatedPlacements.rf.asMap().get(dc);
++            int rf = modelState.simulatedPlacements.rf.asMap().get(dc).totalCount;
+             if (candidates.size() <= rf)
+                 continue;
+ 
+@@ -668,39 +700,42 @@ public class MetadataChangeSimulationTest extends CMSTestBase
+         return sb.toString();
+     }
+ 
+-    public static void match(PlacementForRange actual, Map<TokenPlacementModel.Range, List<Node>> predicted) throws Throwable
++    public static void match(PlacementForRange actual, Map<TokenPlacementModel.Range, List<TokenPlacementModel.Replica>> predicted) throws Throwable
+     {
+         Map<Range<Token>, VersionedEndpoints.ForRange> actualGroups = actual.replicaGroups();
+         assert predicted.size() == actualGroups.size() :
+         String.format("\nPredicted:\n%s(%d)" +
+                       "\nActual:\n%s(%d)", toString(predicted), predicted.size(), toString(actual.replicaGroups()), actualGroups.size());
+ 
+-        for (Map.Entry<TokenPlacementModel.Range, List<Node>> entry : predicted.entrySet())
++        for (Map.Entry<TokenPlacementModel.Range, List<TokenPlacementModel.Replica>> entry : predicted.entrySet())
+         {
+             TokenPlacementModel.Range range = entry.getKey();
+-            List<Node> predictedNodes = entry.getValue();
++            List<TokenPlacementModel.Replica> predictedReplicas = entry.getValue();
+             Range<Token> predictedRange = new Range<Token>(new Murmur3Partitioner.LongToken(range.start),
+                                                            new Murmur3Partitioner.LongToken(range.end));
+             EndpointsForRange endpointsForRange = actualGroups.get(predictedRange).get();
+             assertNotNull(() -> String.format("Could not find %s in ranges %s", predictedRange, actualGroups.keySet()),
+                           endpointsForRange);
++
+             assertEquals(() -> String.format("Predicted to have different endpoints for range %s" +
+                                              "\nExpected: %s" +
+                                              "\nActual:   %s",
+                                              range,
+-                                             predictedNodes.stream().sorted().collect(Collectors.toList()),
++                                             predictedReplicas.stream().sorted().collect(Collectors.toList()),
+                                              endpointsForRange.endpoints().stream().sorted().collect(Collectors.toList())),
+-                         predictedNodes.size(), endpointsForRange.size());
+-            for (Node node : predictedNodes)
++                         predictedReplicas.size(), endpointsForRange.size());
++            for (TokenPlacementModel.Replica fromModel : predictedReplicas)
+             {
++                Replica replica = endpointsForRange.byEndpoint().
++                                                   get(InetAddressAndPort.getByAddress(InetAddress.getByName(fromModel.node().id())));
+                 assertTrue(() -> String.format("Endpoints for range %s should have contained %s, but they have not." +
+                                                "\nExpected: %s" +
+                                                "\nActual:   %s.",
+                                                endpointsForRange.range(),
+-                                               node.id(),
+-                                               predictedNodes,
+-                                               endpointsForRange.endpoints()),
+-                           endpointsForRange.endpoints().contains(InetAddressAndPort.getByAddress(InetAddress.getByName(node.id()))));
++                                               fromModel,
++                                               predictedReplicas,
++                                               endpointsForRange),
++                           replica != null && replica.isFull() == fromModel.isFull());
+             }
+         }
+     }
+@@ -784,10 +819,36 @@ public class MetadataChangeSimulationTest extends CMSTestBase
+         assertRanges(expectedRanges, actualPlacements.writes.ranges());
+         assertRanges(expectedRanges, actualPlacements.reads.ranges());
+ 
++        validateTransientStatus(actualPlacements.reads, actualPlacements.writes);
++
+         validatePlacementsInternal(rf, modelState.inFlightOperations, expectedRanges, actualPlacements.reads, false);
+         validatePlacementsInternal(rf, modelState.inFlightOperations, expectedRanges, actualPlacements.writes, true);
+     }
+ 
++    public static void validateTransientStatus(PlacementForRange reads, PlacementForRange writes)
++    {
++        // No node should ever be a FULL read replica but a TRANSIENT write replica for the same range
++        Map<Range<Token>, List<Replica>> invalid = new HashMap<>();
++        reads.replicaGroups().forEach((range, readGroup) -> {
++            Map<InetAddressAndPort, Replica> writeGroup = writes.forRange(range).get().byEndpoint();
++            readGroup.forEach(r -> {
++                if (r.isFull())
++                {
++                    Replica w = writeGroup.get(r.endpoint());
++                    if (w != null && w.isTransient())
++                    {
++                        List<Replica> i = invalid.computeIfAbsent(range, ignore -> new ArrayList<>());
++                        i.add(w);
++                    }
++                }
++            });
++        });
++        assertTrue(() -> String.format("Found replicas with invalid transient/full status within a given range. " +
++                         "The following were found with the same instance having TRANSIENT status for writes, but " +
++                         "FULL status for reads, which can cause consistency violations. %n%s", invalid),
++                   invalid.isEmpty());
++    }
++
+     public static void assertRanges(List<Range<Token>> l, List<Range<Token>> r)
+     {
+         Assert.assertEquals(new TreeSet<>(l), new TreeSet<>(r));
+@@ -808,12 +869,11 @@ public class MetadataChangeSimulationTest extends CMSTestBase
+                              .add(replica.endpoint());
+             }
+ 
+-            for (Map.Entry<String, Integer> e : rf.asMap().entrySet())
++            for (Map.Entry<String, DCReplicas> e : rf.asMap().entrySet())
+             {
+-                int expectedRf = e.getValue();
++                int expectedRf = e.getValue().totalCount;
+                 String dc = e.getKey();
+                 int actualRf = endpointsByDc.get(dc).size();
+-
+                 if (allowPending)
+                 {
+                     int diff = actualRf - expectedRf;
+@@ -889,10 +949,9 @@ public class MetadataChangeSimulationTest extends CMSTestBase
+             Node toMove = null;
+             Node toReplace = null;
+             Node toLeave = null;
+-            for (Map.Entry<String, Integer> e : rf.asMap().entrySet())
++            for (String replicationFactor : rf.asMap().keySet())
+             {
+-                int dc = Integer.parseInt(e.getKey().replace("datacenter", ""));
+-
++                int dc = Integer.parseInt(replicationFactor.replace("datacenter", ""));
+                 for (int i = 0; i < 100; i++)
+                 {
+                     ModelChecker.Pair<ModelState, Node> registration = registerNewNode(state, sut, dc, random.nextInt(5) + 1);
+diff --git a/test/distributed/org/apache/cassandra/distributed/test/log/ModelState.java b/test/distributed/org/apache/cassandra/distributed/test/log/ModelState.java
+index 7a0a61604d..3ad03fb6a0 100644
+--- a/test/distributed/org/apache/cassandra/distributed/test/log/ModelState.java
++++ b/test/distributed/org/apache/cassandra/distributed/test/log/ModelState.java
+@@ -29,6 +29,7 @@ import java.util.Set;
+ import java.util.TreeMap;
+ 
+ import org.apache.cassandra.harry.sut.TokenPlacementModel;
++import org.apache.cassandra.harry.sut.TokenPlacementModel.DCReplicas;
+ 
+ public class ModelState
+ {
+@@ -138,10 +139,10 @@ public class ModelState
+     private boolean canRemove(TokenPlacementModel.ReplicationFactor rfs)
+     {
+         if (!withinConcurrencyLimit()) return false;
+-        for (Map.Entry<String, Integer> e : rfs.asMap().entrySet())
++        for (Map.Entry<String, DCReplicas> e : rfs.asMap().entrySet())
+         {
+             String dc = e.getKey();
+-            int rf = e.getValue();
++            int rf = e.getValue().totalCount;
+             List<TokenPlacementModel.Node> nodes = nodesByDc.get(dc);
+             Set<TokenPlacementModel.Node> nodesInDc = nodes == null ? new HashSet<>() : new HashSet<>(nodes);
+             for (SimulatedOperation op : inFlightOperations)
+@@ -318,7 +319,7 @@ public class ModelState
+             assert currentNodes.contains(node);
+             // for now... assassinate may change this assertion
+             assert leavingNodes.contains(node);
+-            finished[1]++;
++            finished[2]++;
+             removeFromCluster(node);
+             return this;
+         }
+diff --git a/test/distributed/org/apache/cassandra/distributed/test/log/OperationalEquivalenceTest.java b/test/distributed/org/apache/cassandra/distributed/test/log/OperationalEquivalenceTest.java
+index 58732e3641..035cd68a32 100644
+--- a/test/distributed/org/apache/cassandra/distributed/test/log/OperationalEquivalenceTest.java
++++ b/test/distributed/org/apache/cassandra/distributed/test/log/OperationalEquivalenceTest.java
+@@ -22,7 +22,6 @@ import java.util.ArrayList;
+ import java.util.Collections;
+ import java.util.Iterator;
+ import java.util.List;
+-import java.util.Map;
+ import java.util.Random;
+ import java.util.concurrent.atomic.AtomicInteger;
+ import java.util.stream.Collectors;
+@@ -34,7 +33,6 @@ import org.apache.cassandra.config.DatabaseDescriptor;
+ import org.apache.cassandra.harry.sut.TokenPlacementModel;
+ import org.apache.cassandra.locator.EndpointsForRange;
+ import org.apache.cassandra.locator.Replica;
+-import org.apache.cassandra.schema.KeyspaceParams;
+ import org.apache.cassandra.tcm.AtomicLongBackedProcessor;
+ import org.apache.cassandra.tcm.ClusterMetadata;
+ import org.apache.cassandra.tcm.membership.Location;
+@@ -60,49 +58,6 @@ public class OperationalEquivalenceTest extends CMSTestBase
+         DatabaseDescriptor.setTransientReplicationEnabledUnsafe(true);
+     }
+ 
+-    // Private to this class for now as this is only a limited implementation
+-    private static class TransientReplicationFactor extends TokenPlacementModel.ReplicationFactor
+-    {
+-        private final TokenPlacementModel.Lookup lookup = new TokenPlacementModel.DefaultLookup();
+-        private final int dcs;
+-        private final int full;
+-        private final int trans;
+-
+-        public TransientReplicationFactor(int dcs, int full, int trans)
+-        {
+-            super(dcs * (full + trans));
+-            this.dcs = dcs;
+-            this.full = full;
+-            this.trans = trans;
+-        }
+-
+-        public int dcs()
+-        {
+-            return dcs;
+-        }
+-
+-        public KeyspaceParams asKeyspaceParams()
+-        {
+-            Object[] rf = new Object[dcs * 2];
+-            for (int i = 0; i < dcs * 2;)
+-            {
+-                rf[i++] = lookup.dc(i);
+-                rf[i++] = String.format("%s/%s", full, trans);
+-            }
+-            return KeyspaceParams.nts(rf);
+-        }
+-
+-        public Map<String, Integer> asMap()
+-        {
+-            throw new IllegalStateException("Does not work with transient replication");
+-        }
+-
+-        public TokenPlacementModel.ReplicatedRanges replicate(TokenPlacementModel.Range[] ranges, List<TokenPlacementModel.Node> nodes)
+-        {
+-            throw new IllegalStateException("Does not work with transient replication (yet)");
+-        }
+-    }
+-
+     @Test
+     public void testMove() throws Exception
+     {
+@@ -118,8 +73,10 @@ public class OperationalEquivalenceTest extends CMSTestBase
+         testMove(new TokenPlacementModel.NtsReplicationFactor(3, 3));
+         testMove(new TokenPlacementModel.NtsReplicationFactor(3, 5));
+ 
+-        testMove(new TransientReplicationFactor(3, 3, 1));
+-        testMove(new TransientReplicationFactor(3, 3, 2));
++        testMove(new TokenPlacementModel.SimpleReplicationFactor(3, 1));
++        testMove(new TokenPlacementModel.SimpleReplicationFactor(3, 2));
++        testMove(new TokenPlacementModel.NtsReplicationFactor(3, 3, 1));
++        testMove(new TokenPlacementModel.NtsReplicationFactor(3, 5, 2));
+     }
+ 
+     public void testMove(TokenPlacementModel.ReplicationFactor rf) throws Exception
+diff --git a/test/distributed/org/apache/cassandra/distributed/test/log/PlacementSimulator.java b/test/distributed/org/apache/cassandra/distributed/test/log/PlacementSimulator.java
+index 30833dc9fa..d9ca33a759 100644
+--- a/test/distributed/org/apache/cassandra/distributed/test/log/PlacementSimulator.java
++++ b/test/distributed/org/apache/cassandra/distributed/test/log/PlacementSimulator.java
+@@ -24,20 +24,13 @@ import java.io.FileNotFoundException;
+ import java.io.FileOutputStream;
+ import java.io.IOException;
+ import java.io.OutputStreamWriter;
+-import java.util.ArrayList;
+-import java.util.Collections;
+-import java.util.HashSet;
+-import java.util.Iterator;
+-import java.util.List;
+-import java.util.Map;
+-import java.util.NavigableMap;
+-import java.util.Random;
+-import java.util.Set;
+-import java.util.TreeMap;
++import java.util.*;
++import java.util.concurrent.atomic.AtomicBoolean;
+ import java.util.function.Function;
+ import java.util.function.Predicate;
+ import java.util.stream.Collectors;
+ 
++import org.apache.cassandra.harry.sut.TokenPlacementModel.Replica;
+ import org.junit.Assert;
+ 
+ import static org.apache.cassandra.harry.sut.TokenPlacementModel.Node;
+@@ -70,16 +63,16 @@ public class PlacementSimulator
+     {
+         public final ReplicationFactor rf;
+         public final List<Node> nodes;
+-        public final NavigableMap<Range, List<Node>> readPlacements;
+-        public final NavigableMap<Range, List<Node>> writePlacements;
++        public final NavigableMap<Range, List<Replica>> readPlacements;
++        public final NavigableMap<Range, List<Replica>> writePlacements;
+         // Stashed states are steps required to finish the operation. For example, in case of
+         // bootstrap, this could be adding replicas to write (and then read) sets after splitting ranges.
+         public final List<Transformations> stashedStates;
+ 
+         public SimulatedPlacements(ReplicationFactor rf,
+                                    List<Node> nodes,
+-                                   NavigableMap<Range, List<Node>> readPlacements,
+-                                   NavigableMap<Range, List<Node>> writePlacements,
++                                   NavigableMap<Range, List<Replica>> readPlacements,
++                                   NavigableMap<Range, List<Replica>> writePlacements,
+                                    List<Transformations> stashedStates)
+         {
+             this.rf = rf;
+@@ -94,12 +87,12 @@ public class PlacementSimulator
+             return new SimulatedPlacements(rf, newNodes, readPlacements, writePlacements, stashedStates);
+         }
+ 
+-        public SimulatedPlacements withReadPlacements(NavigableMap<Range, List<Node>> newReadPlacements)
++        public SimulatedPlacements withReadPlacements(NavigableMap<Range, List<Replica>> newReadPlacements)
+         {
+             return new SimulatedPlacements(rf, nodes, newReadPlacements, writePlacements, stashedStates);
+         }
+ 
+-        public SimulatedPlacements withWritePlacements(NavigableMap<Range, List<Node>> newWritePlacements)
++        public SimulatedPlacements withWritePlacements(NavigableMap<Range, List<Replica>> newWritePlacements)
+         {
+             return new SimulatedPlacements(rf, nodes, readPlacements, newWritePlacements, stashedStates);
+         }
+@@ -123,22 +116,22 @@ public class PlacementSimulator
+ 
+         public boolean isWriteTargetFor(long token, Predicate<Node> predicate)
+         {
+-            return writePlacementsFor(token).stream().anyMatch(predicate);
++            return writePlacementsFor(token).stream().map(Replica::node).anyMatch(predicate);
+         }
+ 
+         public boolean isReadReplicaFor(long token, Predicate<Node> predicate)
+         {
+-            return readReplicasFor(token).stream().anyMatch(predicate);
++            return readReplicasFor(token).stream().map(Replica::node).anyMatch(predicate);
+         }
+ 
+         public boolean isReadReplicaFor(long minToken, long maxToken, Predicate<Node> predicate)
+         {
+-            return readReplicasFor(minToken, maxToken).stream().anyMatch(predicate);
++            return readReplicasFor(minToken, maxToken).stream().map(Replica::node).anyMatch(predicate);
+         }
+ 
+-        public List<Node> writePlacementsFor(long token)
++        public List<Replica> writePlacementsFor(long token)
+         {
+-            for (Map.Entry<Range, List<Node>> e : writePlacements.entrySet())
++            for (Map.Entry<Range, List<Replica>> e : writePlacements.entrySet())
+             {
+                 if (e.getKey().contains(token))
+                     return e.getValue();
+@@ -147,9 +140,9 @@ public class PlacementSimulator
+             throw new AssertionError();
+         }
+ 
+-        public List<Node> readReplicasFor(long minToken, long maxToken)
++        public List<Replica> readReplicasFor(long minToken, long maxToken)
+         {
+-            for (Map.Entry<Range, List<Node>> e : readPlacements.entrySet())
++            for (Map.Entry<Range, List<Replica>> e : readPlacements.entrySet())
+             {
+                 if (e.getKey().contains(minToken, maxToken))
+                     return e.getValue();
+@@ -159,9 +152,9 @@ public class PlacementSimulator
+         }
+ 
+ 
+-        public List<Node> readReplicasFor(long token)
++        public List<Replica> readReplicasFor(long token)
+         {
+-            for (Map.Entry<Range, List<Node>> e : readPlacements.entrySet())
++            for (Map.Entry<Range, List<Replica>> e : readPlacements.entrySet())
+             {
+                 if (e.getKey().contains(token))
+                     return e.getValue();
+@@ -305,15 +298,15 @@ public class PlacementSimulator
+     {
+         long token = bootstrappingNode.token();
+         List<Node> splitNodes = split(baseState.nodes, token);
+-        Map<Range, List<Node>> maximalStateWithPlacement = baseState.rf.replicate(move(splitNodes, token, bootstrappingNode)).placementsForRange;
++        Map<Range, List<Replica>> maximalStateWithPlacement = baseState.rf.replicate(move(splitNodes, token, bootstrappingNode)).placementsForRange;
+ 
+-        NavigableMap<Range, List<Node>> splitReadPlacements = baseState.rf.replicate(splitNodes).placementsForRange;
+-        NavigableMap<Range, List<Node>> splitWritePlacements = baseState.rf.replicate(splitNodes).placementsForRange;
++        NavigableMap<Range, List<Replica>> splitReadPlacements = baseState.rf.replicate(splitNodes).placementsForRange;
++        NavigableMap<Range, List<Replica>> splitWritePlacements = baseState.rf.replicate(splitNodes).placementsForRange;
+ 
+-        Map<Range, Diff<Node>> allWriteCommands = diff(splitWritePlacements, maximalStateWithPlacement);
+-        Map<Range, Diff<Node>> step1WriteCommands = map(allWriteCommands, Diff::onlyAdditions);
+-        Map<Range, Diff<Node>> step3WriteCommands = map(allWriteCommands, Diff::onlyRemovals);
+-        Map<Range, Diff<Node>> readCommands = diff(splitReadPlacements, maximalStateWithPlacement);
++        Map<Range, Diff<Replica>> allWriteCommands = diff(splitWritePlacements, maximalStateWithPlacement);
++        Map<Range, Diff<Replica>> step1WriteCommands = map(allWriteCommands, PlacementSimulator::additionsAndTransientToFull);
++        Map<Range, Diff<Replica>> step3WriteCommands = map(allWriteCommands, PlacementSimulator::removalsAndFullToTransient);
++        Map<Range, Diff<Replica>> readCommands = diff(splitReadPlacements, maximalStateWithPlacement);
+ 
+         Transformations steps = new Transformations();
+ 
+@@ -344,7 +337,7 @@ public class PlacementSimulator
+             },
+             (model) -> { // revert
+                 debug.log("Reverting start-join of " + bootstrappingNode + "\n");
+-                Map<Range, Diff<Node>> inverted = map(step1WriteCommands, Diff::invert);
++                Map<Range, Diff<Replica>> inverted = map(step1WriteCommands, Diff::invert);
+                 debug.log("Commands for reverting step 1 of bootstrap of %s.\n" +
+                           "\twriteModifications=\n%s",
+                           bootstrappingNode, diffsToString(inverted));
+@@ -363,7 +356,7 @@ public class PlacementSimulator
+             },
+             (model) -> {  // revert
+                 debug.log("Reverting mid-join of " + bootstrappingNode + "\n");
+-                Map<Range, Diff<Node>> inverted = map(readCommands, Diff::invert);
++                Map<Range, Diff<Replica>> inverted = map(readCommands, Diff::invert);
+                 debug.log(String.format("Commands for reverting step 2 of bootstrap of %s.\n" +
+                                         "\treadCommands=\n%s",
+                                         bootstrappingNode, diffsToString(inverted)));
+@@ -408,10 +401,12 @@ public class PlacementSimulator
+         finalNodes.add(movingNode.overrideToken(newToken));
+         finalNodes.sort(Node::compareTo);
+ 
+-        Map<Range, List<Node>> start = splitReplicated(baseState.rf.replicate(origNodes).placementsForRange, newToken);
+-        Map<Range, List<Node>> end = splitReplicated(baseState.rf.replicate(finalNodes).placementsForRange, movingNode.token());
++        Map<Range, List<Replica>> start = splitReplicated(baseState.rf.replicate(origNodes).placementsForRange, newToken);
++        Map<Range, List<Replica>> end = splitReplicated(baseState.rf.replicate(finalNodes).placementsForRange, movingNode.token());
+ 
+-        Map<Range, Diff<Node>> fromStartToEnd = diff(start, end);
++        Map<Range, Diff<Replica>> fromStartToEnd = diff(start, end);
++        Map<Range, Diff<Replica>> startMoveCommands = map(fromStartToEnd, PlacementSimulator::additionsAndTransientToFull);
++        Map<Range, Diff<Replica>> finishMoveCommands = map(fromStartToEnd, PlacementSimulator::removalsAndFullToTransient);
+ 
+         Transformations steps = new Transformations();
+ 
+@@ -432,20 +427,18 @@ public class PlacementSimulator
+         // Step 2: Start Move, add all potential owners to write quorums
+         steps.add(new Transformation(
+             (model) -> { // apply
+-                Map<Range, Diff<Node>> diff = map(fromStartToEnd, Diff::onlyAdditions);
+                 debug.log("Executing start-move of " + movingNode + "\n");
+                 debug.log(String.format("Commands for step 1 of move of %s to %d.\n" +
+                                         "\twriteModifications=\n%s",
+-                                        movingNode, newToken, diffsToString(diff)));
++                                        movingNode, newToken, diffsToString(startMoveCommands)));
+ 
+-                NavigableMap<Range, List<Node>> placements = model.writePlacements;
+-                placements = PlacementSimulator.apply(placements, diff);
++                NavigableMap<Range, List<Replica>> placements = model.writePlacements;
++                placements = PlacementSimulator.apply(placements, startMoveCommands);
+                 return model.withWritePlacements(placements);
+             },
+             (model) -> { // revert
+                 debug.log("Reverting start-move of " + movingNode + "\n");
+-                Map<Range, Diff<Node>> diff = map(fromStartToEnd, Diff::onlyAdditions);
+-                Map<Range, Diff<Node>> inverted = map(diff, Diff::invert);
++                Map<Range, Diff<Replica>> inverted = map(startMoveCommands, Diff::invert);
+                 debug.log(String.format("Commands for reverting step 1 of move of %s to %d.\n" +
+                                         "\twriteModifications=\n%s",
+                                         movingNode, newToken, diffsToString(inverted)));
+@@ -461,12 +454,12 @@ public class PlacementSimulator
+                                         "\treadModifications=\n%s",
+                                         movingNode, newToken, diffsToString(fromStartToEnd)));
+ 
+-                NavigableMap<Range, List<Node>> placements = model.readPlacements;
++                NavigableMap<Range, List<Replica>> placements = model.readPlacements;
+                 placements = PlacementSimulator.apply(placements, fromStartToEnd);
+                 return model.withReadPlacements(placements);
+             },
+             (model) -> {
+-                NavigableMap<Range, List<Node>> placements = PlacementSimulator.apply(model.readPlacements, map(fromStartToEnd, Diff::invert));
++                NavigableMap<Range, List<Replica>> placements = PlacementSimulator.apply(model.readPlacements, map(fromStartToEnd, Diff::invert));
+                 return model.withReadPlacements(placements);
+             })
+         );
+@@ -474,12 +467,10 @@ public class PlacementSimulator
+         // Step 4: Finish Move, remove all nodes that are losing ranges from write quorums
+         steps.add(new Transformation(
+             (model) -> {
+-                Map<Range, Diff<Node>> diff = map(fromStartToEnd, Diff::onlyRemovals);
+-
+                 debug.log("Executing finish-move of " + movingNode + "\n");
+                 debug.log(String.format("Commands for step 2 of move of %s to %d.\n" +
+                                         "\twriteModifications=\n%s",
+-                                        movingNode, newToken, diffsToString(diff)));
++                                        movingNode, newToken, diffsToString(finishMoveCommands)));
+ 
+                 List<Node> currentNodes = new ArrayList<>(model.nodes);
+                 List<Node> newNodes = new ArrayList<>();
+@@ -492,8 +483,8 @@ public class PlacementSimulator
+                 newNodes.add(movingNode.overrideToken(newToken));
+                 newNodes.sort(Node::compareTo);
+ 
+-                Map<Range, List<Node>> writePlacements = model.writePlacements;
+-                writePlacements = PlacementSimulator.apply(writePlacements, diff);
++                Map<Range, List<Replica>> writePlacements = model.writePlacements;
++                writePlacements = PlacementSimulator.apply(writePlacements, finishMoveCommands);
+ 
+                 return model.withWritePlacements(mergeReplicated(writePlacements, movingNode.token()))
+                             .withReadPlacements(mergeReplicated(model.readPlacements, movingNode.token()))
+@@ -510,18 +501,50 @@ public class PlacementSimulator
+     public static Transformations leave(SimulatedPlacements baseState, Node toRemove)
+     {
+         // calculate current placements - this is start state
+-        Map<Range, List<Node>> start = baseState.rf.replicate(baseState.nodes).placementsForRange;
++        Map<Range, List<Replica>> start = baseState.rf.replicate(baseState.nodes).placementsForRange;
+ 
+         List<Node> afterLeaveNodes = new ArrayList<>(baseState.nodes);
+         afterLeaveNodes.remove(toRemove);
+         // calculate placements based on existing ranges but final set of nodes - this is end state
+-        Map<Range, List<Node>> end = baseState.rf.replicate(toRanges(baseState.nodes), afterLeaveNodes).placementsForRange;
++        Map<Range, List<Replica>> end = baseState.rf.replicate(toRanges(baseState.nodes), afterLeaveNodes).placementsForRange;
+ 
+         // maximal state is union of start & end
+-        Map<Range, Diff<Node>> allWriteCommands = diff(start, end);
+-        Map<Range, Diff<Node>> step1WriteCommands = map(allWriteCommands, Diff::onlyAdditions);
+-        Map<Range, Diff<Node>> step3WriteCommands = map(allWriteCommands, Diff::onlyRemovals);
+-        Map<Range, Diff<Node>> readCommands = diff(start, end);
++        Map<Range, Diff<Replica>> allWriteCommands = diff(start, end);
++        Map<Range, Diff<Replica>> step1WriteCommands = map(allWriteCommands, PlacementSimulator::additionsAndTransientToFull);
++        Map<Range, Diff<Replica>> step3WriteCommands = map(allWriteCommands, PlacementSimulator::removalsAndFullToTransient);
++        Map<Range, Diff<Replica>> readCommands = diff(start, end);
++
++        // Assert that the proposed plan would not violate consistency if used with the current streaming
++        // implementation (i.e. UnbootstrapStreams::movementMap).
++        AtomicBoolean safeForStreaming = new AtomicBoolean(true);
++        step1WriteCommands.forEach((range, diff) -> {
++            for (Replica add : diff.additions)
++            {
++                if (add.isFull())  // for each new FULL replica
++                {
++                    diff.removals.stream()
++                                 .filter(r -> r.node().equals(add.node()) && r.isTransient())  // if the same node is being removed as a TRANSIENT replica
++                                 .findFirst()
++                                 .ifPresent(r -> {
++                                     if (!start.get(range).contains(new Replica(toRemove, true)))  // check the leaving node is a FULL replica for the range
++                                     {
++                                         debug.log(String.format("In prepare-leave of %s, node %s moving from transient to " +
++                                                                 "full, but the leaving node is not a full replica for " +
++                                                                 "the transitioning range %s.",
++                                                                 toRemove, add, range));
++                                         safeForStreaming.getAndSet(false);
++                                     }
++                                 });
++                }
++            }
++        });
++        assert safeForStreaming.get() : String.format("Removal of node %s causes some nodes to move from transient to " +
++                                                      "full replicas for some range where the leaving node is not " +
++                                                      "initially a full replica. This may violate consistency as the " +
++                                                      "streaming implementation assumes that the leaving node is a " +
++                                                      "valid source for streaming in this case. See ./simulated.log " +
++                                                      "for details of the ranges and nodes in question", toRemove);
++
+         Transformations steps = new Transformations();
+         steps.add(new Transformation(
+             (model) -> { // apply
+@@ -533,7 +556,7 @@ public class PlacementSimulator
+             },
+             (model) -> { // revert
+                 debug.log("Reverting start-leave of " + toRemove + "\n");
+-                Map<Range, Diff<Node>> inverted = map(step1WriteCommands, Diff::invert);
++                Map<Range, Diff<Replica>> inverted = map(step1WriteCommands, Diff::invert);
+                 debug.log(String.format("Commands for reverting step 1 of decommission of %s.\n" +
+                                         "\twriteModifications=\n%s",
+                                         toRemove, diffsToString(inverted)));
+@@ -552,7 +575,7 @@ public class PlacementSimulator
+             },
+             (model) -> { // revert
+                 debug.log("Reverting mid-leave of " + toRemove + "\n");
+-                Map<Range, Diff<Node>> inverted = map(readCommands, Diff::invert);
++                Map<Range, Diff<Replica>> inverted = map(readCommands, Diff::invert);
+                 debug.log(String.format("Commands for reverting step 2 of decommission of %s.\n" +
+                                         "\treadModifications=\n%s",
+                                         toRemove,
+@@ -571,7 +594,7 @@ public class PlacementSimulator
+                 List<Node> newNodes = new ArrayList<>(model.nodes);
+                 newNodes.remove(toRemove);
+                 newNodes.sort(Node::compareTo);
+-                Map<Range, List<Node>> writes = PlacementSimulator.apply(model.writePlacements, step3WriteCommands);
++                Map<Range, List<Replica>> writes = PlacementSimulator.apply(model.writePlacements, step3WriteCommands);
+                 return model.withReadPlacements(mergeReplicated(model.readPlacements, toRemove.token()))
+                             .withWritePlacements(mergeReplicated(writes, toRemove.token()))
+                             .withNodes(newNodes);
+@@ -586,18 +609,19 @@ public class PlacementSimulator
+ 
+     public static Transformations replace(SimulatedPlacements baseState, Node toReplace, Node replacement)
+     {
+-        Map<Range, List<Node>> start = baseState.rf.replicate(baseState.nodes).placementsForRange;
+-        Map<Range, Diff<Node>> allCommands = new TreeMap<>();
+-        start.forEach((range, nodes) -> {
+-            if (nodes.contains(toReplace))
+-            {
+-                allCommands.put(range, new Diff<>(Collections.singletonList(replacement),
+-                                                  Collections.singletonList(toReplace)));
+-            }
++        Map<Range, List<Replica>> start = baseState.rf.replicate(baseState.nodes).placementsForRange;
++        Map<Range, Diff<Replica>> allCommands = new TreeMap<>();
++        start.forEach((range, replicas) -> {
++            replicas.forEach(r -> {
++                if (r.node().equals(toReplace)) {
++                    allCommands.put(range, new Diff<>(Collections.singletonList(new Replica(replacement, r.isFull())),
++                                                      Collections.singletonList(r)));
++                }
++            });
+         });
+-        Map<Range, Diff<Node>> step1WriteCommands = map(allCommands, Diff::onlyAdditions);
+-        Map<Range, Diff<Node>> step3WriteCommands = map(allCommands, Diff::onlyRemovals);
+-        Map<Range, Diff<Node>> readCommands = allCommands;
++        Map<Range, Diff<Replica>> step1WriteCommands = map(allCommands, Diff::onlyAdditions);
++        Map<Range, Diff<Replica>> step3WriteCommands = map(allCommands, Diff::onlyRemovals);
++        Map<Range, Diff<Replica>> readCommands = allCommands;
+         Transformations steps = new Transformations();
+         steps.add(new Transformation(
+             (model) -> { // apply
+@@ -609,7 +633,7 @@ public class PlacementSimulator
+             },
+             (model) -> { // revert
+                 debug.log(String.format("Reverting start-replace of %s for  %s\n", replacement, toReplace));
+-                Map<Range, Diff<Node>> inverted = map(step1WriteCommands, Diff::invert);
++                Map<Range, Diff<Replica>> inverted = map(step1WriteCommands, Diff::invert);
+                 debug.log(String.format("Commands for reverting step 1 of bootstrap of %s for replacement of %s.\n" +
+                                         "\twriteModifications=\n%s",
+                                         replacement, toReplace, diffsToString(inverted)));
+@@ -628,7 +652,7 @@ public class PlacementSimulator
+             },
+             (model) -> { // revert
+                 debug.log(String.format("Reverting mid-replace of %s for %s\n", replacement, toReplace));
+-                Map<Range, Diff<Node>> inverted = map(readCommands, Diff::invert);
++                Map<Range, Diff<Replica>> inverted = map(readCommands, Diff::invert);
+                 debug.log(String.format("Commands for reverting step 2 of bootstrap of %s for replacement of %s.\n" +
+                                         "\treadModifications=\n%s",
+                                         replacement, toReplace,
+@@ -660,13 +684,13 @@ public class PlacementSimulator
+         return steps;
+     }
+ 
+-    public static void assertPlacements(SimulatedPlacements placements, Map<Range, List<Node>> r, Map<Range, List<Node>> w)
++    public static void assertPlacements(SimulatedPlacements placements, Map<Range, List<Replica>> r, Map<Range, List<Replica>> w)
+     {
+         assertRanges(r, placements.readPlacements);
+         assertRanges(w, placements.writePlacements);
+     }
+ 
+-    public static void assertRanges(Map<Range, List<Node>> expected, Map<Range, List<Node>> actual)
++    public static void assertRanges(Map<Range, List<Replica>> expected, Map<Range, List<Replica>> actual)
+     {
+         Assert.assertEquals(expected.keySet(), actual.keySet());
+         expected.forEach((k, v) -> {
+@@ -677,8 +701,8 @@ public class PlacementSimulator
+             // bootstrap_diffBased implementation and the real code doesn't do this, only the endpoint matters for
+             // correctness, so we limit this comparison to endpoints only.
+             Assert.assertEquals(String.format("For key: %s\n", k),
+-                                expected.get(k).stream().map(n -> n.idx()).sorted().collect(Collectors.toList()),
+-                                actual.get(k).stream().map(n -> n.idx()).sorted().collect(Collectors.toList()));
++                                expected.get(k).stream().map(r -> r.node().idx()).sorted().collect(Collectors.toList()),
++                                actual.get(k).stream().map(r -> r.node().idx()).sorted().collect(Collectors.toList()));
+         });
+     }
+ 
+@@ -696,15 +720,15 @@ public class PlacementSimulator
+     /**
+      * Applies a given diff to the placement map
+      */
+-    public static NavigableMap<Range, List<Node>> apply(Map<Range, List<Node>> orig, Map<Range, Diff<Node>> diff)
++    public static NavigableMap<Range, List<Replica>> apply(Map<Range, List<Replica>> orig, Map<Range, Diff<Replica>> diff)
+     {
+         assert containsAll(orig.keySet(), diff.keySet()) : String.format("Can't apply diff to a map with different sets of keys:" +
+                                                                          "\nOrig ks: %s" +
+                                                                          "\nDiff ks: %s" +
+                                                                          "\nDiff: %s",
+                                                                          orig.keySet(), diff.keySet(), diff);
+-        NavigableMap<Range, List<Node>> res = new TreeMap<>();
+-        for (Map.Entry<Range, List<Node>> entry : orig.entrySet())
++        NavigableMap<Range, List<Replica>> res = new TreeMap<>();
++        for (Map.Entry<Range, List<Replica>> entry : orig.entrySet())
+         {
+             Range range = entry.getKey();
+             if (diff.containsKey(range))
+@@ -718,28 +742,28 @@ public class PlacementSimulator
+     /**
+      * Apply diff to a list of nodes
+      */
+-    public static List<Node> apply(List<Node> nodes, Diff<Node> diff)
++    public static List<Replica> apply(List<Replica> nodes, Diff<Replica> diff)
+     {
+-        Set<Node> tmp = new HashSet<>(nodes);
++        Set<Replica> tmp = new HashSet<>(nodes);
+         tmp.addAll(diff.additions);
+-        for (Node removal : diff.removals)
++        for (Replica removal : diff.removals)
+             tmp.remove(removal);
+-        List<Node> newNodes = new ArrayList<>(tmp);
+-        newNodes.sort(Node::compareTo);
+-        return Collections.unmodifiableList(newNodes);
++        List<Replica> newReplicas = new ArrayList<>(tmp);
++        newReplicas.sort(Comparator.comparing(Replica::node));
++        return Collections.unmodifiableList(newReplicas);
+     }
+ 
+     /**
+      * Diff two placement maps
+      */
+-    public static Map<Range, Diff<Node>> diff(Map<Range, List<Node>> l, Map<Range, List<Node>> r)
++    public static Map<Range, Diff<Replica>> diff(Map<Range, List<Replica>> l, Map<Range, List<Replica>> r)
+     {
+         assert l.keySet().equals(r.keySet()) : String.format("Can't diff events from different bases %s %s", l.keySet(), r.keySet());
+-        Map<Range, Diff<Node>> diff = new TreeMap<>();
+-        for (Map.Entry<Range, List<Node>> entry : l.entrySet())
++        Map<Range, Diff<Replica>> diff = new TreeMap<>();
++        for (Map.Entry<Range, List<Replica>> entry : l.entrySet())
+         {
+             Range range = entry.getKey();
+-            Diff<Node> d = diff(entry.getValue(), r.get(range));
++            Diff<Replica> d = diff(entry.getValue(), r.get(range));
+             if (!d.removals.isEmpty() || !d.additions.isEmpty())
+                 diff.put(range, d);
+         }
+@@ -770,17 +794,17 @@ public class PlacementSimulator
+      * Produce a diff (i.e. set of additions/subtractions that should be applied to the list of nodes in order to produce
+      * r from l)
+      */
+-    public static Diff<Node> diff(List<Node> l, List<Node> r)
++    public static Diff<Replica> diff(List<Replica> l, List<Replica> r)
+     {
+         // additions things present in r but not in l
+-        List<Node> additions = new ArrayList<>();
++        List<Replica> additions = new ArrayList<>();
+         // removals are things present in l but not r
+-        List<Node> removals = new ArrayList<>();
++        List<Replica> removals = new ArrayList<>();
+ 
+-        for (Node i : r)
++        for (Replica i : r)
+         {
+             boolean isPresentInL = false;
+-            for (Node j : l)
++            for (Replica j : l)
+             {
+                 if (i.equals(j))
+                 {
+@@ -793,10 +817,10 @@ public class PlacementSimulator
+                 additions.add(i);
+         }
+ 
+-        for (Node i : l)
++        for (Replica i : l)
+         {
+             boolean isPresentInR = false;
+-            for (Node j : r)
++            for (Replica j : r)
+             {
+                 if (i.equals(j))
+                 {
+@@ -811,15 +835,15 @@ public class PlacementSimulator
+         return new Diff<>(additions, removals);
+     }
+ 
+-    public static Map<Range, List<Node>> superset(Map<Range, List<Node>> l, Map<Range, List<Node>> r)
++    public static Map<Range, List<Replica>> superset(Map<Range, List<Replica>> l, Map<Range, List<Replica>> r)
+     {
+         assert l.keySet().equals(r.keySet()) : String.format("%s != %s", l.keySet(), r.keySet());
+ 
+-        Map<Range, List<Node>> newState = new TreeMap<>();
+-        for (Map.Entry<Range, List<Node>> entry : l.entrySet())
++        Map<Range, List<Replica>> newState = new TreeMap<>();
++        for (Map.Entry<Range, List<Replica>> entry : l.entrySet())
+         {
+             Range range = entry.getKey();
+-            Set<Node> nodes = new HashSet<>();
++            Set<Replica> nodes = new HashSet<>();
+             nodes.addAll(entry.getValue());
+             nodes.addAll(r.get(range));
+             newState.put(range, new ArrayList<>(nodes));
+@@ -828,22 +852,22 @@ public class PlacementSimulator
+         return newState;
+     }
+ 
+-    public static NavigableMap<Range, List<Node>> mergeReplicated(Map<Range, List<Node>> orig, long removingToken)
++    public static NavigableMap<Range, List<Replica>> mergeReplicated(Map<Range, List<Replica>> orig, long removingToken)
+     {
+         if (removingToken == Long.MIN_VALUE)
+         {
+             Assert.assertEquals(Long.MIN_VALUE, orig.entrySet().iterator().next().getKey().start);
+             return new TreeMap<>(orig);
+         }
+-        NavigableMap<Range, List<Node>> newState = new TreeMap<>();
+-        Iterator<Map.Entry<Range, List<Node>>> iter = orig.entrySet().iterator();
++        NavigableMap<Range, List<Replica>> newState = new TreeMap<>();
++        Iterator<Map.Entry<Range, List<Replica>>> iter = orig.entrySet().iterator();
+         while (iter.hasNext())
+         {
+-            Map.Entry<Range, List<Node>> current = iter.next();
++            Map.Entry<Range, List<Replica>> current = iter.next();
+             if (current.getKey().end == removingToken)
+             {
+                 assert iter.hasNext() : "Cannot merge range, no more ranges in list";
+-                Map.Entry<Range, List<Node>> next = iter.next();
++                Map.Entry<Range, List<Replica>> next = iter.next();
+                 assert current.getValue().containsAll(next.getValue()) && current.getValue().size() == next.getValue().size()
+                 : "Cannot merge ranges with different replica groups";
+                 Range merged = new Range(current.getKey().start, next.getKey().end);
+@@ -858,15 +882,15 @@ public class PlacementSimulator
+         return newState;
+     }
+ 
+-    public static NavigableMap<Range, List<Node>> splitReplicated(Map<Range, List<Node>> orig, long splitAt)
++    public static NavigableMap<Range, List<Replica>> splitReplicated(Map<Range, List<Replica>> orig, long splitAt)
+     {
+         if (splitAt == Long.MIN_VALUE)
+         {
+             Assert.assertEquals(Long.MIN_VALUE, orig.entrySet().iterator().next().getKey().start);
+             return new TreeMap<>(orig);
+         }
+-        NavigableMap<Range, List<Node>> newState = new TreeMap<>();
+-        for (Map.Entry<Range, List<Node>> entry : orig.entrySet())
++        NavigableMap<Range, List<Replica>> newState = new TreeMap<>();
++        for (Map.Entry<Range, List<Replica>> entry : orig.entrySet())
+         {
+             Range range = entry.getKey();
+             if (range.contains(splitAt))
+@@ -948,7 +972,8 @@ public class PlacementSimulator
+         return Collections.unmodifiableList(newNodes);
+     }
+ 
+-    public static class Diff<T> {
++    public static class Diff<T>
++    {
+         public final List<T> additions;
+         public final List<T> removals;
+ 
+@@ -985,20 +1010,88 @@ public class PlacementSimulator
+         }
+     }
+ 
+-    public static String diffsToString(Map<Range, Diff<Node>> placements)
++    public static Diff<Replica> additionsAndTransientToFull(Diff<Replica> unfiltered)
++    {
++        if (unfiltered.additions.isEmpty())
++            return null;
++        List<Replica> additions = new ArrayList<>(unfiltered.additions.size());
++        List<Replica> removals = new ArrayList<>(unfiltered.additions.size());
++        for (Replica added : unfiltered.additions)
++        {
++            // Include any new FULL replicas here. If there exists the removal of a corresponding Transient
++            // replica (i.e. a switch from T -> F), add that too. We want T -> F transitions to happen early
++            // in a multi-step operation, at the same time as new write replicas are added.
++            if (added.isFull())
++            {
++                additions.add(added);
++                Optional<Replica> removed = unfiltered.removals.stream()
++                                                               .filter(r -> r.isTransient() && r.node().equals(added.node()))
++                                                               .findFirst();
++
++                removed.ifPresent(removals::add);
++            }
++            else
++            {
++                // Conversely, when a replica transitions from F -> T, it's enacted late in a multi-step operation.
++                // So only include TRANSIENT additions if there is no removal of a corresponding FULL replica.
++                boolean include = unfiltered.removals.stream()
++                                                     .noneMatch(removed -> removed.node().equals(added.node())
++                                                                           && removed.isFull());
++                if (include)
++                    additions.add(added);
++            }
++        }
++        return new Diff<>(additions, removals);
++    }
++
++    public static Diff<Replica> removalsAndFullToTransient(Diff<Replica> unfiltered)
++    {
++        if (unfiltered.removals.isEmpty())
++            return null;
++        List<Replica> additions = new ArrayList<>(unfiltered.removals.size());
++        List<Replica> removals = new ArrayList<>(unfiltered.removals.size());
++        for (Replica removed : unfiltered.removals)
++        {
++            // Include any new FULL replicas here. If there exists the removal of a corresponding Transient
++            // replica (i.e. a switch from T -> F), add that too. We want T -> F transitions to happen early
++            // in a multi-step operation, at the same time as new write replicas are added.
++            if (removed.isFull())
++            {
++                removals.add(removed);
++                Optional<Replica> added = unfiltered.additions.stream()
++                                                               .filter(r -> r.isTransient() && r.node().equals(removed.node()))
++                                                               .findFirst();
++
++                added.ifPresent(additions::add);
++            }
++            else
++            {
++                // Conversely, when a replica transitions from F -> T, it's enacted late in a multi-step operation.
++                // So only include TRANSIENT additions if there is no removal of a corresponding FULL replica.
++                boolean include = unfiltered.additions.stream()
++                                                     .noneMatch(added -> added.node().equals(removed.node())
++                                                                           && added.isFull());
++                if (include)
++                    removals.add(removed);
++            }
++        }
++        return new Diff<>(additions, removals);
++    }
++
++    public static String diffsToString(Map<Range, Diff<Replica>> placements)
+     {
+         StringBuilder builder = new StringBuilder();
+-        for (Map.Entry<Range, Diff<Node>> e : placements.entrySet())
++        for (Map.Entry<Range, Diff<Replica>> e : placements.entrySet())
+         {
+             builder.append("\t\t").append(e.getKey()).append(": ").append(e.getValue()).append("\n");
+         }
+         return builder.toString();
+     }
+ 
+-    public static String placementsToString(Map<Range, List<Node>> placements)
++    public static String placementsToString(Map<Range, List<Replica>> placements)
+     {
+         StringBuilder builder = new StringBuilder();
+-        for (Map.Entry<Range, List<Node>> e : placements.entrySet())
++        for (Map.Entry<Range, List<Replica>> e : placements.entrySet())
+         {
+             builder.append("\t\t").append(e.getKey()).append(": ").append(e.getValue()).append("\n");
+         }
+diff --git a/test/distributed/org/apache/cassandra/distributed/test/log/PlacementSimulatorTest.java b/test/distributed/org/apache/cassandra/distributed/test/log/PlacementSimulatorTest.java
+index 0b47acb641..386af0d3a0 100644
+--- a/test/distributed/org/apache/cassandra/distributed/test/log/PlacementSimulatorTest.java
++++ b/test/distributed/org/apache/cassandra/distributed/test/log/PlacementSimulatorTest.java
+@@ -29,6 +29,7 @@ import java.util.Random;
+ import java.util.concurrent.atomic.AtomicInteger;
+ import java.util.function.Supplier;
+ 
++import org.apache.cassandra.harry.sut.TokenPlacementModel.Replica;
+ import org.junit.Test;
+ 
+ import org.apache.cassandra.harry.sut.TokenPlacementModel;
+@@ -395,8 +396,8 @@ public class PlacementSimulatorTest
+                                    Supplier<Transformations> opProvider,
+                                    int stepsToExecute)
+     {
+-        Map<Range, List<Node>> startingReadPlacements = sim.readPlacements;
+-        Map<Range, List<Node>> startingWritePlacements = sim.writePlacements;
++        Map<Range, List<Replica>> startingReadPlacements = sim.readPlacements;
++        Map<Range, List<Replica>> startingWritePlacements = sim.writePlacements;
+         Transformations steps = opProvider.get();
+         sim = sim.withStashed(steps);
+         // execute the required steps
+diff --git a/test/harry/main/org/apache/cassandra/harry/model/QuiescentLocalStateCheckerBase.java b/test/harry/main/org/apache/cassandra/harry/model/QuiescentLocalStateCheckerBase.java
+index c47657c057..3a611bc7de 100644
+--- a/test/harry/main/org/apache/cassandra/harry/model/QuiescentLocalStateCheckerBase.java
++++ b/test/harry/main/org/apache/cassandra/harry/model/QuiescentLocalStateCheckerBase.java
+@@ -21,6 +21,7 @@ package org.apache.cassandra.harry.model;
+ import java.util.ArrayList;
+ import java.util.List;
+ 
++import org.apache.cassandra.harry.sut.TokenPlacementModel.Replica;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
+@@ -91,15 +92,15 @@ public abstract class QuiescentLocalStateCheckerBase extends QuiescentChecker
+     protected void validate(Query query, TokenPlacementModel.ReplicatedRanges ring)
+     {
+         CompiledStatement compiled = query.toSelectStatement();
+-        List<Node> replicas = ring.replicasFor(token(query.pd));
++        List<Replica> replicas = ring.replicasFor(token(query.pd));
+ 
+         logger.trace("Predicted {} as replicas for {}. Ring: {}", replicas, query.pd, ring);
+-        for (Node node : replicas)
++        for (Replica replica : replicas)
+         {
+             try
+             {
+                 validate(() -> {
+-                    Object[][] objects = executeNodeLocal(compiled.cql(), node, compiled.bindings());
++                    Object[][] objects = executeNodeLocal(compiled.cql(), replica.node(), compiled.bindings());
+ 
+                     List<ResultSetRow> result = new ArrayList<>();
+                     for (Object[] obj : objects)
+@@ -111,7 +112,7 @@ public abstract class QuiescentLocalStateCheckerBase extends QuiescentChecker
+             catch (ValidationException e)
+             {
+                 throw new AssertionError(String.format("Caught error while validating replica %s of replica set %s",
+-                                                       node, replicas),
++                                                       replica, replicas),
+                                          e);
+             }
+         }
+diff --git a/test/harry/main/org/apache/cassandra/harry/sut/TokenPlacementModel.java b/test/harry/main/org/apache/cassandra/harry/sut/TokenPlacementModel.java
+index ba8f85664c..a25d1ffc6e 100644
+--- a/test/harry/main/org/apache/cassandra/harry/sut/TokenPlacementModel.java
++++ b/test/harry/main/org/apache/cassandra/harry/sut/TokenPlacementModel.java
+@@ -22,12 +22,15 @@ import java.net.InetAddress;
+ import java.net.UnknownHostException;
+ import java.util.*;
+ import java.util.function.Function;
++import java.util.stream.Collectors;
+ 
+ import org.apache.cassandra.dht.Murmur3Partitioner;
+ import org.apache.cassandra.distributed.api.TokenSupplier;
+ import org.apache.cassandra.harry.gen.rng.PCGFastPure;
+ import org.apache.cassandra.locator.InetAddressAndPort;
++import org.apache.cassandra.locator.SimpleStrategy;
+ import org.apache.cassandra.schema.KeyspaceParams;
++import org.apache.cassandra.schema.ReplicationParams;
+ import org.apache.cassandra.tcm.ClusterMetadata;
+ import org.apache.cassandra.tcm.membership.Location;
+ import org.apache.cassandra.tcm.membership.NodeId;
+@@ -36,11 +39,15 @@ public class TokenPlacementModel
+ {
+     public abstract static class ReplicationFactor
+     {
+-        private final int nodesTotal;
++        protected final Lookup lookup;
++        protected final int nodesTotal;
++        protected final Map<String, DCReplicas> replication;
+ 
+-        public ReplicationFactor(int total)
++        public ReplicationFactor(Function<Lookup, Map<String, DCReplicas>> perDcMapProvider)
+         {
+-            this.nodesTotal = total;
++            this.lookup = new DefaultLookup();
++            this.replication = perDcMapProvider.apply(lookup);
++            this.nodesTotal = replication.values().stream().map(r -> r.totalCount).reduce(0, Integer::sum);
+         }
+ 
+         public int total()
+@@ -48,11 +55,17 @@ public class TokenPlacementModel
+             return nodesTotal;
+         }
+ 
+-        public abstract int dcs();
++        public int dcs()
++        {
++            return replication.size();
++        };
+ 
+         public abstract KeyspaceParams asKeyspaceParams();
+ 
+-        public abstract Map<String, Integer> asMap();
++        public Map<String, DCReplicas> asMap()
++        {
++            return replication;
++        }
+ 
+         public ReplicatedRanges replicate(List<Node> nodes)
+         {
+@@ -62,18 +75,34 @@ public class TokenPlacementModel
+         public abstract ReplicatedRanges replicate(Range[] ranges, List<Node> nodes);
+     }
+ 
++    public static class DCReplicas
++    {
++        public final int totalCount;
++        public final int transientCount;
++        public DCReplicas(int totalCount, int transientCount)
++        {
++            this.totalCount = totalCount;
++            this.transientCount = transientCount;
++        }
++
++        public String toString()
++        {
++            return totalCount + ((transientCount > 0) ? "/" + transientCount : "");
++        }
++    }
++
+     public static class ReplicatedRanges
+     {
+         public final Range[] ranges;
+-        public final NavigableMap<Range, List<Node>> placementsForRange;
++        public final NavigableMap<Range, List<Replica>> placementsForRange;
+ 
+-        public ReplicatedRanges(Range[] ranges, NavigableMap<Range, List<Node>> placementsForRange)
++        public ReplicatedRanges(Range[] ranges, NavigableMap<Range, List<Replica>> placementsForRange)
+         {
+             this.ranges = ranges;
+             this.placementsForRange = placementsForRange;
+         }
+ 
+-        public List<Node> replicasFor(long token)
++        public List<Replica> replicasFor(long token)
+         {
+             int idx = indexedBinarySearch(ranges, range -> {
+                 // exclusive start, so token at the start belongs to a lower range
+@@ -89,7 +118,7 @@ public class TokenPlacementModel
+             return placementsForRange.get(ranges[idx]);
+         }
+ 
+-        public NavigableMap<Range, List<Node>> asMap()
++        public NavigableMap<Range, List<Replica>> asMap()
+         {
+             return placementsForRange;
+         }
+@@ -121,12 +150,12 @@ public class TokenPlacementModel
+         int compareTo(V v);
+     }
+ 
+-    public static void addIfUnique(List<Node> nodes, Set<Integer> names, Node node)
++    public static void addIfUnique(List<Replica> replicas, Set<Integer> names, Replica replica)
+     {
+-        if (names.contains(node.idx()))
++        if (names.contains(replica.node().idx()))
+             return;
+-        nodes.add(node);
+-        names.add(node.idx());
++        replicas.add(replica);
++        names.add(replica.node().idx());
+     }
+ 
+     /**
+@@ -199,41 +228,28 @@ public class TokenPlacementModel
+ 
+     public static class NtsReplicationFactor extends ReplicationFactor
+     {
+-        private final Lookup lookup = new DefaultLookup();
+         private KeyspaceParams keyspaceParams;
+-        private final Map<String, Integer> map;
+ 
+         public NtsReplicationFactor(int... nodesPerDc)
+         {
+-            super(total(nodesPerDc));
+-            this.map = toMap(nodesPerDc, lookup);
++            super(mapFunction(nodesPerDc));
+         }
+ 
+         public NtsReplicationFactor(int dcs, int nodesPerDc)
+         {
+-            super(dcs * nodesPerDc);
+-            int[] counts = new int[dcs];
+-            Arrays.fill(counts, nodesPerDc);
+-            this.map = toMap(counts, lookup);
++            this(dcs, nodesPerDc, 0);
+         }
+ 
+-        public NtsReplicationFactor(Map<String, Integer> m)
++        public NtsReplicationFactor(int dcs, int nodesPerDc, int transientPerDc)
+         {
+-            super(m.values().stream().reduce(0, Integer::sum));
+-            this.map = m;
++            super(mapFunction(dcs, nodesPerDc, transientPerDc));
++            if (transientPerDc >= nodesPerDc)
++                throw new IllegalArgumentException("Transient replicas must be zero, or less than total replication factor per dc");
+         }
+ 
+-        private static int total(int... num)
+-        {
+-            int tmp = 0;
+-            for (int i : num)
+-                tmp += i;
+-            return tmp;
+-        }
+-
+-        public int dcs()
++        public NtsReplicationFactor(Map<String, Integer> m)
+         {
+-            return map.size();
++            super((lookup) -> m.entrySet().stream().collect(Collectors.toMap(Map.Entry::getKey, e -> new DCReplicas(e.getValue(), 0))));
+         }
+ 
+         public KeyspaceParams asKeyspaceParams()
+@@ -243,17 +259,12 @@ public class TokenPlacementModel
+             return this.keyspaceParams;
+         }
+ 
+-        public Map<String, Integer> asMap()
+-        {
+-            return this.map;
+-        }
+-
+         public ReplicatedRanges replicate(Range[] ranges, List<Node> nodes)
+         {
+             return replicate(ranges, nodes, asMap());
+         }
+ 
+-        public static ReplicatedRanges replicate(Range[] ranges, List<Node> nodes, Map<String, Integer> rfs)
++        public static ReplicatedRanges replicate(Range[] ranges, List<Node> nodes, Map<String, DCReplicas> rfs)
+         {
+             assertStrictlySorted(nodes);
+             boolean minTokenOwned = nodes.stream().anyMatch(n -> n.token() == Long.MIN_VALUE);
+@@ -262,21 +273,21 @@ public class TokenPlacementModel
+             Map<String, List<Node>> nodesByDC = nodesByDC(nodes);
+             Map<String, Set<String>> racksByDC = racksByDC(nodes);
+ 
+-            for (Map.Entry<String, Integer> entry : rfs.entrySet())
++            for (Map.Entry<String, DCReplicas> entry : rfs.entrySet())
+             {
+                 String dc = entry.getKey();
+-                int rf = entry.getValue();
++                DCReplicas dcRf = entry.getValue();
+                 List<Node> nodesInThisDC = nodesByDC.get(dc);
+                 Set<String> racksInThisDC = racksByDC.get(dc);
+                 int nodeCount = nodesInThisDC == null ? 0 : nodesInThisDC.size();
+                 int rackCount = racksInThisDC == null ? 0 : racksInThisDC.size();
+-                if (rf <= 0 || nodeCount == 0)
++                if (dcRf.totalCount <= 0 || nodeCount == 0)
+                     continue;
+ 
+-                template.put(dc, new DatacenterNodes(rf, rackCount, nodeCount));
++                template.put(dc, new DatacenterNodes(dcRf, rackCount, nodeCount));
+             }
+ 
+-            NavigableMap<Range, Map<String, List<Node>>> replication = new TreeMap<>();
++            NavigableMap<Range, Map<String, List<Replica>>> replication = new TreeMap<>();
+             Range skipped = null;
+             for (Range range : ranges)
+             {
+@@ -300,7 +311,7 @@ public class TokenPlacementModel
+                         cnt++;
+                     }
+ 
+-                    replication.put(range, mapValues(nodesInDCs, v -> v.nodes));
++                    replication.put(range, mapValues(nodesInDCs, DatacenterNodes::asReplicas));
+                 }
+                 else
+                 {
+@@ -325,16 +336,16 @@ public class TokenPlacementModel
+         /**
+          * Replicate ranges to rf nodes.
+          */
+-        private static ReplicatedRanges combine(NavigableMap<Range, Map<String, List<Node>>> orig)
++        private static ReplicatedRanges combine(NavigableMap<Range, Map<String, List<Replica>>> orig)
+         {
+ 
+             Range[] ranges = new Range[orig.size()];
+             int idx = 0;
+-            NavigableMap<Range, List<Node>> flattened = new TreeMap<>();
+-            for (Map.Entry<Range, Map<String, List<Node>>> e : orig.entrySet())
++            NavigableMap<Range, List<Replica>> flattened = new TreeMap<>();
++            for (Map.Entry<Range, Map<String, List<Replica>>> e : orig.entrySet())
+             {
+-                List<Node> placementsForRange = new ArrayList<>();
+-                for (List<Node> v : e.getValue().values())
++                List<Replica> placementsForRange = new ArrayList<>();
++                for (List<Replica> v : e.getValue().values())
+                     placementsForRange.addAll(v);
+                 ranges[idx++] = e.getKey();
+                 flattened.put(e.getKey(), placementsForRange);
+@@ -344,24 +355,43 @@ public class TokenPlacementModel
+ 
+         private KeyspaceParams toKeyspaceParams()
+         {
+-            Object[] args = new Object[map.size() * 2];
++            Object[] args = new Object[replication.size() * 2];
+             int i = 0;
+-            for (Map.Entry<String, Integer> e : map.entrySet())
++            for (Map.Entry<String, DCReplicas> e : replication.entrySet())
+             {
+                 args[i * 2] = e.getKey();
+-                args[i * 2 + 1] = e.getValue();
++                args[i * 2 + 1] = e.getValue().toString();
+                 i++;
+             }
+ 
+             return KeyspaceParams.nts(args);
+         }
+ 
+-        private Map<String, Integer> toMap(int[] nodesPerDc, Lookup lookup)
++        private static Function<Lookup, Map<String, DCReplicas>> mapFunction(int dcs, int nodesPerDc, int transientsPerDc)
+         {
+-            Map<String, Integer> map = new TreeMap<>();
+-            for (int i = 0; i < nodesPerDc.length; i++)
+-            {
+-                map.put(lookup.dc(i + 1), nodesPerDc[i]);
++            return (lookup) -> {
++                int[] totals = new int[dcs];
++                Arrays.fill(totals, nodesPerDc);
++                int[] transients = new int[dcs];
++                Arrays.fill(transients, transientsPerDc);
++                return toMap(totals, transients, lookup);
++            };
++        }
++
++        private static Function<Lookup, Map<String, DCReplicas>> mapFunction(final int[] totalPerDc)
++        {
++            return (lookup) -> {
++                int[] transients = new int[totalPerDc.length];
++                Arrays.fill(transients, 0);
++                return toMap(totalPerDc, transients, lookup);
++            };
++        }
++
++        private static Map<String, DCReplicas> toMap(int[] totalPerDc, int[] transientPerDc, Lookup lookup)
++        {
++            Map<String, DCReplicas> map = new TreeMap<>();
++            for (int i = 0; i < totalPerDc.length; i++) {
++                map.put(lookup.dc(i + 1), new DCReplicas(totalPerDc[i], transientPerDc[i]));
+             }
+             return map;
+         }
+@@ -382,25 +412,26 @@ public class TokenPlacementModel
+         /** Number of replicas left to fill from this DC. */
+         int rfLeft;
+         int acceptableRackRepeats;
++        DCReplicas rf;
+ 
+         public DatacenterNodes copy()
+         {
+-            return new DatacenterNodes(rfLeft, acceptableRackRepeats);
++            return new DatacenterNodes(this);
+         }
+ 
+-        DatacenterNodes(int rf,
+-                        int rackCount,
+-                        int nodeCount)
++        DatacenterNodes(DCReplicas rf, int rackCount, int nodeCount)
+         {
+-            this.rfLeft = Math.min(rf, nodeCount);
+-            acceptableRackRepeats = rf - rackCount;
++            this.rf = rf;
++            this.rfLeft = Math.min(rf.totalCount, nodeCount);
++            this.acceptableRackRepeats = rf.totalCount - rackCount;
+         }
+ 
+         // for copying
+-        DatacenterNodes(int rfLeft, int acceptableRackRepeats)
++        DatacenterNodes(DatacenterNodes source)
+         {
+-            this.rfLeft = rfLeft;
+-            this.acceptableRackRepeats = acceptableRackRepeats;
++            this.rf = source.rf;
++            this.rfLeft = source.rfLeft;
++            this.acceptableRackRepeats = source.acceptableRackRepeats;
+         }
+ 
+         boolean addAndCheckIfDone(Node node, Location location)
+@@ -437,6 +468,17 @@ public class TokenPlacementModel
+             return rfLeft == 0;
+         }
+ 
++        public List<Replica> asReplicas()
++        {
++            List<Replica> replicas = new ArrayList<>(nodes.size());
++            for (Node node : nodes)
++            {
++                boolean full = replicas.size() < rf.totalCount - rf.transientCount;
++                replicas.add(new Replica(node, full));
++            }
++            return replicas;
++        }
++
+         @Override
+         public String toString()
+         {
+@@ -504,47 +546,59 @@ public class TokenPlacementModel
+ 
+     public static class SimpleReplicationFactor extends ReplicationFactor
+     {
+-        private final Lookup lookup = new DefaultLookup();
+         public SimpleReplicationFactor(int total)
+         {
+-            super(total);
++            this(total, 0);
+         }
+ 
+-        public int dcs()
++        public SimpleReplicationFactor(int total, int transientReplicas)
+         {
+-            return 1;
++            super(mapFunction(total, transientReplicas));
++            if (transientReplicas >= total)
++                throw new IllegalArgumentException("Transient replicas must be zero, or less than total replication factor");
+         }
+ 
+-        public KeyspaceParams asKeyspaceParams()
++        public static Function<Lookup, Map<String, DCReplicas>> mapFunction(int totalReplicas, int transientReplicas)
++        {
++            return (lookup) -> Collections.singletonMap(lookup.dc(1), new DCReplicas(totalReplicas, transientReplicas));
++        }
++
++        private DCReplicas dcReplicas()
+         {
+-            return KeyspaceParams.simple(total());
++            return replication.get(lookup.dc(1));
+         }
+ 
+-        public Map<String, Integer> asMap()
++        public KeyspaceParams asKeyspaceParams()
+         {
+-            return Collections.singletonMap(lookup.dc(1), total());
++            Map<String, String> options = new HashMap<>();
++            options.put(ReplicationParams.CLASS, SimpleStrategy.class.getName());
++            options.put(SimpleStrategy.REPLICATION_FACTOR, dcReplicas().toString());
++            return KeyspaceParams.create(true, options);
+         }
+ 
+         public ReplicatedRanges replicate(Range[] ranges, List<Node> nodes)
+         {
+-            return replicate(ranges, nodes, total());
++            return replicate(ranges, nodes, dcReplicas());
+         }
+ 
+-        public static ReplicatedRanges replicate(Range[] ranges, List<Node> nodes, int rf)
++        public static ReplicatedRanges replicate(Range[] ranges, List<Node> nodes, DCReplicas dcReplicas)
+         {
+             assertStrictlySorted(nodes);
+-            NavigableMap<Range, List<Node>> replication = new TreeMap<>();
++            NavigableMap<Range, List<Replica>> replication = new TreeMap<>();
+             boolean minTokenOwned = nodes.stream().anyMatch(n -> n.token() == Long.MIN_VALUE);
+             Range skipped = null;
+             for (Range range : ranges)
+             {
+                 Set<Integer> names = new HashSet<>();
+-                List<Node> replicas = new ArrayList<>();
++                List<Replica> replicas = new ArrayList<>();
+                 int idx = primaryReplica(nodes, range);
+                 if (idx >= 0)
+                 {
+-                    for (int i = 0; i < nodes.size() && replicas.size() < rf; i++)
+-                        addIfUnique(replicas, names, nodes.get((idx + i) % nodes.size()));
++                    for (int i = 0; i < nodes.size() && replicas.size() < dcReplicas.totalCount; i++)
++                    {
++                        boolean full = replicas.size() < dcReplicas.totalCount - dcReplicas.transientCount;
++                        addIfUnique(replicas, names, new Replica(nodes.get((idx + i) % nodes.size()), full));
++                    }
+                     if (!minTokenOwned && range.start == Long.MIN_VALUE)
+                         replication.put(ranges[ranges.length - 1], replicas);
+                     replication.put(range, replicas);
+@@ -572,7 +626,7 @@ public class TokenPlacementModel
+         public String toString()
+         {
+             return "SimpleReplicationFactor{" +
+-                   "rf=" + total() +
++                   "rf=" + dcReplicas().toString() +
+                    '}';
+         }
+     }
+@@ -780,6 +834,58 @@ public class TokenPlacementModel
+         }
+     }
+ 
++    public static class Replica implements Comparable<Replica>
++    {
++        private final Node node;
++        private final boolean full;
++
++        public Replica(Node node, boolean full)
++        {
++            this.node = node;
++            this.full = full;
++        }
++
++        public Node node()
++        {
++            return node;
++        }
++
++        public boolean isFull()
++        {
++            return full;
++        }
++
++        public boolean isTransient()
++        {
++            return !full;
++        }
++
++        @Override
++        public boolean equals(Object o)
++        {
++            if (this == o) return true;
++            if (o == null || !Replica.class.isAssignableFrom(o.getClass())) return false;
++            Replica replica = (Replica) o;
++            return full == replica.full && Objects.equals(node, replica.node);
++        }
++
++        @Override
++        public int hashCode()
++        {
++            return Objects.hash(full, node);
++        }
++
++        public String toString()
++        {
++            return String.format("%s(%s)", (full ? "Full" : "Transient"), node.toString());
++        }
++
++        @Override
++        public int compareTo(Replica o) {
++            return node.compareTo(o.node);
++        }
++    }
++
+     public static NodeFactory nodeFactory()
+     {
+         return new NodeFactory(new DefaultLookup());
+diff --git a/test/harry/main/org/apache/cassandra/harry/sut/injvm/InJVMTokenAwareVisitExecutor.java b/test/harry/main/org/apache/cassandra/harry/sut/injvm/InJVMTokenAwareVisitExecutor.java
+index 6d7f482e03..5943b77b65 100644
+--- a/test/harry/main/org/apache/cassandra/harry/sut/injvm/InJVMTokenAwareVisitExecutor.java
++++ b/test/harry/main/org/apache/cassandra/harry/sut/injvm/InJVMTokenAwareVisitExecutor.java
+@@ -85,21 +85,21 @@ public class InJVMTokenAwareVisitExecutor extends LoggingVisitor.LoggingVisitorE
+         int retries = 0;
+ 
+         Object[] pk = schema.inflatePartitionKey(pd);
+-        List<TokenPlacementModel.Node> replicas = getRing().replicasFor(TokenUtil.token(ByteUtils.compose(ByteUtils.objectsToBytes(pk))));
++        List<TokenPlacementModel.Replica> replicas = getRing().replicasFor(TokenUtil.token(ByteUtils.compose(ByteUtils.objectsToBytes(pk))));
+         while (retries++ < MAX_RETRIES)
+         {
+             try
+             {
+-                TokenPlacementModel.Node replica = replicas.get((int) (lts % replicas.size()));
++                TokenPlacementModel.Replica replica = replicas.get((int) (lts % replicas.size()));
+                 if (cl == SystemUnderTest.ConsistencyLevel.NODE_LOCAL)
+                 {
+-                    return executeNodeLocal(statement.cql(), replica, statement.bindings());
++                    return executeNodeLocal(statement.cql(), replica.node(), statement.bindings());
+                 }
+                 else
+                 {
+                     return sut.cluster
+                            .stream()
+-                           .filter((n) -> n.config().broadcastAddress().toString().contains(replica.id()))
++                           .filter((n) -> n.config().broadcastAddress().toString().contains(replica.node().id()))
+                            .findFirst()
+                            .get()
+                            .coordinator()
+diff --git a/test/simulator/main/org/apache/cassandra/simulator/cluster/KeyspaceActions.java b/test/simulator/main/org/apache/cassandra/simulator/cluster/KeyspaceActions.java
+index 303b2a54d9..1cff2ab08f 100644
+--- a/test/simulator/main/org/apache/cassandra/simulator/cluster/KeyspaceActions.java
++++ b/test/simulator/main/org/apache/cassandra/simulator/cluster/KeyspaceActions.java
+@@ -215,14 +215,14 @@ public class KeyspaceActions extends ClusterActions
+         {
+             int primaryKey = primaryKeys[i];
+             LongToken token = new Murmur3Partitioner().getToken(Int32Type.instance.decompose(primaryKey));
+-            List<TokenPlacementModel.Node> readReplicas = readPlacements.replicasFor(token.token);
+-            List<TokenPlacementModel.Node> writeReplicas = writePlacements.replicasFor(token.token);
++            List<TokenPlacementModel.Replica> readReplicas = readPlacements.replicasFor(token.token);
++            List<TokenPlacementModel.Replica> writeReplicas = writePlacements.replicasFor(token.token);
+ 
+-            replicasForKey[i] = readReplicas.stream().mapToInt(TokenPlacementModel.Node::idx).toArray();
+-            Set<TokenPlacementModel.Node> pendingReplicas = new HashSet<>(writeReplicas);
++            replicasForKey[i] = readReplicas.stream().mapToInt(r -> r.node().idx()).toArray();
++            Set<TokenPlacementModel.Replica> pendingReplicas = new HashSet<>(writeReplicas);
+             pendingReplicas.removeAll(readReplicas);
+-            replicasForKey[i] = readReplicas.stream().mapToInt(TokenPlacementModel.Node::idx).toArray();
+-            pendingReplicasForKey[i] = pendingReplicas.stream().mapToInt(TokenPlacementModel.Node::idx).toArray();
++            replicasForKey[i] = readReplicas.stream().mapToInt(r -> r.node().idx()).toArray();
++            pendingReplicasForKey[i] = pendingReplicas.stream().mapToInt(r -> r.node().idx()).toArray();
+         }
+ 
+         int[] membersOfRing = joined.toArray();
+diff --git a/test/simulator/main/org/apache/cassandra/simulator/harry/HarryValidatingQuery.java b/test/simulator/main/org/apache/cassandra/simulator/harry/HarryValidatingQuery.java
+index 3309bc87dd..1ac7b550f6 100644
+--- a/test/simulator/main/org/apache/cassandra/simulator/harry/HarryValidatingQuery.java
++++ b/test/simulator/main/org/apache/cassandra/simulator/harry/HarryValidatingQuery.java
+@@ -85,15 +85,15 @@ public class HarryValidatingQuery extends SimulatedAction
+                         protected void validate(Query query, TokenPlacementModel.ReplicatedRanges ring)
+                         {
+                             CompiledStatement compiled = query.toSelectStatement();
+-                            List<TokenPlacementModel.Node> replicas = ring.replicasFor(this.token(query.pd));
++                            List<TokenPlacementModel.Replica> replicas = ring.replicasFor(this.token(query.pd));
+                             logger.trace("Predicted {} as replicas for {}. Ring: {}", new Object[]{ replicas, query.pd, ring });
+                             List<Throwable> throwables = new ArrayList<>();
+-                            for (TokenPlacementModel.Node node : replicas)
++                            for (TokenPlacementModel.Replica replica : replicas)
+                             {
+                                 try
+                                 {
+                                     validate(() -> {
+-                                        Object[][] objects = this.executeNodeLocal(compiled.cql(), node, compiled.bindings());
++                                        Object[][] objects = this.executeNodeLocal(compiled.cql(), replica.node(), compiled.bindings());
+                                         List<ResultSetRow> result = new ArrayList();
+                                         int length = objects.length;
+                                         for (int i = 0; i < length; ++i)
+@@ -107,7 +107,7 @@ public class HarryValidatingQuery extends SimulatedAction
+                                 }
+                                 catch (Model.ValidationException t)
+                                 {
+-                                    throwables.add(new AssertionError(String.format("Caught an exception while validating %s on %s", query, node), t));
++                                    throwables.add(new AssertionError(String.format("Caught an exception while validating %s on %s", query, replica), t));
+                                 }
+                             }
+ 
+diff --git a/test/unit/org/apache/cassandra/tcm/ownership/PlacementTransitionPlanTest.java b/test/unit/org/apache/cassandra/tcm/ownership/PlacementTransitionPlanTest.java
+new file mode 100644
+index 0000000000..4da753dcdf
+--- /dev/null
++++ b/test/unit/org/apache/cassandra/tcm/ownership/PlacementTransitionPlanTest.java
+@@ -0,0 +1,243 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.cassandra.tcm.ownership;
++
++import com.google.common.collect.ImmutableMap;
++import org.junit.Test;
++
++import org.apache.cassandra.dht.Murmur3Partitioner;
++import org.apache.cassandra.dht.Range;
++import org.apache.cassandra.dht.Token;
++import org.apache.cassandra.locator.InetAddressAndPort;
++import org.apache.cassandra.locator.RangesAtEndpoint;
++import org.apache.cassandra.locator.RangesByEndpoint;
++import org.apache.cassandra.locator.Replica;
++import org.apache.cassandra.schema.ReplicationParams;
++import org.apache.cassandra.tcm.Transformation;
++import org.apache.cassandra.utils.FBUtilities;
++
++public class PlacementTransitionPlanTest
++{
++    private static final ReplicationParams params = ReplicationParams.simple(2);
++    private static final InetAddressAndPort ep = FBUtilities.getBroadcastAddressAndPort();
++    @Test(expected = Transformation.RejectedTransformationException.class)
++    public void testEmptyWriteReplica()
++    {
++        DataPlacements startPlacements = DataPlacements.EMPTY;
++        RangesByEndpoint newReads = rbe(r(0, 20));
++        PlacementDeltas addRead = PlacementDeltas.builder()
++                                                 .put(params,
++                                                      addReadDelta(newReads)).build();
++        PlacementTransitionPlan.assertPreExistingWriteReplica(startPlacements, addRead);
++    }
++
++    @Test
++    public void testHasWriteReplica()
++    {
++        DataPlacements startPlacements = DataPlacements.EMPTY;
++        RangesByEndpoint newReplica = rbe(r(0, 20));
++        PlacementDeltas addWrite = PlacementDeltas.builder()
++                                                  .put(params,
++                                                       addWriteDelta(newReplica)).build();
++
++        PlacementDeltas addRead = PlacementDeltas.builder()
++                                                 .put(params,
++                                                      addReadDelta(newReplica)).build();
++        PlacementTransitionPlan.assertPreExistingWriteReplica(startPlacements, addWrite, addRead);
++    }
++
++    @Test
++    public void testHasSplitWriteReplica()
++    {
++        DataPlacements startPlacements = DataPlacements.EMPTY;
++        RangesByEndpoint writeReplicas = rbe(r(0, 20), r(20, 40));
++        PlacementDeltas addWrite = PlacementDeltas.builder()
++                                                  .put(params,
++                                                       addWriteDelta(writeReplicas)).build();
++        RangesByEndpoint readReplicas = rbe(r(0, 40));
++        PlacementDeltas addRead = PlacementDeltas.builder()
++                                                 .put(params,
++                                                      addReadDelta(readReplicas)).build();
++        PlacementTransitionPlan.assertPreExistingWriteReplica(startPlacements, addWrite, addRead);
++    }
++    @Test
++    public void testAddSplitReadReplica()
++    {
++        DataPlacements startPlacements = DataPlacements.EMPTY;
++        RangesByEndpoint writeReplicas = rbe(r(0, 40));
++        PlacementDeltas addWrite = PlacementDeltas.builder()
++                                                  .put(params,
++                                                       addWriteDelta(writeReplicas)).build();
++        RangesByEndpoint readReplicas = rbe(r(0, 20), r(20, 40));
++        PlacementDeltas addRead = PlacementDeltas.builder()
++                                                 .put(params,
++                                                      addReadDelta(readReplicas)).build();
++        PlacementTransitionPlan.assertPreExistingWriteReplica(startPlacements, addWrite, addRead);
++    }
++
++    @Test
++    public void testAddSplitReadReplicaGap()
++    {
++        DataPlacements startPlacements = DataPlacements.EMPTY;
++        RangesByEndpoint writeReplicas = rbe(r(0, 40));
++        PlacementDeltas addWrite = PlacementDeltas.builder()
++                                                  .put(params,
++                                                       addWriteDelta(writeReplicas)).build();
++        RangesByEndpoint readReplicas = rbe(r(0, 20), r(25, 40)); // this won't happen, but all read replicas are "covered" by the write replica above
++        PlacementDeltas addRead = PlacementDeltas.builder()
++                                                 .put(params,
++                                                      addReadDelta(readReplicas)).build();
++        PlacementTransitionPlan.assertPreExistingWriteReplica(startPlacements, addWrite, addRead);
++    }
++
++    @Test(expected = Transformation.RejectedTransformationException.class)
++    public void testHasSplitWriteReplicaWithGaps()
++    {
++        DataPlacements startPlacements = DataPlacements.EMPTY;
++        RangesByEndpoint writeReplicas = rbe(r(0, 20), r(21, 40)); // token 21 missing
++        PlacementDeltas addWrite = PlacementDeltas.builder()
++                                                  .put(params,
++                                                       addWriteDelta(writeReplicas)).build();
++        RangesByEndpoint readReplicas = rbe(r(0, 40));
++        PlacementDeltas addRead = PlacementDeltas.builder()
++                                                 .put(params,
++                                                      addReadDelta(readReplicas)).build();
++        PlacementTransitionPlan.assertPreExistingWriteReplica(startPlacements, addWrite, addRead);
++    }
++
++    @Test
++    public void testPlacementsAreUpdatedByDeltas()
++    {
++        DataPlacements startPlacements = DataPlacements.EMPTY;
++        RangesByEndpoint writeReplicas1 = rbe(r(0, 20));
++        PlacementDeltas addWrite1 = PlacementDeltas.builder()
++                                                  .put(params,
++                                                       addWriteDelta(writeReplicas1)).build();
++        RangesByEndpoint writeReplicas2 = rbe(r(20, 40));
++        PlacementDeltas addWrite2 = PlacementDeltas.builder()
++                                                   .put(params,
++                                                        addWriteDelta(writeReplicas2)).build();
++        RangesByEndpoint readReplicas = rbe(r(0, 40));
++        PlacementDeltas addRead = PlacementDeltas.builder()
++                                                 .put(params,
++                                                      addReadDelta(readReplicas)).build();
++        // first delta adds (0, 20] as write, second (20, 40] - make sure both are in placements when adding the read replica;
++        PlacementTransitionPlan.assertPreExistingWriteReplica(startPlacements, addWrite1, addWrite2, addRead);
++    }
++
++    @Test(expected = Transformation.RejectedTransformationException.class)
++    public void testDisallowAddingFullReadWithTransientWrite()
++    {
++        DataPlacements startPlacements = DataPlacements.EMPTY;
++        RangesByEndpoint transientWrite = rbeTransient(r(0, 20));
++        PlacementDeltas addWrite = PlacementDeltas.builder()
++                                                  .put(params,
++                                                       addWriteDelta(transientWrite)).build();
++
++        RangesByEndpoint fullRead = rbe(r(0,20));
++        PlacementDeltas addRead = PlacementDeltas.builder()
++                                                 .put(params,
++                                                      addReadDelta(fullRead)).build();
++        PlacementTransitionPlan.assertPreExistingWriteReplica(startPlacements, addWrite, addRead);
++    }
++
++    @Test
++    public void testAllowAddingTransientReadWithTransientWrite()
++    {
++        DataPlacements startPlacements = DataPlacements.EMPTY;
++        RangesByEndpoint transientWrite = rbeTransient(r(0, 20));
++        PlacementDeltas addWrite = PlacementDeltas.builder()
++                                                  .put(params,
++                                                       addWriteDelta(transientWrite)).build();
++
++        RangesByEndpoint transientRead = rbeTransient(r(0,20));
++        PlacementDeltas addRead = PlacementDeltas.builder()
++                                                 .put(params,
++                                                      addReadDelta(transientRead)).build();
++        PlacementTransitionPlan.assertPreExistingWriteReplica(startPlacements, addWrite, addRead);
++    }
++
++    @Test
++    public void testAllowAddingTransientReadWithFullWrite()
++    {
++        DataPlacements startPlacements = DataPlacements.EMPTY;
++        RangesByEndpoint fullWrite = rbe(r(0, 20));
++        PlacementDeltas addWrite = PlacementDeltas.builder()
++                                                  .put(params,
++                                                       addWriteDelta(fullWrite)).build();
++
++        RangesByEndpoint transientRead = rbeTransient(r(0,20));
++        PlacementDeltas addRead = PlacementDeltas.builder()
++                                                 .put(params,
++                                                      addReadDelta(transientRead)).build();
++        PlacementTransitionPlan.assertPreExistingWriteReplica(startPlacements, addWrite, addRead);
++    }
++
++    @Test(expected = Transformation.RejectedTransformationException.class)
++    public void testHasSplitTransientWriteReplica()
++    {
++        DataPlacements startPlacements = DataPlacements.EMPTY;
++        RangesByEndpoint writeReplicas1 = rbe(r(0, 20));
++        RangesByEndpoint writeReplicas2 = rbeTransient(r(20, 40));
++        PlacementDeltas addWriteFull = PlacementDeltas.builder()
++                                                  .put(params,
++                                                       addWriteDelta(writeReplicas1)).build();
++        PlacementDeltas addWriteTransient = PlacementDeltas.builder()
++                                                           .put(params,
++                                                           addWriteDelta(writeReplicas2)).build();
++
++        RangesByEndpoint readReplicas = rbe(r(0, 40));
++        PlacementDeltas addRead = PlacementDeltas.builder()
++                                                 .put(params,
++                                                      addReadDelta(readReplicas)).build();
++        PlacementTransitionPlan.assertPreExistingWriteReplica(startPlacements, addWriteFull, addWriteTransient, addRead);
++    }
++
++    private PlacementDeltas.PlacementDelta addReadDelta(RangesByEndpoint replica)
++    {
++        return new PlacementDeltas.PlacementDelta(new Delta(RangesByEndpoint.EMPTY, replica), Delta.empty());
++    }
++
++    private PlacementDeltas.PlacementDelta addWriteDelta(RangesByEndpoint replica)
++    {
++        return new PlacementDeltas.PlacementDelta(Delta.empty(), new Delta(RangesByEndpoint.EMPTY, replica));
++    }
++
++    private RangesByEndpoint rbe(Range<Token> ... ranges)
++    {
++        RangesAtEndpoint.Builder builder = RangesAtEndpoint.builder(ep);
++        for (Range<Token> r : ranges)
++            builder.add(Replica.fullReplica(ep, r));
++        return new RangesByEndpoint(ImmutableMap.of(ep, builder.build()));
++    }
++
++    private RangesByEndpoint rbeTransient(Range<Token> ... ranges)
++    {
++        RangesAtEndpoint.Builder builder = RangesAtEndpoint.builder(ep);
++        for (Range<Token> r : ranges)
++            builder.add(Replica.transientReplica(ep, r));
++        return new RangesByEndpoint(ImmutableMap.of(ep, builder.build()));
++    }
++
++
++    private Range<Token> r(long start, long end)
++    {
++        return new Range<>(new Murmur3Partitioner.LongToken(start), new Murmur3Partitioner.LongToken(end));
++    }
++}
+diff --git a/test/unit/org/apache/cassandra/tcm/ownership/UniformRangePlacementTest.java b/test/unit/org/apache/cassandra/tcm/ownership/UniformRangePlacementTest.java
+index f046be7955..b1846ca7fd 100644
+--- a/test/unit/org/apache/cassandra/tcm/ownership/UniformRangePlacementTest.java
++++ b/test/unit/org/apache/cassandra/tcm/ownership/UniformRangePlacementTest.java
+@@ -36,6 +36,7 @@ import org.apache.cassandra.schema.ReplicationParams;
+ import org.apache.cassandra.tcm.Epoch;
+ 
+ import static org.apache.cassandra.tcm.membership.MembershipUtils.endpoint;
++import static org.apache.cassandra.tcm.ownership.OwnershipUtils.bytesToken;
+ import static org.apache.cassandra.tcm.ownership.OwnershipUtils.token;
+ import static org.junit.Assert.assertEquals;
+ import static org.junit.Assert.assertTrue;
+diff --git a/test/unit/org/apache/cassandra/tcm/sequences/ProgressBarrierTest.java b/test/unit/org/apache/cassandra/tcm/sequences/ProgressBarrierTest.java
+index e3aaf69eab..278584fa6d 100644
+--- a/test/unit/org/apache/cassandra/tcm/sequences/ProgressBarrierTest.java
++++ b/test/unit/org/apache/cassandra/tcm/sequences/ProgressBarrierTest.java
+@@ -213,7 +213,7 @@ public class ProgressBarrierTest extends CMSTestBase
+                             if (rf instanceof TokenPlacementModel.SimpleReplicationFactor)
+                                 expected = rf.total() / 2 + 1;
+                             else
+-                                expected = rf.asMap().get(dc) / 2 + 1;
++                                expected = rf.asMap().get(dc).totalCount / 2 + 1;
+                             Assert.assertTrue(String.format("Should have collected at least %d nodes but got %d." +
+                                                             "\nRF: %s" +
+                                                             "\nReplicas: %s" +
+@@ -233,7 +233,7 @@ public class ProgressBarrierTest extends CMSTestBase
+                             if (rf instanceof TokenPlacementModel.SimpleReplicationFactor)
+                             {
+                                 int actual = byDc.get(dc);
+-                                int expected = rf.asMap().get(dc) / 2 + 1;
++                                int expected = rf.asMap().get(dc).totalCount / 2 + 1;
+                                 Assert.assertTrue(String.format("Shuold have collected at least %d nodes, but got %d." +
+                                                                 "\nRF: %s" +
+                                                                 "\nNodes: %s", expected, byDc.size(), rf, byDc),
+@@ -244,7 +244,7 @@ public class ProgressBarrierTest extends CMSTestBase
+                                 for (Map.Entry<String, Integer> e : byDc.entrySet())
+                                 {
+                                     int actual = e.getValue();
+-                                    int expected = rf.asMap().get(e.getKey()) / 2 + 1;
++                                    int expected = rf.asMap().get(e.getKey()).totalCount / 2 + 1;
+                                     Assert.assertTrue(String.format("Shuold have collected at least %d nodes, but got %d." +
+                                                                     "\nRF: %s" +
+                                                                     "\nNodes: %s", expected, byDc.size(), rf, byDc),

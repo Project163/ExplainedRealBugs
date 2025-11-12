@@ -137,10 +137,10 @@ def main():
         print(f"Using GitHub GraphQL strategy (Issues API) for {tracker_id} (to bypass 10k limit).")
         sys.stdout.flush()
         
-        # 1. get GH_TOKEN
+        # 1. Get GH_TOKEN
         gh_token = os.environ.get('GH_TOKEN')
         if not gh_token:
-            print("CRITICAL ERROR: GH_TOKEN environment variable must be set for GraphQL API.", file=sys.stderr)
+            print("[Error]: GH_TOKEN environment variable must be set for GraphQL API.", file=sys.stderr)
             sys.stderr.flush()
             sys.exit(1)
         
@@ -151,7 +151,7 @@ def main():
         
         graphql_endpoint = "https://api.github.com/graphql"
 
-        # 2. extract owner and repo name
+        # 2. Extract owner and repo name
         try:
             if '/' in tracker_id:
                 owner, name = tracker_id.split('/', 1)
@@ -159,14 +159,14 @@ def main():
                 owner = organization_id
                 name = tracker_id
             else:
-                raise ValueError(f"GitHub project ID '{tracker_id}' must be 'owner/repo' or require -z <org>.")
+                raise ValueError(f"[Error]: GitHub project ID '{tracker_id}' must be 'owner/repo' or require -z <org>.")
         except ValueError as e:
-            print(f"Error parsing GitHub project ID: {e}", file=sys.stderr)
+            print(f"[Error]: Error parsing GitHub project ID: {e}", file=sys.stderr)
             sys.stderr.flush()
             sys.exit(1)
 
-        # 3. define GraphQL Repository.Issues API query template
-        #    get all states (OPEN, CLOSED)
+        # 3. Define GraphQL Repository.Issues API query template
+        #    Get all states (OPEN, CLOSED)
         graphql_query_template = """
         query($owner: String!, $name: String!, $labels: [String!], $cursor: String) {
           repository(owner: $owner, name: $name) {
@@ -185,28 +185,28 @@ def main():
         }
         """
 
-        # 4. convert REST 'query' (e.g., 'label=bug,defect') to label list
+        # 4. Convert REST 'query' (e.g., 'label=bug,defect') to label list
         labels_to_search = []
         if query.startswith('label='):
             labels_to_search = query.split('=', 1)[1].split(',')
         else:
-            # if no 'label=' prefix, assume comma-separated labels
+            # If no 'label=' prefix, assume comma-separated labels
             labels_to_search = query.split(',')
             
         if not labels_to_search:
-            print(f"Error: Could not parse labels from query: {query}", file=sys.stderr)
+            print(f"[Error]: Could not parse labels from query: {query}", file=sys.stderr)
             sys.exit(1)
 
         if debug: print(f"GraphQL will run {len(labels_to_search)} full enumerations for labels: {labels_to_search}")
 
-        # 5. run GraphQL queries per label
+        # 5. Run GraphQL queries per label
         all_results_set = set() # set to avoid duplicates
         
-        # make sure issues_file is empty
+        # Make sure issues_file is empty
         try:
             open(issues_file, 'w').close() 
         except IOError as e:
-            print(f"Error: Cannot clear issues file {issues_file}: {e}", file=sys.stderr)
+            print(f"[Error]: Cannot clear issues file {issues_file}: {e}", file=sys.stderr)
             sys.exit(1)
 
 
@@ -226,7 +226,7 @@ def main():
                 variables = {
                     "owner": owner,
                     "name": name,
-                    "labels": [label_name], # query labels as list
+                    "labels": [label_name], # Query labels as list
                     "cursor": cursor
                 }
                 payload = {
@@ -239,7 +239,7 @@ def main():
                     sys.stdout.flush()
                 
                 try:
-                    # use session.post with a longer timeout
+                    # Use session.post with a longer timeout
                     response = session.post(graphql_endpoint, headers=headers, json=payload, timeout=45)
                     response.raise_for_status()
                     data = response.json()
@@ -247,7 +247,7 @@ def main():
                     if 'errors' in data:
                         print(f"GraphQL Error: {data['errors']}", file=sys.stderr)
                         sys.stderr.flush()
-                        break # stop this label's loop
+                        break
                         
                     issues_data = data.get('data', {}).get('repository', {}).get('issues', {})
                     pageInfo = issues_data.get('pageInfo', {})
@@ -259,44 +259,44 @@ def main():
                     if not nodes and page_count == 1:
                         if debug: print(f"  -> No issues found for label {label_name}.")
                     
-                    # new results from this page
+                    # New results from this page
                     page_results = []
                     for node in nodes:
                         if node:
                             issue_tuple = (node['number'], node['url'])
-                            # only process if it hasn't been added yet
+                            # Only process if it hasn't been added yet
                             if issue_tuple not in all_results_set:
                                 all_results_set.add(issue_tuple)
                                 page_results.append(issue_tuple)
 
-                    # append new results from this page to file
+                    # Append new results from this page to file
                     if page_results:
                         try:
                             with open(issues_file, 'a', encoding='utf-8') as f:
                                 for issue_id, issue_url in page_results:
                                     f.write(f"{issue_id},{issue_url}\n")
                         except IOError as e:
-                            print(f"Cannot write to {issues_file}: {e}", file=sys.stderr)
+                            print(f"[Error]: Cannot write to {issues_file}: {e}", file=sys.stderr)
                             sys.exit(1) 
 
                     page_count += 1
                     time.sleep(1) 
 
                 except requests.exceptions.RequestException as e:
-                    print(f"Error during GraphQL request: {e}. Retrying...", file=sys.stderr)
+                    print(f"[Error]: During GraphQL request: {e}. Retrying...", file=sys.stderr)
                     sys.stderr.flush()
                     time.sleep(10) 
                 except json.JSONDecodeError:
-                    print(f"Error decoding GraphQL response (Rate Limit?): {response.text}", file=sys.stderr)
+                    print(f"[Error]: Decoding GraphQL response (Rate Limit?): {response.text}", file=sys.stderr)
                     print("  -> Sleeping for 60 seconds...")
                     sys.stderr.flush()
                     time.sleep(60)
                 except KeyboardInterrupt:
-                    print("GraphQL download interrupted.")
+                    print("[Error]: GraphQL download interrupted.")
                     sys.stdout.flush()
                     sys.exit(1)
-                    
-        print(f"GitHub GraphQL processing complete. Wrote {len(all_results_set)} total unique issues to {issues_file}.")
+
+        print(f"[Info]: GitHub GraphQL processing complete. Wrote {len(all_results_set)} total unique issues to {issues_file}.")
         sys.stdout.flush()
         sys.exit(0)
     
@@ -308,7 +308,7 @@ def main():
         if debug: print(f"Fetching Bugzilla ID list from: {list_uri}")
         id_list = get_bugzilla_id_list(list_uri, tracker_id, session)
         if not id_list:
-            print("No Bugzilla IDs found.", file=sys.stderr)
+            print("[Warning]: No Bugzilla IDs found.", file=sys.stderr)
             sys.exit(0)
             
         if debug: print(f"Found {len(id_list)} Bugzilla IDs.")
@@ -319,7 +319,7 @@ def main():
             ids_query = "&".join([f"id={bid}" for bid in chunk])
             xml_uri = f"https://bz.apache.org/bugzilla/show_bug.cgi?ctype=xml&{ids_query}"
             
-            if debug: print(f"Downloading (in-memory) {xml_uri}")
+            if debug: print(f"Downloading {xml_uri}")
 
             xml_content = None
             max_retries = 5
@@ -333,7 +333,7 @@ def main():
                     break 
                     
                 except requests.exceptions.RequestException as e:
-                    print(f"\nWarning: Attempt {attempt + 1}/{max_retries} failed for {xml_uri}: {e}", file=sys.stderr)
+                    print(f"[Warning]: Attempt {attempt + 1}/{max_retries} failed for {xml_uri}: {e}", file=sys.stderr)
                     sys.stderr.flush()
                     
                     if 'IncompleteRead' in str(e):
@@ -342,7 +342,7 @@ def main():
                          print(f"  -> Server error {e.response.status_code}. Retrying in {retry_delay}s...", file=sys.stderr)
                     
                     if attempt + 1 == max_retries:
-                        print(f"\nError: Could not download {xml_uri} after {max_retries} attempts.", file=sys.stderr)
+                        print(f"[Error]: Could not download {xml_uri} after {max_retries} attempts.", file=sys.stderr)
                         sys.stderr.flush()
                         break
                     
@@ -370,8 +370,8 @@ def main():
         print(f"Bugzilla processing complete. Wrote {len(all_results)} issues.")
         sys.exit(0)
 
-    # other trackers's processing
-    give_up = False # special logic for Google tracker
+    # Other trackers's processing
+    give_up = False # Special logic for Google tracker
     while True:
         uri = tracker['build_uri'](tracker_uri, tracker_id, query, start, limit, organization_id)
         if debug: print(f"Downloading (in-memory) {uri}")
@@ -379,19 +379,19 @@ def main():
         content = None
 
         max_retries = 5
-        retry_delay = 10 # default 10 seconds delay
+        retry_delay = 10 # Default 10 seconds delay
 
         
         for attempt in range(max_retries):
             try:
-                # 1. use session.get with a longer timeout
+                # 1. Use session.get with a longer timeout
                 response = session.get(uri, headers={}, timeout=90) 
-                response.raise_for_status() # check for HTTP errors
-                content = response.text # 3. save content
+                response.raise_for_status() 
+                content = response.text
                 break 
                 
             except requests.exceptions.RequestException as e:
-                print(f"\nWarning: Attempt {attempt + 1}/{max_retries} failed for {uri}: {e}", file=sys.stderr)
+                print(f"[Warning]: Attempt {attempt + 1}/{max_retries} failed for {uri}: {e}", file=sys.stderr)
                 sys.stderr.flush()
                 
                 if 'IncompleteRead' in str(e):
@@ -400,7 +400,7 @@ def main():
                      print(f"  -> Server error {e.response.status_code} (Gateway Timeout/Unavailable). Retrying in {retry_delay}s...", file=sys.stderr)
                 
                 if attempt + 1 == max_retries:
-                    print(f"\nError: Could not download {uri} after {max_retries} attempts.", file=sys.stderr)
+                    print(f"[Error]: Could not download {uri} after {max_retries} attempts.", file=sys.stderr)
                     sys.stderr.flush()
                     
                     if give_up: # Google tracker logic
@@ -411,44 +411,44 @@ def main():
                 
                 time.sleep(retry_delay)
                 retry_delay *= 2
-        
-        # check if content is still None after retries
+
+        # 2. Check if content is still None after retries
         if content is None:
              if give_up: # Google tracker logic
                  if debug: print("Google tracker failed after retries, stopping.")
                  break
              else:
                  # Normal case where sys.exit(1) has already been triggered, but as a safety net
-                 print(f"CRITICAL: Failed to get content for {uri}. Exiting.", file=sys.stderr)
+                 print(f"[Error]: Failed to get content for {uri}. Exiting.", file=sys.stderr)
                  sys.exit(1)
 
+        # 3. Check for empty content
         if not content:
-             if debug: print("Downloaded content is empty. Stopping.")
+             if debug: print("[Warning]: Downloaded content is empty. Stopping.")
              break
         
         try:
-            # 4. transform content to results
+            # 4. Transform content to results
             results = tracker['results'](content, tracker_id)
         except Exception as e:
-            if debug: print(f"Failed to parse content from {uri}: {e}. Assuming end of results.")
+            if debug: print(f"[Error]: Failed to parse content from {uri}: {e}. Assuming end of results.")
             results = []
 
         if results:
             try:
-                # use 'a' (append) mode
                 with open(issues_file, 'a', encoding='utf-8') as f:
                     for issue_id, issue_url in results:
                         f.write(f"{issue_id},{issue_url}\n")
             except IOError as e:
-                print(f"Cannot write to {issues_file}: {e}", file=sys.stderr)
+                print(f"[Error]: Cannot write to {issues_file}: {e}", file=sys.stderr)
                 sys.exit(1)
             
             if args.tracker_name == 'google':
-                give_up = True # special logic for Google tracker
+                give_up = True # Special logic for Google tracker
             
             start += limit 
         else:
-            if debug: print("No more results found. Stopping.")
+            if debug: print("[Warning]: No more results found. Stopping.")
             break 
 
 if __name__ == "__main__":

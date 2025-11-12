@@ -1,0 +1,247 @@
+diff --git a/CHANGES.txt b/CHANGES.txt
+index 9a036b2119..9edc04baa9 100644
+--- a/CHANGES.txt
++++ b/CHANGES.txt
+@@ -1,4 +1,5 @@
+ 4.0.19
++ * Make secondary index implementations notified about rows in fully expired SSTables in compaction (CASSANDRA-20829)
+  * Ensure prepared_statement INSERT timestamp precedes eviction DELETE (CASSANDRA-19703)
+  * Gossip doesn't converge due to race condition when updating EndpointStates multiple fields (CASSANDRA-20659)
+ 
+diff --git a/src/java/org/apache/cassandra/db/compaction/CompactionTask.java b/src/java/org/apache/cassandra/db/compaction/CompactionTask.java
+index b5a7836f64..6916755dfc 100644
+--- a/src/java/org/apache/cassandra/db/compaction/CompactionTask.java
++++ b/src/java/org/apache/cassandra/db/compaction/CompactionTask.java
+@@ -17,9 +17,11 @@
+  */
+ package org.apache.cassandra.db.compaction;
+ 
++import java.util.ArrayList;
+ import java.util.Collection;
+ import java.util.HashMap;
+ import java.util.HashSet;
++import java.util.List;
+ import java.util.Map;
+ import java.util.Set;
+ import java.util.UUID;
+@@ -37,9 +39,16 @@ import org.apache.cassandra.config.DatabaseDescriptor;
+ import org.apache.cassandra.db.ColumnFamilyStore;
+ import org.apache.cassandra.db.Directories;
+ import org.apache.cassandra.db.SystemKeyspace;
++import org.apache.cassandra.db.WriteContext;
+ import org.apache.cassandra.db.compaction.writers.CompactionAwareWriter;
+ import org.apache.cassandra.db.compaction.writers.DefaultCompactionWriter;
+ import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
++import org.apache.cassandra.db.rows.Row;
++import org.apache.cassandra.db.rows.Unfiltered;
++import org.apache.cassandra.db.rows.UnfilteredRowIterator;
++import org.apache.cassandra.index.Index;
++import org.apache.cassandra.index.transactions.IndexTransaction;
++import org.apache.cassandra.io.sstable.ISSTableScanner;
+ import org.apache.cassandra.io.sstable.format.SSTableReader;
+ import org.apache.cassandra.io.sstable.metadata.MetadataCollector;
+ import org.apache.cassandra.service.ActiveRepairService;
+@@ -163,6 +172,8 @@ public class CompactionTask extends AbstractCompactionTask
+             long estimatedKeys = 0;
+             long inputSizeBytes;
+ 
++            maybeNotifyIndexersAboutRowsInFullyExpiredSSTables(fullyExpiredSSTables);
++
+             Set<SSTableReader> actuallyCompact = Sets.difference(transaction.originals(), fullyExpiredSSTables);
+             Collection<SSTableReader> newSStables;
+ 
+@@ -436,4 +447,66 @@ public class CompactionTask extends AbstractCompactionTask
+         }
+         return max;
+     }
++
++    private void maybeNotifyIndexersAboutRowsInFullyExpiredSSTables(Set<SSTableReader> fullyExpiredSSTables)
++    {
++        if (fullyExpiredSSTables.isEmpty())
++            return;
++
++        List<Index> indexes = new ArrayList<>();
++        for (Index index : cfs.indexManager.listIndexes())
++        {
++            if (index.notifyIndexerAboutRowsInFullyExpiredSSTables())
++                indexes.add(index);
++        }
++
++        if (indexes.isEmpty())
++            return;
++
++        for (SSTableReader expiredSSTable : fullyExpiredSSTables)
++        {
++            try (ISSTableScanner scanner = expiredSSTable.getScanner())
++            {
++                while (scanner.hasNext())
++                {
++                    UnfilteredRowIterator partition = scanner.next();
++
++                    try (WriteContext ctx = cfs.keyspace.getWriteHandler().createContextForIndexing())
++                    {
++                        List<Index.Indexer> indexers = new ArrayList<>();
++                        for (int i = 0; i < indexes.size(); i++)
++                        {
++                            Index.Indexer indexer = indexes.get(i).indexerFor(partition.partitionKey(),
++                                                                              partition.columns(),
++                                                                              FBUtilities.nowInSeconds(),
++                                                                              ctx,
++                                                                              IndexTransaction.Type.COMPACTION);
++
++                            if (indexer != null)
++                                indexers.add(indexer);
++                        }
++
++                        if (!indexers.isEmpty())
++                        {
++                            for (Index.Indexer indexer : indexers)
++                                indexer.begin();
++
++                            while (partition.hasNext())
++                            {
++                                Unfiltered unfiltered = partition.next();
++                                if (unfiltered instanceof Row)
++                                {
++                                    for (Index.Indexer indexer : indexers)
++                                        indexer.removeRow((Row) unfiltered);
++                                }
++                            }
++
++                            for (Index.Indexer indexer : indexers)
++                                indexer.finish();
++                        }
++                    }
++                }
++            }
++        }
++    }
+ }
+diff --git a/src/java/org/apache/cassandra/index/Index.java b/src/java/org/apache/cassandra/index/Index.java
+index e9d3d3c3d3..0364a463f7 100644
+--- a/src/java/org/apache/cassandra/index/Index.java
++++ b/src/java/org/apache/cassandra/index/Index.java
+@@ -401,6 +401,28 @@ public interface Index
+      */
+     public void validate(PartitionUpdate update) throws InvalidRequestException;
+ 
++
++    /**
++     * When a secondary index is created on a column for a table with e.g. TWCS strategy,
++     * when this table contains SSTables which are evaluated as fully expired upon compaction,
++     * they are by default filtered out as they can be dropped in their entirety. However, once dropped like that,
++     * the index implementation is not notified about this fact via IndexGCTransaction as compaction on
++     * non-fully expired tables would do. This in turn means that custom index will never know that some data have
++     * been removed hence data custom index implementation is responsible for will grow beyond any limit.
++     *
++     * Override this method and return false in index implementation only in case you do not want to be notified about
++     * dropped fully-expired data. This will eventually mean that {@link Indexer#removeRow(Row)} will not be called
++     * for rows contained in fully expired table. Return true if you do want to be notified about that fact.
++     *
++     * This method returns true by default.
++     *
++     * @return true when fully expired tables should be included in compaction process, false otherwise.
++     */
++    public default boolean notifyIndexerAboutRowsInFullyExpiredSSTables()
++    {
++        return true;
++    }
++
+     /*
+      * Update processing
+      */
+diff --git a/src/java/org/apache/cassandra/index/sasi/SASIIndex.java b/src/java/org/apache/cassandra/index/sasi/SASIIndex.java
+index b1998bc40b..b83bae0e39 100644
+--- a/src/java/org/apache/cassandra/index/sasi/SASIIndex.java
++++ b/src/java/org/apache/cassandra/index/sasi/SASIIndex.java
+@@ -255,6 +255,12 @@ public class SASIIndex implements Index, INotificationConsumer
+         return false;
+     }
+ 
++    @Override
++    public boolean notifyIndexerAboutRowsInFullyExpiredSSTables()
++    {
++        return false;
++    }
++
+     public Indexer indexerFor(DecoratedKey key, RegularAndStaticColumns columns, int nowInSec, WriteContext context, IndexTransaction.Type transactionType)
+     {
+         return new Indexer()
+diff --git a/test/unit/org/apache/cassandra/index/CustomIndexTest.java b/test/unit/org/apache/cassandra/index/CustomIndexTest.java
+index 84a36dfc8e..42446b5d15 100644
+--- a/test/unit/org/apache/cassandra/index/CustomIndexTest.java
++++ b/test/unit/org/apache/cassandra/index/CustomIndexTest.java
+@@ -28,6 +28,8 @@ import java.util.stream.Collectors;
+ 
+ import com.google.common.collect.ImmutableList;
+ import com.google.common.collect.Sets;
++import com.google.common.util.concurrent.Uninterruptibles;
++import org.junit.Assert;
+ import org.junit.Test;
+ 
+ import com.datastax.driver.core.exceptions.QueryValidationException;
+@@ -606,6 +608,64 @@ public class CustomIndexTest extends CQLTester
+         assertEquals(0, deletedClustering.intValue());
+     }
+ 
++
++    // two stub indexes just to track number of row deletions
++    // when we have fully-expired tables and indexes on different columns
++    public static class StubIndex1 extends StubIndex
++    {
++        public StubIndex1(ColumnFamilyStore baseCfs, IndexMetadata metadata)
++        {
++            super(baseCfs, metadata);
++        }
++    }
++
++    public static class StubIndex2 extends StubIndex
++    {
++
++        public StubIndex2(ColumnFamilyStore baseCfs, IndexMetadata metadata)
++        {
++            super(baseCfs, metadata);
++        }
++    }
++
++    @Test
++    public void notifyIndexesOfFullyExpiredSSTablesDuringCompaction() throws Throwable
++    {
++        createTable("CREATE TABLE %s (id int primary key, col1 int, col2 int) " +
++                    "WITH compaction = {'class': 'TimeWindowCompactionStrategy', " +
++                    "                   'compaction_window_size': 1," +
++                    "                   'compaction_window_unit': 'MINUTES'," +
++                    "                   'expired_sstable_check_frequency_seconds': 10} " +
++                    "AND gc_grace_seconds = 0");
++
++        createIndex(String.format("CREATE CUSTOM INDEX row_ttl_test_index_1 ON %%s(col1) USING '%s'", StubIndex1.class.getName()));
++        createIndex(String.format("CREATE CUSTOM INDEX row_ttl_test_index_2 ON %%s(col2) USING '%s'", StubIndex2.class.getName()));
++
++        ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
++        StubIndex index1  = (StubIndex1)cfs.indexManager.getIndexByName("row_ttl_test_index_1");
++        StubIndex index2  = (StubIndex2)cfs.indexManager.getIndexByName("row_ttl_test_index_2");
++
++        execute("INSERT INTO %s (id, col1) VALUES (?, ?) USING TTL 20", 0, 0);
++        execute("INSERT INTO %s (id, col1) VALUES (?, ?) USING TTL 20", 1, 1);
++        execute("INSERT INTO %s (id, col1) VALUES (?, ?) USING TTL 20", 2, 2);
++
++        execute("INSERT INTO %s (id, col2) VALUES (?, ?) USING TTL 20", 0, 0);
++        execute("INSERT INTO %s (id, col2) VALUES (?, ?) USING TTL 20", 1, 1);
++        execute("INSERT INTO %s (id, col2) VALUES (?, ?) USING TTL 20", 2, 2);
++
++        flush();
++
++        Uninterruptibles.sleepUninterruptibly(60, TimeUnit.SECONDS);
++
++        compact();
++
++        Assert.assertFalse(index1.rowsDeleted.isEmpty());
++        Assert.assertEquals(3, index1.rowsDeleted.size());
++
++        Assert.assertFalse(index2.rowsDeleted.isEmpty());
++        Assert.assertEquals(3, index2.rowsDeleted.size());
++    }
++
+     @Test
+     public void validateOptions() throws Throwable
+     {

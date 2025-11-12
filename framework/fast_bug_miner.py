@@ -34,7 +34,7 @@ def process_project(project_id, project_name, repository_url, issue_tracker_name
     print(f"Processing project: {project_id} ({project_name})")
     print("############################################################")
 
-    # 1. define paths
+    # 1. Define necessary paths
     issue_cache_key = f"{issue_tracker_name}_{issue_tracker_project_id}"
     cache_issues_dir = os.path.join(config.SHARED_ISSUES_DIR, issue_cache_key)
     cache_issues_file = os.path.join(cache_issues_dir, 'issues.txt')
@@ -48,15 +48,15 @@ def process_project(project_id, project_name, repository_url, issue_tracker_name
     cache_repo_dir = os.path.join(cache_project_dir, f"{project_name}.git")
     cache_gitlog_file = os.path.join(cache_project_dir, 'gitlog.txt')
     
-    # 2. create necessary directories
+    # 2. Create necessary directories
     os.makedirs(output_patches_dir, exist_ok=True)
     os.makedirs(output_reports_dir, exist_ok=True) 
     os.makedirs(cache_project_dir, exist_ok=True) 
     os.makedirs(cache_issues_dir, exist_ok=True)
     
-    # 3. initialize git repository if not already done
+    # 3. Initialize git repository if not already done
     
-    # 3a. cloning repository
+    # 3a. Cloning repository
     if not os.path.exists(cache_repo_dir):
         cmd_list = [
             'git', 
@@ -67,12 +67,12 @@ def process_project(project_id, project_name, repository_url, issue_tracker_name
         ]
         success, _ = utils.exec_cmd(cmd_list, f"Cloning {project_name}")
         if not success:
-            print(f"Error: Failed to clone {repository_url}. Skipping.", file=sys.stderr)
+            print(f"[Error]: Failed to clone {repository_url}. Skipping.", file=sys.stderr)
             return False # 
     else:
         print(f"Repository {project_name}.git already cached.")
 
-    # 3b. downloading shared issues
+    # 3b. Downloading shared issues
     if not os.path.exists(cache_issues_file) or os.path.getsize(cache_issues_file) == 0:
         print(f"Shared issues for {issue_cache_key} not found. Downloading...")
         
@@ -86,12 +86,12 @@ def process_project(project_id, project_name, repository_url, issue_tracker_name
         ]
         success, _ = utils.exec_cmd(cmd_dl_list, f"Downloading issues for {issue_cache_key}")
         if not success:
-            print(f"Error: Failed to download issues for {issue_cache_key}. Skipping.", file=sys.stderr)
+            print(f"[Error]: Failed to download issues for {issue_cache_key}. Skipping.", file=sys.stderr)
             return False
     else:
         print(f"Shared issues for {issue_cache_key} already cached. Skipping download.")
 
-    # 3c. getting git log
+    # 3c. Downloading git log
     if not os.path.exists(cache_gitlog_file):
         cmd_log_list = [
             'git',
@@ -107,19 +107,19 @@ def process_project(project_id, project_name, repository_url, issue_tracker_name
             output_file=cache_gitlog_file 
         )
         if not success:
-            print(f"Error: Failed to get git log for {project_name}. Skipping.", file=sys.stderr)
+            print(f"[Error]: Failed to get git log for {project_name}. Skipping.", file=sys.stderr)
             return False
     else:
         print(f"Git log for {project_name} already cached.")
 
-    # 3d. cross-referencing git log with issues
+    # 3d. Cross-referencing git log with issues
     if not os.path.exists(output_csv_file):
         try:
             with open(output_csv_file, 'w', encoding='utf-8', newline='') as f:
                 writer = csv.writer(f)
                 writer.writerow(config.ACTIVE_BUGS_HEADER)
         except IOError as e:
-            print(f"Error: Cannot write header to {output_csv_file}: {e}. Skipping.", file=sys.stderr)
+            print(f"[Error]: Cannot write header to {output_csv_file}: {e}. Skipping.", file=sys.stderr)
             return False
 
         print(f"Regex for bug-fixing commits: {bug_fix_regex!r}")
@@ -137,12 +137,12 @@ def process_project(project_id, project_name, repository_url, issue_tracker_name
         ]
         success, _ = utils.exec_cmd(cmd_xref_list, f"Cross-referencing log for {project_id}")
         if not success:
-            print(f"Error: Failed to cross-reference log for {project_id}. Skipping.", file=sys.stderr)
+            print(f"[Error]: Failed to cross-reference log for {project_id}. Skipping.", file=sys.stderr)
             return False
     else:
         print(f"Bugs file {output_csv_file} already exists.")
 
-    # 4. generating patches AND downloading reports
+    # 4. Generating patches AND downloading reports
     print(f"Generating patches and downloading reports from {output_csv_file}...")
     
     try:
@@ -156,11 +156,12 @@ def process_project(project_id, project_name, repository_url, issue_tracker_name
                 idx_report_url = header.index(config.BUGS_CSV_ISSUE_URL) 
                 
             except (StopIteration, ValueError) as e:
-                print(f"Error: Invalid or empty CSV file: {output_csv_file}. {e}", file=sys.stderr)
+                print(f"[Error]: Invalid or empty CSV file: {output_csv_file}. {e}", file=sys.stderr)
                 return False
                 
             for row in reader:
                 try:
+                    repo_name = project_name
                     bug_id = row[idx_bug_id]
                     commit_buggy = row[idx_commit_buggy]
                     commit_fixed = row[idx_commit_fixed]
@@ -183,7 +184,7 @@ def process_project(project_id, project_name, repository_url, issue_tracker_name
                     if os.path.exists(report_file):
                         pass 
                     else:
-                        print(f"\n  -> Downloading report for bug {bug_id}...", end="")
+                        print(f"  -> Downloading report for repo {repo_name} bug {bug_id}...", end="")
                         utils.download_report_data(report_url, report_file)
                         
                 # 4a.1 Download timeline if GitHub issue
@@ -202,12 +203,12 @@ def process_project(project_id, project_name, repository_url, issue_tracker_name
                                 # print(f"  -> Found timeline URL in GitHub API response: {timeline_url}")
                                 
                         except json.JSONDecodeError:
-                            print(f"  -> [Warning] {report_file} 不是有效的 JSON，无法查找 timeline URL。")
+                            print(f"  -> [Warning] {report_file} is not valid JSON.")
                         except Exception as e:
-                            print(f"  -> [Warning] 解析 {report_file} 时出错: {e}")
+                            print(f"  -> [Warning] Error parsing {report_file}: {e}")
 
                         if timeline_url:
-                            print(f"\n  -> Downloading timeline (discussion) for bug {bug_id}...", end="")
+                            print(f"  -> Downloading timeline (discussion) for repo {repo_name} bug {bug_id}...", end="")
 
                             utils.download_report_data(timeline_url, timeline_file)                
 
@@ -221,7 +222,7 @@ def process_project(project_id, project_name, repository_url, issue_tracker_name
                 if os.path.exists(patch_file):
                     continue 
 
-                print(f"  -> Generating patch for bug {bug_id} ({commit_buggy} -> {commit_fixed})")
+                print(f"  -> Generating patch for repo {repo_name} bug {bug_id}")
                 
                 cmd_diff_list = [
                     'git',
@@ -234,7 +235,7 @@ def process_project(project_id, project_name, repository_url, issue_tracker_name
                 ]
                 
                 git_env = os.environ.copy()
-                git_env['GIT_TERMINAL_PROMPT'] = '0'  # disable git prompts
+                git_env['GIT_TERMINAL_PROMPT'] = '0'  # Disable git prompts
                 
                 try:
                     result = subprocess.run(
@@ -246,7 +247,7 @@ def process_project(project_id, project_name, repository_url, issue_tracker_name
                         encoding='utf-8',
                         errors='ignore',
                         stdin=subprocess.DEVNULL,
-                        timeout=1800,
+                        timeout=5400,
                         env=git_env
                     )
                     
@@ -254,32 +255,32 @@ def process_project(project_id, project_name, repository_url, issue_tracker_name
                         f.write(result.stdout)
                     
                     if os.path.getsize(patch_file) == 0:
-                        print(f"  -> Warning: Generated patch for bug {bug_id} is empty.", file=sys.stderr)
+                        print(f"  -> [Warning]: Generated patch for bug {bug_id} is empty.", file=sys.stderr)
                 except subprocess.CalledProcessError as e:
-                    print(f"  -> Error generating patch for bug {bug_id}.", file=sys.stderr)
+                    print(f"  -> [Error]: Error generating patch for bug {bug_id}.", file=sys.stderr)
                     if os.path.exists(patch_file):
                         os.remove(patch_file) 
 
     except IOError as e:
-        print(f"Error reading {output_csv_file}: {e}", file=sys.stderr)
+        print(f"[Error]: Error reading {output_csv_file}: {e}", file=sys.stderr)
         return False
 
     print(f"Finished processing project {project_id}.\n")
     return True
 
 def main():
-    
-    # define error log file
+
+    # Define error log file
     ERROR_LOG_FILE = 'error.txt'
-    
-    # save original stderr
+
+    # Save original stderr
     original_stderr = sys.stderr
 
     # import os
-    # print(f"--- 架构师诊断: 脚本看到的 GH_TOKEN = {os.environ.get('GH_TOKEN')} ---")
+    # print(f"GH_TOKEN = {os.environ.get('GH_TOKEN')}")
     
     try:
-        # open error log file and redirect stderr
+        # Open error log file and redirect stderr
         with open(ERROR_LOG_FILE, 'w', encoding='utf-8') as error_log:
             sys.stderr = Tee(original_stderr, error_log)
             
@@ -296,6 +297,7 @@ def main():
                         continue
                         
                     try:
+                        # Parse the line into its components
                         parts = line.split('\t') 
                         project_id = parts[0] 
                         project_name = parts[1]
@@ -312,7 +314,7 @@ def main():
                         print(f"Skipping malformed line (expected at least 6 tab-separated parts): {line}", file=sys.stderr)
                         continue
 
-                    # define project output directory
+                    # Define project output directory
                     output_project_dir = os.path.join(config.OUTPUT_DIR, project_id)
                     
                     success = process_project(
@@ -324,8 +326,8 @@ def main():
                         bug_fix_regex, 
                         sub_project_path
                     )
-                    
-                    # check success and clean up on failure
+
+                    # Check success and clean up on failure
                     if not success:
                         print(f"--- Project {project_id} FAILED. Cleaning up output directory. ---", file=sys.stderr)
                         if os.path.exists(output_project_dir):

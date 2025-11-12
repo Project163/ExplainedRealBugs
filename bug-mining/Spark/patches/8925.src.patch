@@ -1,0 +1,816 @@
+diff --git a/core/src/main/scala/org/apache/spark/internal/config/package.scala b/core/src/main/scala/org/apache/spark/internal/config/package.scala
+index be210cfe59b..84332b9cee4 100644
+--- a/core/src/main/scala/org/apache/spark/internal/config/package.scala
++++ b/core/src/main/scala/org/apache/spark/internal/config/package.scala
+@@ -2468,4 +2468,15 @@ package object config {
+       .version("3.4.0")
+       .booleanConf
+       .createWithDefault(false)
++
++  private[spark] val RDD_CACHE_VISIBILITY_TRACKING_ENABLED =
++    ConfigBuilder("spark.rdd.cache.visibilityTracking.enabled")
++      .internal()
++      .doc("Set to be true to enabled RDD cache block's visibility status. Once it's enabled," +
++        " a RDD cache block can be used only when it's marked as visible. And a RDD block will be" +
++        " marked as visible only when one of the tasks generating the cache block finished" +
++        " successfully. This is relevant in context of consistent accumulator status.")
++      .version("3.4.0")
++      .booleanConf
++      .createWithDefault(false)
+ }
+diff --git a/core/src/main/scala/org/apache/spark/rdd/RDD.scala b/core/src/main/scala/org/apache/spark/rdd/RDD.scala
+index 18f3f87f30f..637d564e5b1 100644
+--- a/core/src/main/scala/org/apache/spark/rdd/RDD.scala
++++ b/core/src/main/scala/org/apache/spark/rdd/RDD.scala
+@@ -372,10 +372,12 @@ abstract class RDD[T: ClassTag](
+     val blockId = RDDBlockId(id, partition.index)
+     var readCachedBlock = true
+     // This method is called on executors, so we need call SparkEnv.get instead of sc.env.
+-    SparkEnv.get.blockManager.getOrElseUpdate(blockId, storageLevel, elementClassTag, () => {
+-      readCachedBlock = false
+-      computeOrReadCheckpoint(partition, context)
+-    }) match {
++    SparkEnv.get.blockManager.getOrElseUpdateRDDBlock(
++      context.taskAttemptId(), blockId, storageLevel, elementClassTag, () => {
++        readCachedBlock = false
++        computeOrReadCheckpoint(partition, context)
++      }
++    ) match {
+       // Block hit.
+       case Left(blockResult) =>
+         if (readCachedBlock) {
+diff --git a/core/src/main/scala/org/apache/spark/scheduler/DAGScheduler.scala b/core/src/main/scala/org/apache/spark/scheduler/DAGScheduler.scala
+index 5b9a7d725b9..9ce77ad7609 100644
+--- a/core/src/main/scala/org/apache/spark/scheduler/DAGScheduler.scala
++++ b/core/src/main/scala/org/apache/spark/scheduler/DAGScheduler.scala
+@@ -38,6 +38,7 @@ import org.apache.spark.errors.SparkCoreErrors
+ import org.apache.spark.executor.{ExecutorMetrics, TaskMetrics}
+ import org.apache.spark.internal.Logging
+ import org.apache.spark.internal.config
++import org.apache.spark.internal.config.RDD_CACHE_VISIBILITY_TRACKING_ENABLED
+ import org.apache.spark.internal.config.Tests.TEST_NO_STAGE_RETRY
+ import org.apache.spark.network.shuffle.{BlockStoreClient, MergeFinalizerListener}
+ import org.apache.spark.network.shuffle.protocol.MergeStatuses
+@@ -303,6 +304,10 @@ private[spark] class DAGScheduler(
+   private val shuffleSendFinalizeRpcExecutor: ExecutorService =
+     ThreadUtils.newDaemonFixedThreadPool(shuffleFinalizeRpcThreads, "shuffle-merge-finalize-rpc")
+ 
++  /** Whether rdd cache visibility tracking is enabled. */
++  private val trackingCacheVisibility: Boolean =
++    sc.getConf.get(RDD_CACHE_VISIBILITY_TRACKING_ENABLED)
++
+   /**
+    * Called by the TaskSetManager to report task's starting.
+    */
+@@ -1787,6 +1792,12 @@ private[spark] class DAGScheduler(
+       case _: ExceptionFailure | _: TaskKilled => updateAccumulators(event)
+       case _ =>
+     }
++    if (trackingCacheVisibility) {
++      // Update rdd blocks' visibility status.
++      blockManagerMaster.updateRDDBlockVisibility(
++        event.taskInfo.taskId, visible = event.reason == Success)
++    }
++
+     postTaskEnd(event)
+ 
+     event.reason match {
+diff --git a/core/src/main/scala/org/apache/spark/storage/BlockInfoManager.scala b/core/src/main/scala/org/apache/spark/storage/BlockInfoManager.scala
+index 9eb1418fd16..fb532dd0736 100644
+--- a/core/src/main/scala/org/apache/spark/storage/BlockInfoManager.scala
++++ b/core/src/main/scala/org/apache/spark/storage/BlockInfoManager.scala
+@@ -139,7 +139,7 @@ private[storage] object BlockInfo {
+  *
+  * This class is thread-safe.
+  */
+-private[storage] class BlockInfoManager extends Logging {
++private[storage] class BlockInfoManager(trackingCacheVisibility: Boolean = false) extends Logging {
+ 
+   private type TaskAttemptId = Long
+ 
+@@ -150,6 +150,12 @@ private[storage] class BlockInfoManager extends Logging {
+    */
+   private[this] val blockInfoWrappers = new ConcurrentHashMap[BlockId, BlockInfoWrapper]
+ 
++  /**
++   * Record invisible rdd blocks stored in the block manager, entries will be removed when blocks
++   * are marked as visible or blocks are removed by [[removeBlock()]].
++   */
++  private[this] val invisibleRDDBlocks = new mutable.HashSet[RDDBlockId]
++
+   /**
+    * Stripe used to control multi-threaded access to block information.
+    *
+@@ -180,6 +186,32 @@ private[storage] class BlockInfoManager extends Logging {
+ 
+   // ----------------------------------------------------------------------------------------------
+ 
++  // Exposed for test only.
++  private[storage] def containsInvisibleRDDBlock(blockId: RDDBlockId): Boolean = {
++    invisibleRDDBlocks.synchronized {
++      invisibleRDDBlocks.contains(blockId)
++    }
++  }
++
++  private[spark] def isRDDBlockVisible(blockId: RDDBlockId): Boolean = {
++    if (trackingCacheVisibility) {
++      invisibleRDDBlocks.synchronized {
++        blockInfoWrappers.containsKey(blockId) && !invisibleRDDBlocks.contains(blockId)
++      }
++    } else {
++      // Always be visible if the feature flag is disabled.
++      true
++    }
++  }
++
++  private[spark] def tryMarkBlockAsVisible(blockId: RDDBlockId): Unit = {
++    if (trackingCacheVisibility) {
++      invisibleRDDBlocks.synchronized {
++        invisibleRDDBlocks.remove(blockId)
++      }
++    }
++  }
++
+   /**
+    * Called at the start of a task in order to register that task with this [[BlockInfoManager]].
+    * This must be called prior to calling any other BlockInfoManager methods from that task.
+@@ -399,7 +431,19 @@ private[storage] class BlockInfoManager extends Logging {
+     try {
+       val wrapper = new BlockInfoWrapper(newBlockInfo, lock)
+       while (true) {
+-        val previous = blockInfoWrappers.putIfAbsent(blockId, wrapper)
++        val previous = if (trackingCacheVisibility) {
++          invisibleRDDBlocks.synchronized {
++            val res = blockInfoWrappers.putIfAbsent(blockId, wrapper)
++            if (res == null) {
++              // Added to invisible blocks if it doesn't exist before.
++              blockId.asRDDId.foreach(invisibleRDDBlocks.add)
++            }
++            res
++          }
++        } else {
++          blockInfoWrappers.putIfAbsent(blockId, wrapper)
++        }
++
+         if (previous == null) {
+           // New block lock it for writing.
+           val result = lockForWriting(blockId, blocking = false)
+@@ -502,7 +546,10 @@ private[storage] class BlockInfoManager extends Logging {
+         throw new IllegalStateException(
+           s"Task $taskAttemptId called remove() on block $blockId without a write lock")
+       } else {
+-        blockInfoWrappers.remove(blockId)
++        invisibleRDDBlocks.synchronized {
++          blockInfoWrappers.remove(blockId)
++          blockId.asRDDId.foreach(invisibleRDDBlocks.remove)
++        }
+         info.readerCount = 0
+         info.writerTask = BlockInfo.NO_WRITER
+         writeLocksByTask.get(taskAttemptId).remove(blockId)
+@@ -525,6 +572,9 @@ private[storage] class BlockInfoManager extends Logging {
+     blockInfoWrappers.clear()
+     readLocksByTask.clear()
+     writeLocksByTask.clear()
++    invisibleRDDBlocks.synchronized {
++      invisibleRDDBlocks.clear()
++    }
+   }
+ 
+ }
+diff --git a/core/src/main/scala/org/apache/spark/storage/BlockManager.scala b/core/src/main/scala/org/apache/spark/storage/BlockManager.scala
+index 847a6f1d68e..143f4b3ada4 100644
+--- a/core/src/main/scala/org/apache/spark/storage/BlockManager.scala
++++ b/core/src/main/scala/org/apache/spark/storage/BlockManager.scala
+@@ -43,7 +43,7 @@ import org.apache.spark.errors.SparkCoreErrors
+ import org.apache.spark.executor.DataReadMethod
+ import org.apache.spark.internal.Logging
+ import org.apache.spark.internal.config
+-import org.apache.spark.internal.config.Network
++import org.apache.spark.internal.config.{Network, RDD_CACHE_VISIBILITY_TRACKING_ENABLED}
+ import org.apache.spark.memory.{MemoryManager, MemoryMode}
+ import org.apache.spark.metrics.source.Source
+ import org.apache.spark.network._
+@@ -199,8 +199,11 @@ private[spark] class BlockManager(
+     new DiskBlockManager(conf, deleteFilesOnStop = deleteFilesOnStop, isDriver = isDriver)
+   }
+ 
++  /** Whether rdd cache visibility tracking is enabled. */
++  private val trackingCacheVisibility: Boolean = conf.get(RDD_CACHE_VISIBILITY_TRACKING_ENABLED)
++
+   // Visible for testing
+-  private[storage] val blockInfoManager = new BlockInfoManager
++  private[storage] val blockInfoManager = new BlockInfoManager(trackingCacheVisibility)
+ 
+   private val futureExecutionContext = ExecutionContext.fromExecutorService(
+     ThreadUtils.newDaemonCachedThreadPool("block-manager-future", 128))
+@@ -1323,6 +1326,29 @@ private[spark] class BlockManager(
+     blockInfoManager.releaseAllLocksForTask(taskAttemptId)
+   }
+ 
++  /**
++   * Retrieve the given rdd block if it exists and is visible, otherwise call the provided
++   * `makeIterator` method to compute the block, persist it, and return its values.
++   *
++   * @return either a BlockResult if the block was successfully cached, or an iterator if the block
++   *         could not be cached.
++   */
++  def getOrElseUpdateRDDBlock[T](
++      taskId: Long,
++      blockId: RDDBlockId,
++      level: StorageLevel,
++      classTag: ClassTag[T],
++      makeIterator: () => Iterator[T]): Either[BlockResult, Iterator[T]] = {
++    val isCacheVisible = isRDDBlockVisible(blockId)
++    val res = getOrElseUpdate(blockId, level, classTag, makeIterator, isCacheVisible)
++    if (res.isLeft && !isCacheVisible) {
++      // Block exists but not visible, report taskId -> blockId info to master.
++      master.updateRDDBlockTaskInfo(blockId, taskId)
++    }
++
++    res
++  }
++
+   /**
+    * Retrieve the given block if it exists, otherwise call the provided `makeIterator` method
+    * to compute the block, persist it, and return its values.
+@@ -1330,24 +1356,44 @@ private[spark] class BlockManager(
+    * @return either a BlockResult if the block was successfully cached, or an iterator if the block
+    *         could not be cached.
+    */
+-  def getOrElseUpdate[T](
++  private def getOrElseUpdate[T](
+       blockId: BlockId,
+       level: StorageLevel,
+       classTag: ClassTag[T],
+-      makeIterator: () => Iterator[T]): Either[BlockResult, Iterator[T]] = {
+-    // Attempt to read the block from local or remote storage. If it's present, then we don't need
+-    // to go through the local-get-or-put path.
+-    get[T](blockId)(classTag) match {
+-      case Some(block) =>
+-        return Left(block)
+-      case _ =>
+-        // Need to compute the block.
++      makeIterator: () => Iterator[T],
++      isCacheVisible: Boolean): Either[BlockResult, Iterator[T]] = {
++    // Track whether the data is computed or not, force to do the computation later if need to.
++    // The reason we push the force computing later is that once the executor is decommissioned we
++    // will have a better chance to replicate the cache block because of the `checkShouldStore`
++    // validation when putting a new block.
++    var computed: Boolean = false
++    val iterator = () => {
++      computed = true
++      makeIterator()
++    }
++    if (isCacheVisible) {
++      // Attempt to read the block from local or remote storage. If it's present, then we don't need
++      // to go through the local-get-or-put path.
++      get[T](blockId)(classTag) match {
++        case Some(block) =>
++          return Left(block)
++        case _ =>
++          // Need to compute the block.
++      }
+     }
++
++    // TODO: need a better way to handle blocks with indeterminate/unordered results, replicas
++    //  for same blockId could be different. And the reported accumulators could be not matching
++    //  the cached results.
+     // Initially we hold no locks on this block.
+-    doPutIterator(blockId, makeIterator, level, classTag, keepReadLock = true) match {
++    doPutIterator(blockId, iterator, level, classTag, keepReadLock = true) match {
+       case None =>
+         // doPut() didn't hand work back to us, so the block already existed or was successfully
+         // stored. Therefore, we now hold a read lock on the block.
++        if (!isCacheVisible && !computed) {
++          // Force compute to report accumulator updates.
++          Utils.getIteratorSize(makeIterator())
++        }
+         val blockResult = getLocalValues(blockId).getOrElse {
+           // Since we held a read lock between the doPut() and get() calls, the block should not
+           // have been evicted, so get() not returning the block indicates some internal error.
+@@ -1422,6 +1468,28 @@ private[spark] class BlockManager(
+     blockStoreUpdater.save()
+   }
+ 
++  // Check whether a rdd block is visible or not.
++  private[spark] def isRDDBlockVisible(blockId: RDDBlockId): Boolean = {
++    // Cached blocks are always visible if the feature flag is disabled.
++    if (!trackingCacheVisibility) {
++      return true
++    }
++
++    // If the rdd block visibility information not available in the block manager,
++    // asking master for the information.
++    if (blockInfoManager.isRDDBlockVisible(blockId)) {
++      return true
++    }
++
++    if(master.isRDDBlockVisible(blockId)) {
++      // Cache the visibility status if block exists.
++      blockInfoManager.tryMarkBlockAsVisible(blockId)
++      true
++    } else {
++      false
++    }
++  }
++
+   /**
+    * Helper method used to abstract common code from [[BlockStoreUpdater.save()]]
+    * and [[doPutIterator()]].
+diff --git a/core/src/main/scala/org/apache/spark/storage/BlockManagerMaster.scala b/core/src/main/scala/org/apache/spark/storage/BlockManagerMaster.scala
+index ef92d907733..aee7f1f7626 100644
+--- a/core/src/main/scala/org/apache/spark/storage/BlockManagerMaster.scala
++++ b/core/src/main/scala/org/apache/spark/storage/BlockManagerMaster.scala
+@@ -108,6 +108,19 @@ class BlockManagerMaster(
+     res
+   }
+ 
++  def updateRDDBlockTaskInfo(blockId: RDDBlockId, taskId: Long): Unit = {
++    driverEndpoint.askSync[Unit](UpdateRDDBlockTaskInfo(blockId, taskId))
++  }
++
++  def updateRDDBlockVisibility(taskId: Long, visible: Boolean): Unit = {
++    driverEndpoint.ask[Unit](UpdateRDDBlockVisibility(taskId, visible))
++  }
++
++  /** Check whether a block is visible */
++  def isRDDBlockVisible(blockId: RDDBlockId): Boolean = {
++    driverEndpoint.askSync[Boolean](GetRDDBlockVisibility(blockId))
++  }
++
+   /** Get locations of the blockId from the driver */
+   def getLocations(blockId: BlockId): Seq[BlockManagerId] = {
+     driverEndpoint.askSync[Seq[BlockManagerId]](GetLocations(blockId))
+diff --git a/core/src/main/scala/org/apache/spark/storage/BlockManagerMasterEndpoint.scala b/core/src/main/scala/org/apache/spark/storage/BlockManagerMasterEndpoint.scala
+index fe820adfe5a..19de4544bea 100644
+--- a/core/src/main/scala/org/apache/spark/storage/BlockManagerMasterEndpoint.scala
++++ b/core/src/main/scala/org/apache/spark/storage/BlockManagerMasterEndpoint.scala
+@@ -32,6 +32,7 @@ import com.google.common.cache.CacheBuilder
+ import org.apache.spark.{MapOutputTrackerMaster, SparkConf, SparkContext}
+ import org.apache.spark.annotation.DeveloperApi
+ import org.apache.spark.internal.{config, Logging}
++import org.apache.spark.internal.config.RDD_CACHE_VISIBILITY_TRACKING_ENABLED
+ import org.apache.spark.network.shuffle.{ExternalBlockStoreClient, RemoteBlockPushResolver}
+ import org.apache.spark.rpc.{IsolatedThreadSafeRpcEndpoint, RpcCallContext, RpcEndpointRef, RpcEnv}
+ import org.apache.spark.scheduler._
+@@ -77,6 +78,12 @@ class BlockManagerMasterEndpoint(
+   // Mapping from block id to the set of block managers that have the block.
+   private val blockLocations = new JHashMap[BlockId, mutable.HashSet[BlockManagerId]]
+ 
++  // Mapping from task id to the set of rdd blocks which are generated from the task.
++  private val tidToRddBlockIds = new mutable.HashMap[Long, mutable.HashSet[RDDBlockId]]
++  // Record the RDD blocks which are not visible yet, a block will be removed from this collection
++  // after at least one task generating the block finishes successfully.
++  private val invisibleRDDBlocks = new mutable.HashSet[RDDBlockId]
++
+   // Mapping from host name to shuffle (mergers) services where the current app
+   // registered an executor in the past. Older hosts are removed when the
+   // maxRetainedMergerLocations size is reached in favor of newer locations.
+@@ -116,6 +123,9 @@ class BlockManagerMasterEndpoint(
+   private lazy val driverEndpoint =
+     RpcUtils.makeDriverRef(CoarseGrainedSchedulerBackend.ENDPOINT_NAME, conf, rpcEnv)
+ 
++  /** Whether rdd cache visibility tracking is enabled. */
++  private val trackingCacheVisibility: Boolean = conf.get(RDD_CACHE_VISIBILITY_TRACKING_ENABLED)
++
+   override def receiveAndReply(context: RpcCallContext): PartialFunction[Any, Unit] = {
+     case RegisterBlockManager(
+       id, localDirs, maxOnHeapMemSize, maxOffHeapMemSize, endpoint, isReRegister) =>
+@@ -210,6 +220,70 @@ class BlockManagerMasterEndpoint(
+     case StopBlockManagerMaster =>
+       context.reply(true)
+       stop()
++
++    case UpdateRDDBlockTaskInfo(blockId, taskId) =>
++      // This is to report the information that a rdd block(with `blockId`) is computed
++      // and cached by task(with `taskId`). And this happens right after the task finished
++      // computing/caching the block only when the block is not visible yet. And the rdd
++      // block will be marked as visible when the corresponding task finished successfully.
++      context.reply(updateRDDBlockTaskInfo(blockId, taskId))
++
++    case GetRDDBlockVisibility(blockId) =>
++      // Get the visibility status of a specific rdd block.
++      context.reply(isRDDBlockVisible(blockId))
++
++    case UpdateRDDBlockVisibility(taskId, visible) =>
++      // This is to report the information that whether rdd blocks computed by task(with `taskId`)
++      // can be turned to be visible. This is reported by DAGScheduler right after task completes.
++      // If the task finished successfully, rdd blocks can be turned to be visible, otherwise rdd
++      // blocks' visibility status won't change.
++      context.reply(updateRDDBlockVisibility(taskId, visible))
++  }
++
++  private def isRDDBlockVisible(blockId: RDDBlockId): Boolean = {
++    if (trackingCacheVisibility) {
++      blockLocations.containsKey(blockId) &&
++        blockLocations.get(blockId).nonEmpty && !invisibleRDDBlocks.contains(blockId)
++    } else {
++      // Blocks should always be visible if the feature flag is disabled.
++      true
++    }
++  }
++
++  private def updateRDDBlockVisibility(taskId: Long, visible: Boolean): Unit = {
++    if (!trackingCacheVisibility) {
++      // Do nothing if the feature flag is disabled.
++      return
++    }
++
++    // TODO: When visible is false(the task had failed), we should be asking the block managers to
++    //  evict the block since the results can be inconsistent if there is any indeterminate
++    //  operation computing the rdd. Besides evicting the blocks here, when a rdd block is reported
++    //  we may also need to check the data with existing replicas somehow.
++    //  This will be tracked with jira: https://issues.apache.org/jira/browse/SPARK-42582
++    if (visible) {
++      tidToRddBlockIds.get(taskId).foreach { blockIds =>
++        blockIds.foreach { blockId =>
++          invisibleRDDBlocks.remove(blockId)
++          // Ask block managers to update the visibility status.
++          val msg = MarkRDDBlockAsVisible(blockId)
++          getLocations(blockId).flatMap(blockManagerInfo.get).foreach { managerInfo =>
++            managerInfo.storageEndpoint.ask[Unit](msg)
++          }
++        }
++      }
++    }
++
++    tidToRddBlockIds.remove(taskId)
++  }
++
++  private def updateRDDBlockTaskInfo(blockId: RDDBlockId, taskId: Long): Unit = {
++    if (!trackingCacheVisibility) {
++      // Do nothing if the feature flag is disabled.
++      return
++    }
++    tidToRddBlockIds.getOrElseUpdate(taskId, new mutable.HashSet[RDDBlockId])
++      .add(blockId)
+   }
+ 
+   /**
+@@ -274,6 +348,9 @@ class BlockManagerMasterEndpoint(
+ 
+     blocks.foreach { blockId =>
+       val bms: mutable.HashSet[BlockManagerId] = blockLocations.remove(blockId)
++      if (trackingCacheVisibility) {
++        invisibleRDDBlocks.remove(blockId)
++      }
+ 
+       val (bmIdsExtShuffle, bmIdsExecutor) = bms.partition(_.port == externalShuffleServicePort)
+       val liveExecutorsForBlock = bmIdsExecutor.map(_.executorId).toSet
+@@ -728,7 +805,22 @@ class BlockManagerMasterEndpoint(
+     }
+ 
+     if (storageLevel.isValid) {
++      val firstBlock = locations.isEmpty
+       locations.add(blockManagerId)
++
++      blockId.asRDDId.foreach { rddBlockId =>
++        (trackingCacheVisibility, firstBlock) match {
++          case (true, true) =>
++            // Mark as invisible for the first block.
++            invisibleRDDBlocks.add(rddBlockId)
++          case (true, false) if !invisibleRDDBlocks.contains(rddBlockId) =>
++            // If the rdd block is already visible, ask storage manager to update the visibility
++            // status.
++            blockManagerInfo(blockManagerId).storageEndpoint
++              .ask[Unit](MarkRDDBlockAsVisible(rddBlockId))
++          case _ =>
++        }
++      }
+     } else {
+       locations.remove(blockManagerId)
+     }
+diff --git a/core/src/main/scala/org/apache/spark/storage/BlockManagerMessages.scala b/core/src/main/scala/org/apache/spark/storage/BlockManagerMessages.scala
+index e047b61fcb1..24d0f239f73 100644
+--- a/core/src/main/scala/org/apache/spark/storage/BlockManagerMessages.scala
++++ b/core/src/main/scala/org/apache/spark/storage/BlockManagerMessages.scala
+@@ -48,6 +48,9 @@ private[spark] object BlockManagerMessages {
+   case class RemoveBroadcast(broadcastId: Long, removeFromDriver: Boolean = true)
+     extends ToBlockManagerMasterStorageEndpoint
+ 
++  // Mark a rdd block as visible.
++  case class MarkRDDBlockAsVisible(blockId: RDDBlockId) extends ToBlockManagerMasterStorageEndpoint
++
+   /**
+    * Driver to Executor message to trigger a thread dump.
+    */
+@@ -95,6 +98,12 @@ private[spark] object BlockManagerMessages {
+     }
+   }
+ 
++  case class UpdateRDDBlockTaskInfo(blockId: RDDBlockId, taskId: Long) extends ToBlockManagerMaster
++
++  case class UpdateRDDBlockVisibility(taskId: Long, visible: Boolean) extends ToBlockManagerMaster
++
++  case class GetRDDBlockVisibility(blockId: RDDBlockId) extends ToBlockManagerMaster
++
+   case class GetLocations(blockId: BlockId) extends ToBlockManagerMaster
+ 
+   case class GetLocationsAndStatus(blockId: BlockId, requesterHost: String)
+diff --git a/core/src/main/scala/org/apache/spark/storage/BlockManagerStorageEndpoint.scala b/core/src/main/scala/org/apache/spark/storage/BlockManagerStorageEndpoint.scala
+index 71c7a4de4c1..d4c631e59a1 100644
+--- a/core/src/main/scala/org/apache/spark/storage/BlockManagerStorageEndpoint.scala
++++ b/core/src/main/scala/org/apache/spark/storage/BlockManagerStorageEndpoint.scala
+@@ -81,6 +81,15 @@ class BlockManagerStorageEndpoint(
+     case ReplicateBlock(blockId, replicas, maxReplicas) =>
+       context.reply(blockManager.replicateBlock(blockId, replicas.toSet, maxReplicas))
+ 
++    case MarkRDDBlockAsVisible(blockId) =>
++      // The message is sent from driver to ask the block manager to mark the rdd block with
++      // `blockId` to be visible now. This happens in 2 scenarios:
++      // 1. A task computing/caching the rdd block finished successfully and the rdd block can be
++      //    turned to be visible. Driver will ask all block managers hosting the rdd block to mark
++      //    the block as visible.
++      // 2. Once a replica of a visible block is cached and reported, driver will also ask the
++      //    the block manager to mark the block as visible immediately.
++      context.reply(blockManager.blockInfoManager.tryMarkBlockAsVisible(blockId))
+   }
+ 
+   private def doAsync[T](actionMessage: String, context: RpcCallContext)(body: => T): Unit = {
+diff --git a/core/src/test/scala/org/apache/spark/AccumulatorSuite.scala b/core/src/test/scala/org/apache/spark/AccumulatorSuite.scala
+index e4dfa149a7d..9b70ccdf07e 100644
+--- a/core/src/test/scala/org/apache/spark/AccumulatorSuite.scala
++++ b/core/src/test/scala/org/apache/spark/AccumulatorSuite.scala
+@@ -28,11 +28,12 @@ import scala.util.control.NonFatal
+ import org.scalatest.exceptions.TestFailedException
+ import org.scalatest.matchers.must.Matchers
+ 
++import org.apache.spark.internal.config.RDD_CACHE_VISIBILITY_TRACKING_ENABLED
+ import org.apache.spark.scheduler._
+ import org.apache.spark.serializer.JavaSerializer
++import org.apache.spark.storage.StorageLevel
+ import org.apache.spark.util.{AccumulatorContext, AccumulatorMetadata, AccumulatorV2, LongAccumulator}
+ 
+-
+ class AccumulatorSuite extends SparkFunSuite with Matchers with LocalSparkContext {
+   import AccumulatorSuite.createLongAccum
+ 
+@@ -89,6 +90,39 @@ class AccumulatorSuite extends SparkFunSuite with Matchers with LocalSparkContex
+     assert(AccumulatorContext.get(100000).isEmpty)
+   }
+ 
++  test("SPARK-41497: accumulators should be reported in the case of task retry with rdd cache") {
++    // Set up a cluster with 2 executors
++    val conf = new SparkConf()
++      .set(RDD_CACHE_VISIBILITY_TRACKING_ENABLED, true)
++      .setMaster("local-cluster[2, 1, 1024]")
++      .setAppName("test")
++    sc = new SparkContext(conf)
++    val myAcc = sc.longAccumulator("myAcc")
++    // Initiate a rdd with only one partition so there's only one task and specify the storage level
++    // with MEMORY_ONLY_2 so that the rdd result will be cached on both two executors.
++    val rdd1 = sc.parallelize(0 until 10, 1).mapPartitions { iter =>
++      myAcc.add(100)
++      iter.map(x => x + 1)
++    }.persist(StorageLevel.MEMORY_ONLY_2)
++
++    val rdd2 = rdd1.filter { x =>
++      val context = TaskContext.get()
++      if (context.attemptNumber() == 0) {
++        throw new RuntimeException("fail the task.")
++      }
++      x >= 0
++    }
++
++    // This will pass since the second task attempt will succeed
++    assert(rdd2.count() === 10)
++    // Even though the first task attempt had cached the data, the accumulator should be reported
++    // by the second attempt.
++    assert(myAcc.value === 100)
++
++    // Should load cache and not update the accumulators since cache is visible now.
++    assert(rdd2.count() === 10)
++    assert(myAcc.value === 100)
++  }
+ }
+ 
+ private[spark] object AccumulatorSuite {
+diff --git a/core/src/test/scala/org/apache/spark/scheduler/DAGSchedulerSuite.scala b/core/src/test/scala/org/apache/spark/scheduler/DAGSchedulerSuite.scala
+index 1e3f353a278..31f2ed0a915 100644
+--- a/core/src/test/scala/org/apache/spark/scheduler/DAGSchedulerSuite.scala
++++ b/core/src/test/scala/org/apache/spark/scheduler/DAGSchedulerSuite.scala
+@@ -404,6 +404,7 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
+     broadcastManager = new BroadcastManager(true, sc.getConf)
+     mapOutputTracker = spy(new MyMapOutputTrackerMaster(sc.getConf, broadcastManager))
+     blockManagerMaster = spy(new MyBlockManagerMaster(sc.getConf))
++    doNothing().when(blockManagerMaster).updateRDDBlockVisibility(any(), any())
+     scheduler = new MyDAGScheduler(
+       sc,
+       taskScheduler,
+diff --git a/core/src/test/scala/org/apache/spark/storage/BlockManagerSuite.scala b/core/src/test/scala/org/apache/spark/storage/BlockManagerSuite.scala
+index 842b66193f2..cc1c01d80cb 100644
+--- a/core/src/test/scala/org/apache/spark/storage/BlockManagerSuite.scala
++++ b/core/src/test/scala/org/apache/spark/storage/BlockManagerSuite.scala
+@@ -28,6 +28,7 @@ import scala.concurrent.{Future, TimeoutException}
+ import scala.concurrent.duration._
+ import scala.language.implicitConversions
+ import scala.reflect.ClassTag
++import scala.reflect.classTag
+ 
+ import com.esotericsoftware.kryo.KryoException
+ import org.apache.commons.lang3.RandomUtils
+@@ -104,6 +105,7 @@ class BlockManagerSuite extends SparkFunSuite with Matchers with PrivateMethodTe
+       .set(STORAGE_UNROLL_MEMORY_THRESHOLD, 512L)
+       .set(Network.RPC_ASK_TIMEOUT, "5s")
+       .set(PUSH_BASED_SHUFFLE_ENABLED, true)
++      .set(RDD_CACHE_VISIBILITY_TRACKING_ENABLED, true)
+   }
+ 
+   private def makeSortShuffleManager(conf: Option[SparkConf] = None): SortShuffleManager = {
+@@ -972,13 +974,17 @@ class BlockManagerSuite extends SparkFunSuite with Matchers with PrivateMethodTe
+   }
+ 
+   test("SPARK-14252: getOrElseUpdate should still read from remote storage") {
+-    val store = makeBlockManager(8000, "executor1")
++    val store = spy(makeBlockManager(8000, "executor1"))
+     val store2 = makeBlockManager(8000, "executor2")
+     val list1 = List(new Array[Byte](4000))
++    val blockId = RDDBlockId(0, 0)
+     store2.putIterator(
+-      "list1", list1.iterator, StorageLevel.MEMORY_ONLY, tellMaster = true)
+-    assert(store.getOrElseUpdate(
+-      "list1",
++      blockId, list1.iterator, StorageLevel.MEMORY_ONLY, tellMaster = true)
++
++    doAnswer { _ => true }.when(store).isRDDBlockVisible(mc.any())
++    assert(store.getOrElseUpdateRDDBlock(
++      0L,
++      blockId,
+       StorageLevel.MEMORY_ONLY,
+       ClassTag.Any,
+       () => fail("attempted to compute locally")).isLeft)
+@@ -2198,8 +2204,7 @@ class BlockManagerSuite extends SparkFunSuite with Matchers with PrivateMethodTe
+     store.putSingle("my-block-id", new Array[User](300), StorageLevel.MEMORY_AND_DISK)
+ 
+     val kryoException = intercept[KryoException] {
+-      store.getOrElseUpdate("my-block-id", StorageLevel.MEMORY_AND_DISK, ClassTag.Object,
+-        () => List(new Array[User](1)).iterator)
++      store.get("my-block-id")
+     }
+     assert(kryoException.getMessage === "java.io.IOException: Input/output error")
+     assertUpdateBlockInfoReportedForRemovingBlock(store, "my-block-id",
+@@ -2266,6 +2271,164 @@ class BlockManagerSuite extends SparkFunSuite with Matchers with PrivateMethodTe
+     }
+   }
+ 
++  test("SPARK-41497: getOrElseUpdateRDDBlock do compute based on cache visibility statue") {
++    val store = makeBlockManager(8000, "executor1")
++    val blockId = RDDBlockId(rddId = 1, splitIndex = 1)
++    var computed: Boolean = false
++    val data = Seq(1, 2, 3)
++    val makeIterator = () => {
++      computed = true
++      data.iterator
++    }
++
++    // Cache doesn't exist and is not visible.
++    assert(store.getStatus(blockId).isEmpty && !store.isRDDBlockVisible(blockId))
++    val res1 = store.getOrElseUpdateRDDBlock(
++      1, blockId, StorageLevel.MEMORY_ONLY, classTag[Int], makeIterator)
++    // Put cache successfully and reported block task info.
++    assert(res1.isLeft && computed)
++    verify(master, times(1)).updateRDDBlockTaskInfo(blockId, 1)
++    assert(store.getStatus(blockId).nonEmpty && !store.isRDDBlockVisible(blockId))
++
++    // Cache exists but not visible.
++    computed = false
++    val res2 = store.getOrElseUpdateRDDBlock(
++      1, blockId, StorageLevel.MEMORY_ONLY, classTag[Int], makeIterator)
++    // Load cache successfully and reported block task info.
++    assert(res2.isLeft && computed)
++    assert(!store.isRDDBlockVisible(blockId))
++    verify(master, times(2)).updateRDDBlockTaskInfo(blockId, 1)
++
++    // Cache exists and visible.
++    store.blockInfoManager.tryMarkBlockAsVisible(blockId)
++    computed = false
++    assert(store.getStatus(blockId).nonEmpty && store.isRDDBlockVisible(blockId))
++    val res3 = store.getOrElseUpdateRDDBlock(
++      1, blockId, StorageLevel.MEMORY_ONLY, classTag[Int], makeIterator)
++    // Load cache successfully but not report block task info.
++    assert(res3.isLeft && !computed)
++    verify(master, times(2)).updateRDDBlockTaskInfo(blockId, 1)
++  }
++
++
++  test("SPARK-41497: mark rdd block as visible") {
++    val store = makeBlockManager(8000, "executor1")
++    val blockId = RDDBlockId(rddId = 1, splitIndex = 1)
++    val data = Seq(1, 2, 3)
++    store.putIterator(blockId, data.iterator, StorageLevel.MEMORY_ONLY, tellMaster = true)
++    assert(store.getStatus(blockId).nonEmpty)
++    assert(!store.blockInfoManager.isRDDBlockVisible(blockId))
++    assert(store.blockInfoManager.containsInvisibleRDDBlock(blockId))
++
++    // Mark rdd block as visible.
++    store.blockInfoManager.tryMarkBlockAsVisible(blockId)
++    assert(store.blockInfoManager.isRDDBlockVisible(blockId))
++    assert(!store.blockInfoManager.containsInvisibleRDDBlock(blockId))
++
++    // Cache the block again should not change the visibility status.
++    store.putIterator(blockId, data.iterator, StorageLevel.MEMORY_ONLY, tellMaster = true)
++    assert(store.blockInfoManager.isRDDBlockVisible(blockId))
++    assert(!store.blockInfoManager.containsInvisibleRDDBlock(blockId))
++
++    // Remove rdd block.
++    store.removeBlock(blockId)
++    assert(!store.blockInfoManager.isRDDBlockVisible(blockId))
++    assert(!store.blockInfoManager.containsInvisibleRDDBlock(blockId))
++
++    // Visibility status should not be added once rdd is removed.
++    store.blockInfoManager.tryMarkBlockAsVisible(blockId)
++    assert(!store.blockInfoManager.isRDDBlockVisible(blockId))
++    assert(!store.blockInfoManager.containsInvisibleRDDBlock(blockId))
++  }
++
++
++  test("SPARK-41497: master & manager interaction about rdd block visibility information") {
++    val store1 = makeBlockManager(8000, "executor1")
++    val store2 = makeBlockManager(8000, "executor2")
++    val store3 = makeBlockManager(8000, "executor3")
++
++    val taskId = 0L
++    val blockId = RDDBlockId(rddId = 1, splitIndex = 1)
++    val data = Seq(1, 2, 3)
++
++    store1.getOrElseUpdateRDDBlock(
++      taskId, blockId, StorageLevel.MEMORY_ONLY, classTag[Int], () => data.iterator)
++    // Block information is reported and block is not visible.
++    assert(master.getLocations(blockId).nonEmpty)
++    assert(!master.isRDDBlockVisible(blockId))
++    assert(store1.blockInfoManager.containsInvisibleRDDBlock(blockId))
++
++    // A copy is reported, visibility status not changed.
++    store2.putIterator(blockId, data.iterator, StorageLevel.MEMORY_ONLY)
++    assert(master.getLocations(blockId).length === 2)
++    assert(!master.isRDDBlockVisible(blockId))
++    assert(store2.blockInfoManager.containsInvisibleRDDBlock(blockId))
++
++    // Report rdd block visibility as true, driver should ask block managers to mark the block
++    // as visible.
++    master.updateRDDBlockVisibility(taskId, visible = true)
++    eventually(timeout(5.seconds)) {
++      assert(master.isRDDBlockVisible(blockId))
++      assert(store1.blockInfoManager.isRDDBlockVisible(blockId))
++      assert(store2.blockInfoManager.isRDDBlockVisible(blockId))
++    }
++
++    // Visibility status should be updated right after block reported since it's already visible.
++    assert(!store3.blockInfoManager.isRDDBlockVisible(blockId))
++    store3.putIterator(blockId, data.iterator, StorageLevel.MEMORY_ONLY)
++    eventually(timeout(5.seconds)) {
++      assert(store3.blockInfoManager.isRDDBlockVisible(blockId))
++    }
++  }
++
++
++  test("SPARK-41497: rdd block's visibility status should be cached once got from driver") {
++    val store = makeBlockManager(8000, "executor1")
++    val taskId = 0L
++    val blockId = RDDBlockId(rddId = 1, splitIndex = 1)
++    val data = Seq(1, 2, 3)
++
++    store.getOrElseUpdateRDDBlock(
++      taskId, blockId, StorageLevel.MEMORY_ONLY, classTag[Int], () => data.iterator)
++    // Block information is reported and block is not visible.
++    assert(master.getLocations(blockId).nonEmpty)
++    assert(!master.isRDDBlockVisible(blockId))
++    assert(store.blockInfoManager.containsInvisibleRDDBlock(blockId))
++
++    doAnswer(_ => true).when(master).isRDDBlockVisible(mc.any())
++    // Visibility status should be cached.
++    assert(store.isRDDBlockVisible(blockId))
++    assert(!store.blockInfoManager.containsInvisibleRDDBlock(blockId))
++    assert(store.blockInfoManager.isRDDBlockVisible(blockId))
++  }
++
++  test("SPARK-41497: getOrElseUpdateRDDBlock should make sure accumulators updated when block" +
++    " already exist but still not visible") {
++    val store = makeBlockManager(8000, "executor1")
++    val taskId = 0L
++    val blockId = RDDBlockId(rddId = 1, splitIndex = 1)
++    val data = Seq(1, 2, 3)
++    val acc = new LongAccumulator
++    val makeIterator = () => {
++      data.iterator.map { x =>
++        acc.add(1)
++        x
++      }
++    }
++
++    store.getOrElseUpdateRDDBlock(
++      taskId, blockId, StorageLevel.MEMORY_ONLY, classTag[Int], makeIterator)
++    // Block cached but not visible.
++    assert(master.getLocations(blockId).nonEmpty)
++    assert(!master.isRDDBlockVisible(blockId))
++    assert(acc.value === 3)
++
++    store.getOrElseUpdateRDDBlock(
++      taskId, blockId, StorageLevel.MEMORY_ONLY, classTag[Int], makeIterator)
++    // Accumulator should be updated even though block already exists.
++    assert(acc.value === 6)
++  }
++
+   private def createKryoSerializerWithDiskCorruptedInputStream(): KryoSerializer = {
+     class TestDiskCorruptedInputStream extends InputStream {
+       override def read(): Int = throw new IOException("Input/output error")

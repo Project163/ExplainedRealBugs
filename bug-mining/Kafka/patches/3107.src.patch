@@ -1,0 +1,1467 @@
+diff --git a/core/src/main/scala/kafka/cluster/Partition.scala b/core/src/main/scala/kafka/cluster/Partition.scala
+index 069bf6ae14..b8e0ce41bb 100755
+--- a/core/src/main/scala/kafka/cluster/Partition.scala
++++ b/core/src/main/scala/kafka/cluster/Partition.scala
+@@ -18,6 +18,8 @@ package kafka.cluster
+ 
+ import java.util.concurrent.locks.ReentrantReadWriteLock
+ import java.util.Optional
++import java.util.concurrent.CompletableFuture
++
+ import kafka.api.{ApiVersion, LeaderAndIsr}
+ import kafka.common.UnexpectedAppendOffsetException
+ import kafka.controller.{KafkaController, StateChangeLogger}
+@@ -150,30 +152,38 @@ sealed trait IsrState {
+   def isInflight: Boolean
+ }
+ 
++sealed trait PendingIsrChange extends IsrState {
++  def sentLeaderAndIsr: LeaderAndIsr
++}
++
+ case class PendingExpandIsr(
+   isr: Set[Int],
+-  newInSyncReplicaId: Int
+-) extends IsrState {
++  newInSyncReplicaId: Int,
++  sentLeaderAndIsr: LeaderAndIsr
++) extends PendingIsrChange {
+   val maximalIsr = isr + newInSyncReplicaId
+   val isInflight = true
+ 
+   override def toString: String = {
+     s"PendingExpandIsr(isr=$isr" +
+       s", newInSyncReplicaId=$newInSyncReplicaId" +
++      s", sentLeaderAndIsr=$sentLeaderAndIsr" +
+       ")"
+   }
+ }
+ 
+ case class PendingShrinkIsr(
+   isr: Set[Int],
+-  outOfSyncReplicaIds: Set[Int]
+-) extends IsrState  {
++  outOfSyncReplicaIds: Set[Int],
++  sentLeaderAndIsr: LeaderAndIsr
++) extends PendingIsrChange  {
+   val maximalIsr = isr
+   val isInflight = true
+ 
+   override def toString: String = {
+     s"PendingShrinkIsr(isr=$isr" +
+       s", outOfSyncReplicaIds=$outOfSyncReplicaIds" +
++      s", sentLeaderAndIsr=$sentLeaderAndIsr" +
+       ")"
+   }
+ }
+@@ -669,7 +679,7 @@ class Partition(val topicPartition: TopicPartition,
+         val leaderLWIncremented = newLeaderLW > oldLeaderLW
+ 
+         // Check if this in-sync replica needs to be added to the ISR.
+-        maybeExpandIsr(followerReplica, followerFetchTimeMs)
++        maybeExpandIsr(followerReplica)
+ 
+         // check if the HW of the partition can now be incremented
+         // since the replica may already be in the ISR and its LEO has just incremented
+@@ -744,17 +754,22 @@ class Partition(val topicPartition: TopicPartition,
+    *
+    * This function can be triggered when a replica's LEO has incremented.
+    */
+-  private def maybeExpandIsr(followerReplica: Replica, followerFetchTimeMs: Long): Unit = {
+-    val needsIsrUpdate = canAddReplicaToIsr(followerReplica.brokerId) && inReadLock(leaderIsrUpdateLock) {
++  private def maybeExpandIsr(followerReplica: Replica): Unit = {
++    val needsIsrUpdate = !isrState.isInflight && canAddReplicaToIsr(followerReplica.brokerId) && inReadLock(leaderIsrUpdateLock) {
+       needsExpandIsr(followerReplica)
+     }
+     if (needsIsrUpdate) {
+-      inWriteLock(leaderIsrUpdateLock) {
++      val alterIsrUpdateOpt = inWriteLock(leaderIsrUpdateLock) {
+         // check if this replica needs to be added to the ISR
+-        if (needsExpandIsr(followerReplica)) {
+-          expandIsr(followerReplica.brokerId)
++        if (!isrState.isInflight && needsExpandIsr(followerReplica)) {
++          Some(prepareIsrExpand(followerReplica.brokerId))
++        } else {
++          None
+         }
+       }
++      // Send the AlterIsr request outside of the LeaderAndIsr lock since the completion logic
++      // may increment the high watermark (and consequently complete delayed operations).
++      alterIsrUpdateOpt.foreach(submitAlterIsr)
+     }
+   }
+ 
+@@ -914,10 +929,10 @@ class Partition(val topicPartition: TopicPartition,
+     }
+ 
+     if (needsIsrUpdate) {
+-      inWriteLock(leaderIsrUpdateLock) {
+-        leaderLogIfLocal.foreach { leaderLog =>
++      val alterIsrUpdateOpt = inWriteLock(leaderIsrUpdateLock) {
++        leaderLogIfLocal.flatMap { leaderLog =>
+           val outOfSyncReplicaIds = getOutOfSyncReplicas(replicaLagTimeMaxMs)
+-          if (outOfSyncReplicaIds.nonEmpty) {
++          if (!isrState.isInflight && outOfSyncReplicaIds.nonEmpty) {
+             val outOfSyncReplicaLog = outOfSyncReplicaIds.map { replicaId =>
+               val logEndOffsetMessage = getReplica(replicaId)
+                 .map(_.logEndOffset.toString)
+@@ -929,11 +944,15 @@ class Partition(val topicPartition: TopicPartition,
+               s"Leader: (highWatermark: ${leaderLog.highWatermark}, " +
+               s"endOffset: ${leaderLog.logEndOffset}). " +
+               s"Out of sync replicas: $outOfSyncReplicaLog.")
+-
+-            shrinkIsr(outOfSyncReplicaIds)
++            Some(prepareIsrShrink(outOfSyncReplicaIds))
++          } else {
++            None
+           }
+         }
+       }
++      // Send the AlterIsr request outside of the LeaderAndIsr lock since the completion logic
++      // may increment the high watermark (and consequently complete delayed operations).
++      alterIsrUpdateOpt.foreach(submitAlterIsr)
+     }
+   }
+ 
+@@ -1304,121 +1323,138 @@ class Partition(val topicPartition: TopicPartition,
+     }
+   }
+ 
+-  private[cluster] def expandIsr(newInSyncReplica: Int): Unit = {
+-    // This is called from maybeExpandIsr which holds the ISR write lock
+-    if (!isrState.isInflight) {
+-      // When expanding the ISR, we can safely assume the new replica will make it into the ISR since this puts us in
+-      // a more constrained state for advancing the HW.
+-      sendAlterIsrRequest(PendingExpandIsr(isrState.isr, newInSyncReplica))
+-    } else {
+-      trace(s"ISR update in-flight, not adding new in-sync replica $newInSyncReplica")
+-    }
++  private def prepareIsrExpand(newInSyncReplicaId: Int): PendingExpandIsr = {
++    // When expanding the ISR, we assume that the new replica will make it into the ISR
++    // before we receive confirmation that it has. This ensures that the HW will already
++    // reflect the updated ISR even if there is a delay before we receive the confirmation.
++    // Alternatively, if the update fails, no harm is done since the expanded ISR puts
++    // a stricter requirement for advancement of the HW.
++    val isrToSend = isrState.isr + newInSyncReplicaId
++    val newLeaderAndIsr = new LeaderAndIsr(localBrokerId, leaderEpoch, isrToSend.toList, zkVersion)
++    val updatedState = PendingExpandIsr(isrState.isr, newInSyncReplicaId, newLeaderAndIsr)
++    isrState = updatedState
++    updatedState
+   }
+ 
+-  private[cluster] def shrinkIsr(outOfSyncReplicas: Set[Int]): Unit = {
+-    // This is called from maybeShrinkIsr which holds the ISR write lock
+-    if (!isrState.isInflight) {
+-      // When shrinking the ISR, we cannot assume that the update will succeed as this could erroneously advance the HW
+-      // We update pendingInSyncReplicaIds here simply to prevent any further ISR updates from occurring until we get
+-      // the next LeaderAndIsr
+-      sendAlterIsrRequest(PendingShrinkIsr(isrState.isr, outOfSyncReplicas))
+-    } else {
+-      trace(s"ISR update in-flight, not removing out-of-sync replicas $outOfSyncReplicas")
+-    }
++  private[cluster] def prepareIsrShrink(outOfSyncReplicaIds: Set[Int]): PendingShrinkIsr = {
++    // When shrinking the ISR, we cannot assume that the update will succeed as this could
++    // erroneously advance the HW if the `AlterIsr` were to fail. Hence the "maximal ISR"
++    // for `PendingShrinkIsr` is the the current ISR.
++    val isrToSend = isrState.isr -- outOfSyncReplicaIds
++    val newLeaderAndIsr = new LeaderAndIsr(localBrokerId, leaderEpoch, isrToSend.toList, zkVersion)
++    val updatedState = PendingShrinkIsr(isrState.isr, outOfSyncReplicaIds, newLeaderAndIsr)
++    isrState = updatedState
++    updatedState
+   }
+ 
+-  private def sendAlterIsrRequest(proposedIsrState: IsrState): Unit = {
+-    val isrToSend: Set[Int] = proposedIsrState match {
+-      case PendingExpandIsr(isr, newInSyncReplicaId) => isr + newInSyncReplicaId
+-      case PendingShrinkIsr(isr, outOfSyncReplicaIds) => isr -- outOfSyncReplicaIds
+-      case state =>
+-        isrChangeListener.markFailed()
+-        throw new IllegalStateException(s"Invalid state $state for ISR change for partition $topicPartition")
+-    }
++  private def submitAlterIsr(proposedIsrState: PendingIsrChange): CompletableFuture[LeaderAndIsr] = {
++    debug(s"Submitting ISR state change $proposedIsrState")
++    val future = alterIsrManager.submit(topicPartition, proposedIsrState.sentLeaderAndIsr, controllerEpoch)
++    future.whenComplete { (leaderAndIsr, e) =>
++      var hwIncremented = false
++      var shouldRetry = false
+ 
+-    val newLeaderAndIsr = new LeaderAndIsr(localBrokerId, leaderEpoch, isrToSend.toList, zkVersion)
+-    val alterIsrItem = AlterIsrItem(topicPartition, newLeaderAndIsr, handleAlterIsrResponse(proposedIsrState), controllerEpoch)
++      inWriteLock(leaderIsrUpdateLock) {
++        if (isrState != proposedIsrState) {
++          // This means isrState was updated through leader election or some other mechanism
++          // before we got the AlterIsr response. We don't know what happened on the controller
++          // exactly, but we do know this response is out of date so we ignore it.
++          debug(s"Ignoring failed ISR update to $proposedIsrState since we have already " +
++            s"updated state to $isrState")
++        } else if (leaderAndIsr != null) {
++          hwIncremented = handleAlterIsrUpdate(proposedIsrState, leaderAndIsr)
++        } else {
++          shouldRetry = handleAlterIsrError(proposedIsrState, Errors.forException(e))
++        }
++      }
+ 
+-    val oldState = isrState
+-    isrState = proposedIsrState
++      if (hwIncremented) {
++        tryCompleteDelayedRequests()
++      }
+ 
+-    if (!alterIsrManager.submit(alterIsrItem)) {
+-      // If the ISR manager did not accept our update, we need to revert the proposed state.
+-      // This can happen if the ISR state was updated by the controller (via LeaderAndIsr in ZK-mode or
+-      // ChangePartitionRecord in KRaft mode) but we have an AlterIsr request still in-flight.
+-      isrState = oldState
+-      isrChangeListener.markFailed()
+-      warn(s"Failed to enqueue ISR change state $newLeaderAndIsr for partition $topicPartition")
+-    } else {
+-      debug(s"Enqueued ISR change to state $newLeaderAndIsr after transition to $proposedIsrState")
++      // Send the AlterIsr request outside of the LeaderAndIsr lock since the completion logic
++      // may increment the high watermark (and consequently complete delayed operations).
++      if (shouldRetry) {
++        submitAlterIsr(proposedIsrState)
++      }
+     }
+   }
+ 
+   /**
+-   * This is called for each partition in the body of an AlterIsr response. For errors which are non-retryable we simply
+-   * give up. This leaves [[Partition.isrState]] in an in-flight state (either pending shrink or pending expand).
+-   * Since our error was non-retryable we are okay staying in this state until we see new metadata from UpdateMetadata
+-   * or LeaderAndIsr
++   * Handle a failed `AlterIsr` request. For errors which are non-retriable, we simply give up.
++   * This leaves [[Partition.isrState]] in a pending state. Since the error was non-retriable,
++   * we are okay staying in this state until we see new metadata from LeaderAndIsr (or an update
++   * to the KRaft metadata log).
++   *
++   * @param proposedIsrState The ISR state change that was requested
++   * @param error The error returned from [[AlterIsrManager]]
++   * @return true if the `AlterIsr` request should be retried, false otherwise
+    */
+-  private def handleAlterIsrResponse(proposedIsrState: IsrState)(result: Either[Errors, LeaderAndIsr]): Unit = {
+-    val hwIncremented = inWriteLock(leaderIsrUpdateLock) {
+-      if (isrState != proposedIsrState) {
+-        // This means isrState was updated through leader election or some other mechanism before we got the AlterIsr
+-        // response. We don't know what happened on the controller exactly, but we do know this response is out of date
+-        // so we ignore it.
+-        debug(s"Ignoring failed ISR update to $proposedIsrState since we have already updated state to $isrState")
++  private def handleAlterIsrError(
++    proposedIsrState: PendingIsrChange,
++    error: Errors
++  ): Boolean = {
++    isrChangeListener.markFailed()
++    error match {
++      case Errors.OPERATION_NOT_ATTEMPTED =>
++        // Since the operation was not attempted, it is safe to reset back to the committed state.
++        isrState = CommittedIsr(proposedIsrState.isr)
++        debug(s"Failed to update ISR to $proposedIsrState since there is a pending ISR update still inflight. " +
++          s"ISR state has been reset to the latest committed state $isrState")
+         false
+-      } else {
+-        result match {
+-          case Left(error: Errors) =>
+-            isrChangeListener.markFailed()
+-            error match {
+-              case Errors.UNKNOWN_TOPIC_OR_PARTITION =>
+-                debug(s"Failed to update ISR to $proposedIsrState since it doesn't know about this topic or partition. Giving up.")
+-              case Errors.FENCED_LEADER_EPOCH =>
+-                debug(s"Failed to update ISR to $proposedIsrState since we sent an old leader epoch. Giving up.")
+-              case Errors.INVALID_UPDATE_VERSION =>
+-                debug(s"Failed to update ISR to $proposedIsrState due to invalid version. Giving up.")
+-              case _ =>
+-                warn(s"Failed to update ISR to $proposedIsrState due to unexpected $error. Retrying.")
+-                sendAlterIsrRequest(proposedIsrState)
+-            }
+-            false
++      case Errors.UNKNOWN_TOPIC_OR_PARTITION =>
++        debug(s"Failed to update ISR to $proposedIsrState since the controller doesn't know about " +
++          "this topic or partition. Giving up.")
++        false
++      case Errors.FENCED_LEADER_EPOCH =>
++        debug(s"Failed to update ISR to $proposedIsrState since the leader epoch is old. Giving up.")
++        false
++      case Errors.INVALID_UPDATE_VERSION =>
++        debug(s"Failed to update ISR to $proposedIsrState because the version is invalid. Giving up.")
++        false
++      case _ =>
++        warn(s"Failed to update ISR to $proposedIsrState due to unexpected $error. Retrying.")
++        true
++    }
++  }
+ 
+-          case Right(leaderAndIsr: LeaderAndIsr) =>
+-            // Success from controller, still need to check a few things
+-            if (leaderAndIsr.leaderEpoch != leaderEpoch) {
+-              debug(s"Ignoring new ISR ${leaderAndIsr} since we have a stale leader epoch $leaderEpoch.")
+-              isrChangeListener.markFailed()
+-              false
+-            } else if (leaderAndIsr.zkVersion < zkVersion) {
+-              debug(s"Ignoring new ISR ${leaderAndIsr} since we have a newer version $zkVersion.")
+-              isrChangeListener.markFailed()
+-              false
+-            } else {
+-              // This is one of two states:
+-              //   1) leaderAndIsr.zkVersion > zkVersion: Controller updated to new version with proposedIsrState.
+-              //   2) leaderAndIsr.zkVersion == zkVersion: No update was performed since proposed and actual state are the same.
+-              // In both cases, we want to move from Pending to Committed state to ensure new updates are processed.
+-
+-              isrState = CommittedIsr(leaderAndIsr.isr.toSet)
+-              zkVersion = leaderAndIsr.zkVersion
+-              info(s"ISR updated to ${isrState.isr.mkString(",")} and version updated to [$zkVersion]")
+-              proposedIsrState match {
+-                case PendingExpandIsr(_, _) => isrChangeListener.markExpand()
+-                case PendingShrinkIsr(_, _) => isrChangeListener.markShrink()
+-                case _ => // nothing to do, shouldn't get here
+-              }
+-
+-              // we may need to increment high watermark since ISR could be down to 1
+-              leaderLogIfLocal.exists(log => maybeIncrementLeaderHW(log))
+-            }
+-        }
++  /**
++   * Handle a successful `AlterIsr` response.
++   *
++   * @param proposedIsrState The ISR state change that was requested
++   * @param leaderAndIsr The updated LeaderAndIsr state
++   * @return true if the high watermark was successfully incremented following, false otherwise
++   */
++  private def handleAlterIsrUpdate(
++    proposedIsrState: PendingIsrChange,
++    leaderAndIsr: LeaderAndIsr
++  ): Boolean = {
++    // Success from controller, still need to check a few things
++    if (leaderAndIsr.leaderEpoch != leaderEpoch) {
++      debug(s"Ignoring new ISR $leaderAndIsr since we have a stale leader epoch $leaderEpoch.")
++      isrChangeListener.markFailed()
++      false
++    } else if (leaderAndIsr.zkVersion < zkVersion) {
++      debug(s"Ignoring new ISR $leaderAndIsr since we have a newer version $zkVersion.")
++      isrChangeListener.markFailed()
++      false
++    } else {
++      // This is one of two states:
++      //   1) leaderAndIsr.zkVersion > zkVersion: Controller updated to new version with proposedIsrState.
++      //   2) leaderAndIsr.zkVersion == zkVersion: No update was performed since proposed and actual state are the same.
++      // In both cases, we want to move from Pending to Committed state to ensure new updates are processed.
++
++      isrState = CommittedIsr(leaderAndIsr.isr.toSet)
++      zkVersion = leaderAndIsr.zkVersion
++      info(s"ISR updated to ${isrState.isr.mkString(",")} and version updated to $zkVersion")
++
++      proposedIsrState match {
++        case PendingExpandIsr(_, _, _) => isrChangeListener.markExpand()
++        case PendingShrinkIsr(_, _, _) => isrChangeListener.markShrink()
+       }
+-    }
+ 
+-    if (hwIncremented) {
+-      tryCompleteDelayedRequests()
++      // we may need to increment high watermark since ISR could be down to 1
++      leaderLogIfLocal.exists(log => maybeIncrementLeaderHW(log))
+     }
+   }
+ 
+diff --git a/core/src/main/scala/kafka/server/AlterIsrManager.scala b/core/src/main/scala/kafka/server/AlterIsrManager.scala
+index 489152ddea..b8507d086d 100644
+--- a/core/src/main/scala/kafka/server/AlterIsrManager.scala
++++ b/core/src/main/scala/kafka/server/AlterIsrManager.scala
+@@ -17,20 +17,22 @@
+ package kafka.server
+ 
+ import java.util
+-import java.util.concurrent.{ConcurrentHashMap, TimeUnit}
++import java.util.concurrent.atomic.AtomicBoolean
++import java.util.concurrent.{CompletableFuture, ConcurrentHashMap, TimeUnit}
++
+ import kafka.api.LeaderAndIsr
+ import kafka.metrics.KafkaMetricsGroup
+ import kafka.utils.{KafkaScheduler, Logging, Scheduler}
+ import kafka.zk.KafkaZkClient
+ import org.apache.kafka.clients.ClientResponse
+ import org.apache.kafka.common.TopicPartition
++import org.apache.kafka.common.errors.OperationNotAttemptedException
+ import org.apache.kafka.common.message.{AlterIsrRequestData, AlterIsrResponseData}
+ import org.apache.kafka.common.metrics.Metrics
+ import org.apache.kafka.common.protocol.Errors
+ import org.apache.kafka.common.requests.{AlterIsrRequest, AlterIsrResponse}
+ import org.apache.kafka.common.utils.Time
+ 
+-import java.util.concurrent.atomic.AtomicBoolean
+ import scala.collection.mutable
+ import scala.collection.mutable.ListBuffer
+ import scala.jdk.CollectionConverters._
+@@ -48,12 +50,16 @@ trait AlterIsrManager {
+ 
+   def shutdown(): Unit = {}
+ 
+-  def submit(alterIsrItem: AlterIsrItem): Boolean
++  def submit(
++    topicPartition: TopicPartition,
++    leaderAndIsr: LeaderAndIsr,
++    controllerEpoch: Int
++  ): CompletableFuture[LeaderAndIsr]
+ }
+ 
+ case class AlterIsrItem(topicPartition: TopicPartition,
+                         leaderAndIsr: LeaderAndIsr,
+-                        callback: Either[Errors, LeaderAndIsr] => Unit,
++                        future: CompletableFuture[LeaderAndIsr],
+                         controllerEpoch: Int) // controllerEpoch needed for Zk impl
+ 
+ object AlterIsrManager {
+@@ -126,10 +132,21 @@ class DefaultAlterIsrManager(
+     controllerChannelManager.shutdown()
+   }
+ 
+-  override def submit(alterIsrItem: AlterIsrItem): Boolean = {
++  override def submit(
++    topicPartition: TopicPartition,
++    leaderAndIsr: LeaderAndIsr,
++    controllerEpoch: Int
++  ): CompletableFuture[LeaderAndIsr] = {
++    val future = new CompletableFuture[LeaderAndIsr]()
++    val alterIsrItem = AlterIsrItem(topicPartition, leaderAndIsr, future, controllerEpoch)
+     val enqueued = unsentIsrUpdates.putIfAbsent(alterIsrItem.topicPartition, alterIsrItem) == null
+-    maybePropagateIsrChanges()
+-    enqueued
++    if (enqueued) {
++      maybePropagateIsrChanges()
++    } else {
++      future.completeExceptionally(new OperationNotAttemptedException(
++        s"Failed to enqueue ISR change state $leaderAndIsr for partition $topicPartition"))
++    }
++    future
+   }
+ 
+   private[server] def maybePropagateIsrChanges(): Unit = {
+@@ -250,19 +267,24 @@ class DefaultAlterIsrManager(
+         // Iterate across the items we sent rather than what we received to ensure we run the callback even if a
+         // partition was somehow erroneously excluded from the response. Note that these callbacks are run from
+         // the leaderIsrUpdateLock write lock in Partition#sendAlterIsrRequest
+-        inflightAlterIsrItems.foreach(inflightAlterIsr =>
+-          if (partitionResponses.contains(inflightAlterIsr.topicPartition)) {
+-            try {
+-              inflightAlterIsr.callback.apply(partitionResponses(inflightAlterIsr.topicPartition))
+-            } finally {
+-              // Regardless of callback outcome, we need to clear from the unsent updates map to unblock further updates
+-              unsentIsrUpdates.remove(inflightAlterIsr.topicPartition)
+-            }
+-          } else {
+-            // Don't remove this partition from the update map so it will get re-sent
+-            warn(s"Partition ${inflightAlterIsr.topicPartition} was sent but not included in the response")
++        inflightAlterIsrItems.foreach { inflightAlterIsr =>
++          partitionResponses.get(inflightAlterIsr.topicPartition) match {
++            case Some(leaderAndIsrOrError) =>
++              try {
++                leaderAndIsrOrError match {
++                  case Left(error) => inflightAlterIsr.future.completeExceptionally(error.exception)
++                  case Right(leaderAndIsr) => inflightAlterIsr.future.complete(leaderAndIsr)
++                }
++              } finally {
++                // Regardless of callback outcome, we need to clear from the unsent updates map to unblock further updates
++                unsentIsrUpdates.remove(inflightAlterIsr.topicPartition)
++              }
++            case None =>
++              // Don't remove this partition from the update map so it will get re-sent
++              warn(s"Partition ${inflightAlterIsr.topicPartition} was sent but not included in the response")
+           }
+-        )
++        }
++
+       case e: Errors =>
+         warn(s"Controller returned an unexpected top-level error when handling AlterIsr request: $e")
+     }
+diff --git a/core/src/main/scala/kafka/server/ZkIsrManager.scala b/core/src/main/scala/kafka/server/ZkIsrManager.scala
+index 8dffcdf307..65e8c147d7 100644
+--- a/core/src/main/scala/kafka/server/ZkIsrManager.scala
++++ b/core/src/main/scala/kafka/server/ZkIsrManager.scala
+@@ -19,11 +19,13 @@ package kafka.server
+ import kafka.utils.{Logging, ReplicationUtils, Scheduler}
+ import kafka.zk.KafkaZkClient
+ import org.apache.kafka.common.TopicPartition
+-import org.apache.kafka.common.protocol.Errors
++import java.util.concurrent.atomic.AtomicLong
++import java.util.concurrent.{CompletableFuture, TimeUnit}
++
++import kafka.api.LeaderAndIsr
++import org.apache.kafka.common.errors.InvalidUpdateVersionException
+ import org.apache.kafka.common.utils.Time
+ 
+-import java.util.concurrent.TimeUnit
+-import java.util.concurrent.atomic.AtomicLong
+ import scala.collection.mutable
+ 
+ /**
+@@ -55,30 +57,34 @@ class ZkIsrManager(scheduler: Scheduler, time: Time, zkClient: KafkaZkClient) ex
+       period = isrChangeNotificationConfig.checkIntervalMs, unit = TimeUnit.MILLISECONDS)
+   }
+ 
+-  override def submit(alterIsrItem: AlterIsrItem): Boolean = {
+-    debug(s"Writing new ISR ${alterIsrItem.leaderAndIsr.isr} to ZooKeeper with version " +
+-      s"${alterIsrItem.leaderAndIsr.zkVersion} for partition ${alterIsrItem.topicPartition}")
++  override def submit(
++    topicPartition: TopicPartition,
++    leaderAndIsr: LeaderAndIsr,
++    controllerEpoch: Int
++  ): CompletableFuture[LeaderAndIsr]= {
++    debug(s"Writing new ISR ${leaderAndIsr.isr} to ZooKeeper with version " +
++      s"${leaderAndIsr.zkVersion} for partition $topicPartition")
+ 
+-    val (updateSucceeded, newVersion) = ReplicationUtils.updateLeaderAndIsr(zkClient, alterIsrItem.topicPartition,
+-      alterIsrItem.leaderAndIsr, alterIsrItem.controllerEpoch)
++    val (updateSucceeded, newVersion) = ReplicationUtils.updateLeaderAndIsr(zkClient, topicPartition,
++      leaderAndIsr, controllerEpoch)
+ 
++    val future = new CompletableFuture[LeaderAndIsr]()
+     if (updateSucceeded) {
+       // Track which partitions need to be propagated to the controller
+       isrChangeSet synchronized {
+-        isrChangeSet += alterIsrItem.topicPartition
++        isrChangeSet += topicPartition
+         lastIsrChangeMs.set(time.milliseconds())
+       }
+ 
+       // We rely on Partition#isrState being properly set to the pending ISR at this point since we are synchronously
+       // applying the callback
+-      alterIsrItem.callback.apply(Right(alterIsrItem.leaderAndIsr.withZkVersion(newVersion)))
++      future.complete(leaderAndIsr.withZkVersion(newVersion))
+     } else {
+-      alterIsrItem.callback.apply(Left(Errors.INVALID_UPDATE_VERSION))
++      future.completeExceptionally(new InvalidUpdateVersionException(
++        s"ISR update $leaderAndIsr for partition $topicPartition with controller epoch $controllerEpoch " +
++          "failed with an invalid version error"))
+     }
+-
+-    // Return true since we unconditionally accept the AlterIsrItem. The result of the operation is indicated by the
+-    // callback, not the return value of this method
+-    true
++    future
+   }
+ 
+   /**
+diff --git a/core/src/test/scala/unit/kafka/cluster/PartitionLockTest.scala b/core/src/test/scala/unit/kafka/cluster/PartitionLockTest.scala
+index 83165effce..9e5441dee1 100644
+--- a/core/src/test/scala/unit/kafka/cluster/PartitionLockTest.scala
++++ b/core/src/test/scala/unit/kafka/cluster/PartitionLockTest.scala
+@@ -18,10 +18,10 @@
+ package kafka.cluster
+ 
+ import java.util.Properties
+-import java.util.concurrent.atomic.AtomicBoolean
+ import java.util.concurrent._
++import java.util.concurrent.atomic.AtomicBoolean
+ 
+-import kafka.api.ApiVersion
++import kafka.api.{ApiVersion, LeaderAndIsr}
+ import kafka.log._
+ import kafka.server._
+ import kafka.server.checkpoints.OffsetCheckpoints
+@@ -29,16 +29,16 @@ import kafka.server.epoch.LeaderEpochFileCache
+ import kafka.server.metadata.MockConfigRepository
+ import kafka.utils._
+ import org.apache.kafka.common.message.LeaderAndIsrRequestData.LeaderAndIsrPartitionState
+-import org.apache.kafka.common.{TopicPartition, Uuid}
+ import org.apache.kafka.common.record.{MemoryRecords, SimpleRecord}
+ import org.apache.kafka.common.utils.Utils
++import org.apache.kafka.common.{TopicPartition, Uuid}
+ import org.junit.jupiter.api.Assertions.{assertEquals, assertFalse, assertTrue}
+ import org.junit.jupiter.api.{AfterEach, BeforeEach, Test}
+ import org.mockito.ArgumentMatchers
+ import org.mockito.Mockito.{mock, when}
+ 
+-import scala.jdk.CollectionConverters._
+ import scala.concurrent.duration._
++import scala.jdk.CollectionConverters._
+ 
+ /**
+  * Verifies that slow appends to log don't block request threads processing replica fetch requests.
+@@ -271,10 +271,10 @@ class PartitionLockTest extends Logging {
+       logManager,
+       alterIsrManager) {
+ 
+-      override def shrinkIsr(newIsr: Set[Int]): Unit = {
++      override def prepareIsrShrink(outOfSyncReplicaIds: Set[Int]): PendingShrinkIsr = {
+         shrinkIsrSemaphore.acquire()
+         try {
+-          super.shrinkIsr(newIsr)
++          super.prepareIsrShrink(outOfSyncReplicaIds)
+         } finally {
+           shrinkIsrSemaphore.release()
+         }
+@@ -307,10 +307,15 @@ class PartitionLockTest extends Logging {
+         new SlowLog(log, offsets.logStartOffset, localLog, leaderEpochCache, producerStateManager, appendSemaphore)
+       }
+     }
+-    when(offsetCheckpoints.fetch(ArgumentMatchers.anyString, ArgumentMatchers.eq(topicPartition)))
+-      .thenReturn(None)
+-    when(alterIsrManager.submit(ArgumentMatchers.any[AlterIsrItem]))
+-      .thenReturn(true)
++    when(offsetCheckpoints.fetch(
++      ArgumentMatchers.anyString,
++      ArgumentMatchers.eq(topicPartition)
++    )).thenReturn(None)
++    when(alterIsrManager.submit(
++      ArgumentMatchers.eq(topicPartition),
++      ArgumentMatchers.any[LeaderAndIsr],
++      ArgumentMatchers.anyInt()
++    )).thenReturn(new CompletableFuture[LeaderAndIsr]())
+ 
+     partition.createLogIfNotExists(isNew = false, isFutureReplica = false, offsetCheckpoints, None)
+ 
+diff --git a/core/src/test/scala/unit/kafka/cluster/PartitionTest.scala b/core/src/test/scala/unit/kafka/cluster/PartitionTest.scala
+index 206a8ee1f6..ccbb1023a6 100644
+--- a/core/src/test/scala/unit/kafka/cluster/PartitionTest.scala
++++ b/core/src/test/scala/unit/kafka/cluster/PartitionTest.scala
+@@ -1608,7 +1608,13 @@ class PartitionTest extends AbstractPartitionTest {
+     assertEquals(0L, partition.localLogOrException.highWatermark)
+ 
+     // Expand ISR
+-    partition.expandIsr(follower3)
++    partition.updateFollowerFetchState(
++      followerId = follower3,
++      followerFetchOffsetMetadata = LogOffsetMetadata(10),
++      followerStartOffset = 0L,
++      followerFetchTimeMs = time.milliseconds(),
++      leaderEndOffset = 10
++    )
+     assertEquals(Set(brokerId, follower1, follower2), partition.isrState.isr)
+     assertEquals(Set(brokerId, follower1, follower2, follower3), partition.isrState.maximalIsr)
+ 
+@@ -1616,7 +1622,8 @@ class PartitionTest extends AbstractPartitionTest {
+     assertEquals(alterIsrManager.isrUpdates.size, 1)
+ 
+     // Try to modify ISR again, should do nothing
+-    partition.shrinkIsr(Set(follower3))
++    time.sleep(partition.replicaLagTimeMaxMs + 1)
++    partition.maybeShrinkIsr()
+     assertEquals(alterIsrManager.isrUpdates.size, 1)
+   }
+ 
+@@ -1671,7 +1678,13 @@ class PartitionTest extends AbstractPartitionTest {
+     assertEquals(0L, partition.localLogOrException.highWatermark)
+ 
+     // Expand ISR
+-    partition.expandIsr(follower3)
++    partition.updateFollowerFetchState(
++      followerId = follower3,
++      followerFetchOffsetMetadata = LogOffsetMetadata(10),
++      followerStartOffset = 0L,
++      followerFetchTimeMs = time.milliseconds(),
++      leaderEndOffset = 10
++    )
+ 
+     // Try avoiding a race
+     TestUtils.waitUntilTrue(() => !partition.isrState.isInflight, "Expected ISR state to be committed", 100)
+@@ -1681,13 +1694,6 @@ class PartitionTest extends AbstractPartitionTest {
+       case _ => fail("Expected a committed ISR following Zk expansion")
+     }
+ 
+-    // Verify duplicate request. In-flight state should be reset even though version hasn't changed.
+-    doAnswer(_ => (true, 2))
+-      .when(kafkaZkClient)
+-      .conditionalUpdatePath(anyString(), any(), ArgumentMatchers.eq(2), any())
+-    partition.expandIsr(follower3)
+-    TestUtils.waitUntilTrue(() => !partition.isrState.isInflight, "Expected ISR state to be committed", 100)
+-
+     scheduler.shutdown()
+   }
+ 
+diff --git a/core/src/test/scala/unit/kafka/server/AlterIsrManagerTest.scala b/core/src/test/scala/unit/kafka/server/AlterIsrManagerTest.scala
+index 1c8c81471f..86f0dd2361 100644
+--- a/core/src/test/scala/unit/kafka/server/AlterIsrManagerTest.scala
++++ b/core/src/test/scala/unit/kafka/server/AlterIsrManagerTest.scala
+@@ -18,23 +18,25 @@
+ package kafka.server
+ 
+ import java.util.Collections
+-import java.util.concurrent.atomic.AtomicInteger
+ 
+ import kafka.api.LeaderAndIsr
+ import kafka.utils.{MockScheduler, MockTime}
+ import kafka.zk.KafkaZkClient
+ import org.apache.kafka.clients.ClientResponse
+ import org.apache.kafka.common.TopicPartition
+-import org.apache.kafka.common.errors.{AuthenticationException, UnsupportedVersionException}
++import org.apache.kafka.common.errors.{AuthenticationException, InvalidUpdateVersionException, OperationNotAttemptedException, UnknownServerException, UnsupportedVersionException}
+ import org.apache.kafka.common.message.AlterIsrResponseData
+ import org.apache.kafka.common.metrics.Metrics
+-import org.apache.kafka.common.protocol.Errors
++import org.apache.kafka.common.protocol.{ApiKeys, Errors}
+ import org.apache.kafka.common.requests.{AbstractRequest, AlterIsrRequest, AlterIsrResponse}
++import org.apache.kafka.test.TestUtils.assertFutureThrows
+ import org.easymock.EasyMock
+ import org.junit.jupiter.api.Assertions._
+ import org.junit.jupiter.api.{BeforeEach, Test}
+ import org.mockito.ArgumentMatchers.{any, anyString}
+-import org.mockito.{ArgumentMatchers, Mockito}
++import org.mockito.{ArgumentCaptor, ArgumentMatchers, Mockito}
++
++import scala.jdk.CollectionConverters._
+ 
+ class AlterIsrManagerTest {
+ 
+@@ -63,7 +65,7 @@ class AlterIsrManagerTest {
+     val scheduler = new MockScheduler(time)
+     val alterIsrManager = new DefaultAlterIsrManager(brokerToController, scheduler, time, brokerId, () => 2)
+     alterIsrManager.start()
+-    alterIsrManager.submit(AlterIsrItem(tp0, new LeaderAndIsr(1, 1, List(1,2,3), 10), _ => {}, 0))
++    alterIsrManager.submit(tp0, new LeaderAndIsr(1, 1, List(1,2,3), 10), 0)
+     EasyMock.verify(brokerToController)
+   }
+ 
+@@ -81,8 +83,12 @@ class AlterIsrManagerTest {
+     alterIsrManager.start()
+ 
+     // Only send one ISR update for a given topic+partition
+-    assertTrue(alterIsrManager.submit(AlterIsrItem(tp0, new LeaderAndIsr(1, 1, List(1,2,3), 10), _ => {}, 0)))
+-    assertFalse(alterIsrManager.submit(AlterIsrItem(tp0, new LeaderAndIsr(1, 1, List(1,2), 10), _ => {}, 0)))
++    val firstSubmitFuture = alterIsrManager.submit(tp0, new LeaderAndIsr(1, 1, List(1,2,3), 10), 0)
++    assertFalse(firstSubmitFuture.isDone)
++
++    val failedSubmitFuture = alterIsrManager.submit(tp0, new LeaderAndIsr(1, 1, List(1,2), 10), 0)
++    assertTrue(failedSubmitFuture.isCompletedExceptionally)
++    assertFutureThrows(failedSubmitFuture, classOf[OperationNotAttemptedException])
+ 
+     // Simulate response
+     val alterIsrResp = partitionResponse(tp0, Errors.NONE)
+@@ -91,7 +97,9 @@ class AlterIsrManagerTest {
+     callbackCapture.getValue.onComplete(resp)
+ 
+     // Now we can submit this partition again
+-    assertTrue(alterIsrManager.submit(AlterIsrItem(tp0, new LeaderAndIsr(1, 1, List(1), 10), _ => {}, 0)))
++    val newSubmitFuture = alterIsrManager.submit(tp0, new LeaderAndIsr(1, 1, List(1), 10), 0)
++    assertFalse(newSubmitFuture.isDone)
++
+     EasyMock.verify(brokerToController)
+ 
+     // Make sure we sent the right request ISR={1}
+@@ -114,13 +122,13 @@ class AlterIsrManagerTest {
+     alterIsrManager.start()
+ 
+     // First request will send batch of one
+-    alterIsrManager.submit(AlterIsrItem(new TopicPartition(topic, 0),
+-      new LeaderAndIsr(1, 1, List(1,2,3), 10), _ => {}, 0))
++    alterIsrManager.submit(new TopicPartition(topic, 0),
++      new LeaderAndIsr(1, 1, List(1,2,3), 10), 0)
+ 
+     // Other submissions will queue up until a response
+     for (i <- 1 to 9) {
+-      alterIsrManager.submit(AlterIsrItem(new TopicPartition(topic, i),
+-        new LeaderAndIsr(1, 1, List(1,2,3), 10), _ => {}, 0))
++      alterIsrManager.submit(new TopicPartition(topic, i),
++        new LeaderAndIsr(1, 1, List(1,2,3), 10), 0)
+     }
+ 
+     // Simulate response, omitting partition 0 will allow it to stay in unsent queue
+@@ -175,7 +183,6 @@ class AlterIsrManagerTest {
+ 
+   private def testRetryOnErrorResponse(response: ClientResponse): Unit = {
+     val leaderAndIsr = new LeaderAndIsr(1, 1, List(1,2,3), 10)
+-    val isrs = Seq(AlterIsrItem(tp0, leaderAndIsr, _ => { }, 0))
+     val callbackCapture = EasyMock.newCapture[ControllerRequestCompletionHandler]()
+ 
+     EasyMock.expect(brokerToController.start())
+@@ -185,7 +192,7 @@ class AlterIsrManagerTest {
+     val scheduler = new MockScheduler(time)
+     val alterIsrManager = new DefaultAlterIsrManager(brokerToController, scheduler, time, brokerId, () => 2)
+     alterIsrManager.start()
+-    isrs.foreach(alterIsrManager.submit)
++    alterIsrManager.submit(tp0, leaderAndIsr, 0)
+ 
+     EasyMock.verify(brokerToController)
+ 
+@@ -231,7 +238,8 @@ class AlterIsrManagerTest {
+   private def checkPartitionError(error: Errors): Unit = {
+     val alterIsrManager = testPartitionError(tp0, error)
+     // Any partition-level error should clear the item from the pending queue allowing for future updates
+-    assertTrue(alterIsrManager.submit(AlterIsrItem(tp0, new LeaderAndIsr(1, 1, List(1,2,3), 10), _ => {}, 0)))
++    val future = alterIsrManager.submit(tp0, new LeaderAndIsr(1, 1, List(1,2,3), 10), 0)
++    assertFalse(future.isDone)
+   }
+ 
+   private def testPartitionError(tp: TopicPartition, error: Errors): AlterIsrManager = {
+@@ -245,15 +253,7 @@ class AlterIsrManagerTest {
+     val alterIsrManager = new DefaultAlterIsrManager(brokerToController, scheduler, time, brokerId, () => 2)
+     alterIsrManager.start()
+ 
+-    var capturedError: Option[Errors] = None
+-    val callback = (result:  Either[Errors, LeaderAndIsr]) => {
+-      result match {
+-        case Left(error: Errors) => capturedError = Some(error)
+-        case Right(_) => fail("Should have seen error")
+-      }
+-    }
+-
+-    alterIsrManager.submit(AlterIsrItem(tp, new LeaderAndIsr(1, 1, List(1,2,3), 10), callback, 0))
++    val future = alterIsrManager.submit(tp, new LeaderAndIsr(1, 1, List(1,2,3), 10), 0)
+ 
+     EasyMock.verify(brokerToController)
+     EasyMock.reset(brokerToController)
+@@ -262,8 +262,8 @@ class AlterIsrManagerTest {
+     val resp = new ClientResponse(null, null, "", 0L, 0L,
+       false, null, null, alterIsrResp)
+     callbackCapture.getValue.onComplete(resp)
+-    assertTrue(capturedError.isDefined)
+-    assertEquals(capturedError.get, error)
++    assertTrue(future.isCompletedExceptionally)
++    assertFutureThrows(future, error.exception.getClass)
+     alterIsrManager
+   }
+ 
+@@ -280,11 +280,11 @@ class AlterIsrManagerTest {
+     alterIsrManager.start()
+ 
+     // First submit will send the request
+-    alterIsrManager.submit(AlterIsrItem(tp0, new LeaderAndIsr(1, 1, List(1,2,3), 10), _ => {}, 0))
++    alterIsrManager.submit(tp0, new LeaderAndIsr(1, 1, List(1,2,3), 10), 0)
+ 
+     // These will become pending unsent items
+-    alterIsrManager.submit(AlterIsrItem(tp1, new LeaderAndIsr(1, 1, List(1,2,3), 10), _ => {}, 0))
+-    alterIsrManager.submit(AlterIsrItem(tp2, new LeaderAndIsr(1, 1, List(1,2,3), 10), _ => {}, 0))
++    alterIsrManager.submit(tp1, new LeaderAndIsr(1, 1, List(1,2,3), 10), 0)
++    alterIsrManager.submit(tp2, new LeaderAndIsr(1, 1, List(1,2,3), 10), 0)
+ 
+     EasyMock.verify(brokerToController)
+ 
+@@ -301,34 +301,68 @@ class AlterIsrManagerTest {
+ 
+   @Test
+   def testPartitionMissingInResponse(): Unit = {
+-    val callbackCapture = EasyMock.newCapture[ControllerRequestCompletionHandler]()
+-    EasyMock.reset(brokerToController)
+-    EasyMock.expect(brokerToController.start())
+-    EasyMock.expect(brokerToController.sendRequest(EasyMock.anyObject(), EasyMock.capture(callbackCapture))).once()
+-    EasyMock.replay(brokerToController)
++    brokerToController = Mockito.mock(classOf[BrokerToControllerChannelManager])
+ 
++    val brokerEpoch = 2
+     val scheduler = new MockScheduler(time)
+-    val alterIsrManager = new DefaultAlterIsrManager(brokerToController, scheduler, time, brokerId, () => 2)
++    val alterIsrManager = new DefaultAlterIsrManager(brokerToController, scheduler, time, brokerId, () => brokerEpoch)
+     alterIsrManager.start()
+ 
+-    val count = new AtomicInteger(0)
+-    val callback = (result:  Either[Errors, LeaderAndIsr]) => {
+-      count.incrementAndGet()
+-      return
++    def matchesAlterIsr(topicPartitions: Set[TopicPartition]): AbstractRequest.Builder[_ <: AbstractRequest] = {
++      ArgumentMatchers.argThat[AbstractRequest.Builder[_ <: AbstractRequest]] { request =>
++        assertEquals(ApiKeys.ALTER_ISR, request.apiKey())
++        val alterIsrRequest = request.asInstanceOf[AlterIsrRequest.Builder].build()
++
++        val requestTopicPartitions = alterIsrRequest.data.topics.asScala.flatMap { topicData =>
++          val topic = topicData.name
++          topicData.partitions.asScala.map(partitionData => new TopicPartition(topic, partitionData.partitionIndex))
++        }.toSet
++
++        topicPartitions == requestTopicPartitions
++      }
+     }
+-    alterIsrManager.submit(AlterIsrItem(tp0, new LeaderAndIsr(1, 1, List(1,2,3), 10), callback, 0))
+-    alterIsrManager.submit(AlterIsrItem(tp1, new LeaderAndIsr(1, 1, List(1,2,3), 10), callback, 0))
+-    alterIsrManager.submit(AlterIsrItem(tp2, new LeaderAndIsr(1, 1, List(1,2,3), 10), callback, 0))
+ 
+-    EasyMock.verify(brokerToController)
++    def verifySendAlterIsr(topicPartitions: Set[TopicPartition]): ControllerRequestCompletionHandler = {
++      val callbackCapture: ArgumentCaptor[ControllerRequestCompletionHandler] =
++        ArgumentCaptor.forClass(classOf[ControllerRequestCompletionHandler])
++      Mockito.verify(brokerToController).sendRequest(
++        matchesAlterIsr(topicPartitions),
++        callbackCapture.capture()
++      )
++      Mockito.reset(brokerToController)
++      callbackCapture.getValue
++    }
+ 
+-    // Three partitions were sent, but only one returned
+-    val alterIsrResp = partitionResponse(tp0, Errors.UNKNOWN_SERVER_ERROR)
+-    val resp = new ClientResponse(null, null, "", 0L, 0L,
+-      false, null, null, alterIsrResp)
+-    callbackCapture.getValue.onComplete(resp)
++    def clientResponse(topicPartition: TopicPartition, error: Errors): ClientResponse = {
++      val alterIsrResponse = partitionResponse(topicPartition, error)
++      new ClientResponse(null, null, "", 0L, 0L,
++        false, null, null, alterIsrResponse)
++    }
+ 
+-    assertEquals(count.get, 3, "Expected all callbacks to run")
++    // The first `submit` will send the `AlterIsr` request
++    val future1 = alterIsrManager.submit(tp0, new LeaderAndIsr(1, 1, List(1,2,3), 10), 0)
++    val callback1 = verifySendAlterIsr(Set(tp0))
++
++    // Additional calls while the `AlterIsr` request is inflight will be queued
++    val future2 = alterIsrManager.submit(tp1, new LeaderAndIsr(1, 1, List(1,2,3), 10), 0)
++    val future3 = alterIsrManager.submit(tp2, new LeaderAndIsr(1, 1, List(1,2,3), 10), 0)
++
++    // Respond to the first request, which will also allow the next request to get sent
++    callback1.onComplete(clientResponse(tp0, Errors.UNKNOWN_SERVER_ERROR))
++    assertFutureThrows(future1, classOf[UnknownServerException])
++    assertFalse(future2.isDone)
++    assertFalse(future3.isDone)
++
++    // Verify the second request includes both expected partitions, but only respond with one of them
++    val callback2 = verifySendAlterIsr(Set(tp1, tp2))
++    callback2.onComplete(clientResponse(tp2, Errors.UNKNOWN_SERVER_ERROR))
++    assertFutureThrows(future3, classOf[UnknownServerException])
++    assertFalse(future2.isDone)
++
++    // The missing partition should be retried
++    val callback3 = verifySendAlterIsr(Set(tp1))
++    callback3.onComplete(clientResponse(tp1, Errors.UNKNOWN_SERVER_ERROR))
++    assertFutureThrows(future2, classOf[UnknownServerException])
+   }
+ 
+   @Test
+@@ -347,17 +381,15 @@ class AlterIsrManagerTest {
+     val zkIsrManager = new ZkIsrManager(scheduler, time, kafkaZkClient)
+     zkIsrManager.start()
+ 
+-    def expectMatch(expect: Either[Errors, LeaderAndIsr])(result: Either[Errors, LeaderAndIsr]): Unit = {
+-      assertEquals(expect, result)
+-    }
+-
+     // Correct ZK version
+-    assertTrue(zkIsrManager.submit(AlterIsrItem(tp0, new LeaderAndIsr(1, 1, List(1,2,3), 1),
+-      expectMatch(Right(new LeaderAndIsr(1, 1, List(1,2,3), 2))), 0)))
++    val future1 = zkIsrManager.submit(tp0, new LeaderAndIsr(1, 1, List(1,2,3), 1), 0)
++    assertTrue(future1.isDone)
++    assertEquals(new LeaderAndIsr(1, 1, List(1,2,3), 2), future1.get)
+ 
+     // Wrong ZK version
+-    assertTrue(zkIsrManager.submit(AlterIsrItem(tp0, new LeaderAndIsr(1, 1, List(1,2,3), 3),
+-      expectMatch(Left(Errors.INVALID_UPDATE_VERSION)), 0)))
++    val future2 = zkIsrManager.submit(tp0, new LeaderAndIsr(1, 1, List(1,2,3), 3), 0)
++    assertTrue(future2.isCompletedExceptionally)
++    assertFutureThrows(future2, classOf[InvalidUpdateVersionException])
+   }
+ 
+   private def partitionResponse(tp: TopicPartition, error: Errors): AlterIsrResponse = {
+diff --git a/core/src/test/scala/unit/kafka/server/ReplicaManagerConcurrencyTest.scala b/core/src/test/scala/unit/kafka/server/ReplicaManagerConcurrencyTest.scala
+new file mode 100644
+index 0000000000..e054b192a6
+--- /dev/null
++++ b/core/src/test/scala/unit/kafka/server/ReplicaManagerConcurrencyTest.scala
+@@ -0,0 +1,460 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements. See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License. You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package kafka.server
++
++import java.net.InetAddress
++import java.util
++import java.util.concurrent.atomic.AtomicBoolean
++import java.util.concurrent.{CompletableFuture, Executors, LinkedBlockingQueue, TimeUnit}
++import java.util.{Collections, Optional, Properties}
++
++import kafka.api.LeaderAndIsr
++import kafka.log.{AppendOrigin, LogConfig}
++import kafka.server.metadata.MockConfigRepository
++import kafka.utils.TestUtils.waitUntilTrue
++import kafka.utils.{MockTime, ShutdownableThread, TestUtils}
++import org.apache.kafka.common.metadata.{PartitionChangeRecord, PartitionRecord, TopicRecord}
++import org.apache.kafka.common.metrics.Metrics
++import org.apache.kafka.common.protocol.Errors
++import org.apache.kafka.common.record.SimpleRecord
++import org.apache.kafka.common.replica.ClientMetadata.DefaultClientMetadata
++import org.apache.kafka.common.requests.{FetchRequest, ProduceResponse}
++import org.apache.kafka.common.security.auth.KafkaPrincipal
++import org.apache.kafka.common.utils.Time
++import org.apache.kafka.common.{IsolationLevel, TopicPartition, Uuid}
++import org.apache.kafka.image.{MetadataDelta, MetadataImage}
++import org.apache.kafka.metadata.PartitionRegistration
++import org.junit.jupiter.api.Assertions._
++import org.junit.jupiter.api.{AfterEach, Test}
++import org.mockito.Mockito
++
++import scala.collection.mutable
++import scala.jdk.CollectionConverters._
++import scala.util.Random
++
++class ReplicaManagerConcurrencyTest {
++
++  private val time = new MockTime()
++  private val metrics = new Metrics()
++  private val executor = Executors.newScheduledThreadPool(8)
++  private val tasks = mutable.Buffer.empty[ShutdownableThread]
++
++  private def submit(task: ShutdownableThread): Unit = {
++    tasks += task
++    executor.submit(task)
++  }
++
++  @AfterEach
++  def cleanup(): Unit = {
++    tasks.foreach(_.shutdown())
++    executor.shutdownNow()
++    executor.awaitTermination(5, TimeUnit.SECONDS)
++    metrics.close()
++  }
++
++  @Test
++  def testIsrExpandAndShrinkWithConcurrentProduce(): Unit = {
++    val localId = 0
++    val remoteId = 1
++    val channel = new ControllerChannel
++    val replicaManager = buildReplicaManager(localId, channel)
++
++    // Start with the remote replica out of the ISR
++    val initialPartitionRegistration = registration(
++      replicaIds = Seq(localId, remoteId),
++      isr = Seq(localId),
++      leader = localId
++    )
++
++    val topicModel = new TopicModel(Uuid.randomUuid(), "foo", Map(0 -> initialPartitionRegistration))
++    val topicPartition = new TopicPartition(topicModel.name, 0)
++    val controller = new ControllerModel(topicModel, channel, replicaManager)
++
++    submit(new Clock(time))
++    replicaManager.startup()
++
++    submit(controller)
++    controller.initialize()
++
++    waitUntilTrue(() => {
++      replicaManager.getPartition(topicPartition) match {
++        case HostedPartition.Online(partition) => partition.isLeader
++        case _ => false
++      }
++    }, "Timed out waiting for partition to initialize")
++
++    val partition = replicaManager.getPartitionOrException(topicPartition)
++
++    // Start several producers which are actively writing to the partition
++    (0 to 2).foreach { i =>
++      submit(new ProducerModel(
++        clientId = s"producer-$i",
++        topicPartition,
++        replicaManager
++      ))
++    }
++
++    // Start the remote replica fetcher and wait for it to join the ISR
++    val fetcher = new FetcherModel(
++      clientId = s"replica-$remoteId",
++      replicaId = remoteId,
++      topicModel.topicId,
++      topicPartition,
++      replicaManager
++    )
++
++    submit(fetcher)
++    waitUntilTrue(() => {
++      partition.inSyncReplicaIds == Set(localId, remoteId)
++    }, "Test timed out before ISR was expanded")
++
++    // Stop the fetcher so that the replica is removed from the ISR
++    fetcher.shutdown()
++    waitUntilTrue(() => {
++      partition.inSyncReplicaIds == Set(localId)
++    }, "Test timed out before ISR was shrunk")
++  }
++
++  private class Clock(
++    time: MockTime
++  ) extends ShutdownableThread(name = "clock", isInterruptible = false) {
++    override def doWork(): Unit = {
++      time.sleep(1)
++    }
++  }
++
++  private def buildReplicaManager(
++    localId: Int,
++    channel: ControllerChannel
++  ): ReplicaManager = {
++    val logDir = TestUtils.tempDir()
++
++    val props = new Properties
++    props.put(KafkaConfig.QuorumVotersProp, "100@localhost:12345")
++    props.put(KafkaConfig.ProcessRolesProp, "broker")
++    props.put(KafkaConfig.NodeIdProp, localId.toString)
++    props.put(KafkaConfig.LogDirProp, logDir.getAbsolutePath)
++    props.put(KafkaConfig.ReplicaLagTimeMaxMsProp, 5000.toString)
++
++    val config = new KafkaConfig(props, doLog = false)
++
++    val logManager = TestUtils.createLogManager(
++      defaultConfig = new LogConfig(new Properties),
++      configRepository = new MockConfigRepository,
++      logDirs = Seq(logDir),
++      time = time
++    )
++
++    new ReplicaManager(
++      config,
++      metrics,
++      time,
++      None,
++      time.scheduler,
++      logManager,
++      new AtomicBoolean(false),
++      QuotaFactory.instantiate(config, metrics, time, ""),
++      new BrokerTopicStats,
++      MetadataCache.kRaftMetadataCache(config.brokerId),
++      new LogDirFailureChannel(config.logDirs.size),
++      new MockAlterIsrManager(channel)
++    ) {
++      override def createReplicaFetcherManager(
++        metrics: Metrics,
++        time: Time,
++        threadNamePrefix: Option[String],
++        quotaManager: ReplicationQuotaManager
++      ): ReplicaFetcherManager = {
++        Mockito.mock(classOf[ReplicaFetcherManager])
++      }
++    }
++  }
++
++  private class FetcherModel(
++    clientId: String,
++    replicaId: Int,
++    topicId: Uuid,
++    topicPartition: TopicPartition,
++    replicaManager: ReplicaManager
++  ) extends ShutdownableThread(name = clientId, isInterruptible = false) {
++    private val random = new Random()
++
++    private val clientMetadata = new DefaultClientMetadata(
++      "",
++      clientId,
++      InetAddress.getLocalHost,
++      KafkaPrincipal.ANONYMOUS,
++      "PLAINTEXT"
++    )
++
++    private var fetchOffset = 0L
++
++    override def doWork(): Unit = {
++      val partitionData = new FetchRequest.PartitionData(
++        fetchOffset,
++        -1,
++        65536,
++        Optional.empty(),
++        Optional.empty()
++      )
++
++      val future = new CompletableFuture[FetchPartitionData]()
++      def fetchCallback(results: collection.Seq[(TopicPartition, FetchPartitionData)]): Unit = {
++        try {
++          assertEquals(1, results.size)
++          val (topicPartition, result) = results.head
++          assertEquals(this.topicPartition, topicPartition)
++          assertEquals(Errors.NONE, result.error)
++          future.complete(result)
++        } catch {
++          case e: Throwable => future.completeExceptionally(e)
++        }
++      }
++
++      replicaManager.fetchMessages(
++        timeout = random.nextInt(100),
++        replicaId = replicaId,
++        fetchMinBytes = 1,
++        fetchMaxBytes = 1024 * 1024,
++        hardMaxBytesLimit = false,
++        fetchInfos = Seq(topicPartition -> partitionData),
++        topicIds = Collections.singletonMap(topicPartition.topic, topicId),
++        quota = QuotaFactory.UnboundedQuota,
++        responseCallback = fetchCallback,
++        isolationLevel = IsolationLevel.READ_UNCOMMITTED,
++        clientMetadata = Some(clientMetadata)
++      )
++
++      val fetchResult = future.get()
++      fetchResult.records.batches.forEach { batch =>
++        fetchOffset = batch.lastOffset + 1
++      }
++    }
++  }
++
++  private class ProducerModel(
++    clientId: String,
++    topicPartition: TopicPartition,
++    replicaManager: ReplicaManager
++  ) extends ShutdownableThread(name = clientId, isInterruptible = false) {
++    private val random = new Random()
++    private var sequence = 0
++
++    override def doWork(): Unit = {
++      val numRecords = (random.nextInt() % 10) + 1
++
++      val records = (0 until numRecords).map { i =>
++        new SimpleRecord(s"$clientId-${sequence + i}".getBytes)
++      }
++
++      val future = new CompletableFuture[ProduceResponse.PartitionResponse]()
++      def produceCallback(results: collection.Map[TopicPartition, ProduceResponse.PartitionResponse]): Unit = {
++        try {
++          assertEquals(1, results.size)
++          val (topicPartition, result) = results.head
++          assertEquals(this.topicPartition, topicPartition)
++          assertEquals(Errors.NONE, result.error)
++          future.complete(result)
++        } catch {
++          case e: Throwable => future.completeExceptionally(e)
++        }
++      }
++
++      replicaManager.appendRecords(
++        timeout = 30000,
++        requiredAcks = (-1).toShort,
++        internalTopicsAllowed = false,
++        origin = AppendOrigin.Client,
++        entriesPerPartition = collection.Map(topicPartition -> TestUtils.records(records)),
++        responseCallback = produceCallback
++      )
++
++      future.get()
++      sequence += numRecords
++    }
++  }
++
++  sealed trait ControllerEvent
++  case object InitializeEvent extends ControllerEvent
++  case object ShutdownEvent extends ControllerEvent
++  case class AlterIsrEvent(
++    future: CompletableFuture[LeaderAndIsr],
++    topicPartition: TopicPartition,
++    leaderAndIsr: LeaderAndIsr
++  ) extends ControllerEvent
++
++  private class ControllerChannel {
++    private val eventQueue = new LinkedBlockingQueue[ControllerEvent]()
++
++    def poll(): ControllerEvent = {
++      eventQueue.take()
++    }
++
++    def alterIsr(
++      topicPartition: TopicPartition,
++      leaderAndIsr: LeaderAndIsr
++    ): CompletableFuture[LeaderAndIsr] = {
++      val future = new CompletableFuture[LeaderAndIsr]()
++      eventQueue.offer(AlterIsrEvent(future, topicPartition, leaderAndIsr))
++      future
++    }
++
++    def initialize(): Unit = {
++      eventQueue.offer(InitializeEvent)
++    }
++
++    def shutdown(): Unit = {
++      eventQueue.offer(ShutdownEvent)
++    }
++  }
++
++  private class ControllerModel(
++    topic: TopicModel,
++    channel: ControllerChannel,
++    replicaManager: ReplicaManager
++  ) extends ShutdownableThread(name = "controller", isInterruptible = false) {
++    private var latestImage = MetadataImage.EMPTY
++
++    def initialize(): Unit = {
++      channel.initialize()
++    }
++
++    override def shutdown(): Unit = {
++      super.initiateShutdown()
++      channel.shutdown()
++      super.awaitShutdown()
++    }
++
++    override def doWork(): Unit = {
++      channel.poll() match {
++        case InitializeEvent =>
++          val delta = new MetadataDelta(latestImage)
++          topic.initialize(delta)
++          latestImage = delta.apply()
++          replicaManager.applyDelta(latestImage, delta.topicsDelta)
++
++        case AlterIsrEvent(future, topicPartition, leaderAndIsr) =>
++          val delta = new MetadataDelta(latestImage)
++          val updatedLeaderAndIsr = topic.alterIsr(topicPartition, leaderAndIsr, delta)
++          latestImage = delta.apply()
++          future.complete(updatedLeaderAndIsr)
++          replicaManager.applyDelta(latestImage, delta.topicsDelta)
++
++        case ShutdownEvent =>
++      }
++    }
++  }
++
++  private class TopicModel(
++    val topicId: Uuid,
++    val name: String,
++    initialRegistrations: Map[Int, PartitionRegistration]
++  ) {
++    private val partitions: Map[Int, PartitionModel] = initialRegistrations.map {
++      case (partitionId, registration) =>
++        partitionId -> new PartitionModel(this, partitionId, registration)
++    }
++
++    def initialize(delta: MetadataDelta): Unit = {
++      delta.replay(new TopicRecord()
++        .setName(name)
++        .setTopicId(topicId)
++      )
++      partitions.values.foreach(_.initialize(delta))
++    }
++
++    def alterIsr(
++      topicPartition: TopicPartition,
++      leaderAndIsr: LeaderAndIsr,
++      delta: MetadataDelta
++    ): LeaderAndIsr = {
++      val partitionModel = partitions.getOrElse(topicPartition.partition,
++        throw new IllegalStateException(s"Unexpected partition $topicPartition")
++      )
++      partitionModel.alterIsr(leaderAndIsr, delta)
++    }
++  }
++
++  private class PartitionModel(
++    val topic: TopicModel,
++    val partitionId: Int,
++    var registration: PartitionRegistration
++  ) {
++    def alterIsr(
++      leaderAndIsr: LeaderAndIsr,
++      delta: MetadataDelta
++    ): LeaderAndIsr = {
++      delta.replay(new PartitionChangeRecord()
++        .setTopicId(topic.topicId)
++        .setPartitionId(partitionId)
++        .setIsr(leaderAndIsr.isr.map(Int.box).asJava)
++        .setLeader(leaderAndIsr.leader)
++      )
++      this.registration = delta.topicsDelta
++        .changedTopic(topic.topicId)
++        .partitionChanges
++        .get(partitionId)
++
++      leaderAndIsr.withZkVersion(registration.partitionEpoch)
++    }
++
++    private def toList(ints: Array[Int]): util.List[Integer] = {
++      ints.map(Int.box).toList.asJava
++    }
++
++    def initialize(delta: MetadataDelta): Unit = {
++      delta.replay(new PartitionRecord()
++        .setTopicId(topic.topicId)
++        .setPartitionId(partitionId)
++        .setReplicas(toList(registration.replicas))
++        .setIsr(toList(registration.isr))
++        .setLeader(registration.leader)
++        .setLeaderEpoch(registration.leaderEpoch)
++        .setPartitionEpoch(registration.partitionEpoch)
++      )
++    }
++  }
++
++  private class MockAlterIsrManager(channel: ControllerChannel) extends AlterIsrManager {
++    override def submit(
++      topicPartition: TopicPartition,
++      leaderAndIsr: LeaderAndIsr,
++      controllerEpoch: Int
++    ): CompletableFuture[LeaderAndIsr] = {
++      channel.alterIsr(topicPartition, leaderAndIsr)
++    }
++  }
++
++  private def registration(
++    replicaIds: Seq[Int],
++    isr: Seq[Int],
++    leader: Int,
++    leaderEpoch: Int = 0,
++    version: Int = 0
++  ): PartitionRegistration = {
++    new PartitionRegistration(
++      replicaIds.toArray,
++      isr.toArray,
++      Array.empty[Int],
++      Array.empty[Int],
++      leader,
++      leaderEpoch,
++      version
++    )
++  }
++
++}
+diff --git a/core/src/test/scala/unit/kafka/utils/TestUtils.scala b/core/src/test/scala/unit/kafka/utils/TestUtils.scala
+index 06c7569f33..0d8c5b7172 100755
+--- a/core/src/test/scala/unit/kafka/utils/TestUtils.scala
++++ b/core/src/test/scala/unit/kafka/utils/TestUtils.scala
+@@ -25,7 +25,7 @@ import java.nio.file.{Files, StandardOpenOption}
+ import java.security.cert.X509Certificate
+ import java.time.Duration
+ import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger}
+-import java.util.concurrent.{Callable, ExecutionException, Executors, TimeUnit}
++import java.util.concurrent.{Callable, CompletableFuture, ExecutionException, Executors, TimeUnit}
+ import java.util.{Arrays, Collections, Optional, Properties}
+ 
+ import com.yammer.metrics.core.Meter
+@@ -50,7 +50,7 @@ import org.apache.kafka.clients.producer.{KafkaProducer, ProducerConfig, Produce
+ import org.apache.kafka.common.acl.{AccessControlEntry, AccessControlEntryFilter, AclBinding, AclBindingFilter}
+ import org.apache.kafka.common.config.ConfigResource
+ import org.apache.kafka.common.config.ConfigResource.Type.TOPIC
+-import org.apache.kafka.common.errors.{KafkaStorageException, UnknownTopicOrPartitionException}
++import org.apache.kafka.common.errors.{KafkaStorageException, OperationNotAttemptedException, UnknownTopicOrPartitionException}
+ import org.apache.kafka.common.header.Header
+ import org.apache.kafka.common.internals.Topic
+ import org.apache.kafka.common.memory.MemoryPool
+@@ -1120,19 +1120,26 @@ object TestUtils extends Logging {
+     val isrUpdates: mutable.Queue[AlterIsrItem] = new mutable.Queue[AlterIsrItem]()
+     val inFlight: AtomicBoolean = new AtomicBoolean(false)
+ 
+-    override def submit(alterIsrItem: AlterIsrItem): Boolean = {
++
++    override def submit(
++      topicPartition: TopicPartition,
++      leaderAndIsr: LeaderAndIsr,
++      controllerEpoch: Int
++    ): CompletableFuture[LeaderAndIsr]= {
++      val future = new CompletableFuture[LeaderAndIsr]()
+       if (inFlight.compareAndSet(false, true)) {
+-        isrUpdates += alterIsrItem
+-        true
++        isrUpdates += AlterIsrItem(topicPartition, leaderAndIsr, future, controllerEpoch)
+       } else {
+-        false
++        future.completeExceptionally(new OperationNotAttemptedException(
++          s"Failed to enqueue AlterIsr request for $topicPartition since there is already an inflight request"))
+       }
++      future
+     }
+ 
+     def completeIsrUpdate(newZkVersion: Int): Unit = {
+       if (inFlight.compareAndSet(true, false)) {
+         val item = isrUpdates.dequeue()
+-        item.callback.apply(Right(item.leaderAndIsr.withZkVersion(newZkVersion)))
++        item.future.complete(item.leaderAndIsr.withZkVersion(newZkVersion))
+       } else {
+         fail("Expected an in-flight ISR update, but there was none")
+       }
+@@ -1141,7 +1148,7 @@ object TestUtils extends Logging {
+     def failIsrUpdate(error: Errors): Unit = {
+       if (inFlight.compareAndSet(true, false)) {
+         val item = isrUpdates.dequeue()
+-        item.callback.apply(Left(error))
++        item.future.completeExceptionally(error.exception)
+       } else {
+         fail("Expected an in-flight ISR update, but there was none")
+       }

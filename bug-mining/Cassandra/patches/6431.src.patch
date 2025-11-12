@@ -1,0 +1,746 @@
+diff --git a/CHANGES.txt b/CHANGES.txt
+index c02e1ffc7d..baeb9b7f61 100644
+--- a/CHANGES.txt
++++ b/CHANGES.txt
+@@ -1,4 +1,5 @@
+ 4.0.13
++ * Add new concurrent_merkle_tree_requests config property to prevent OOM during multi-range and/or multi-table repairs (CASSANDRA-19336)
+ Merged from 3.11:
+ Merged from 3.0:
+  * Backport CASSANDRA-16418 to 3.x (CASSANDRA-18824)
+diff --git a/conf/cassandra.yaml b/conf/cassandra.yaml
+index 3e4da52f5f..7f162749d2 100644
+--- a/conf/cassandra.yaml
++++ b/conf/cassandra.yaml
+@@ -553,17 +553,41 @@ concurrent_materialized_view_writes: 32
+ #    off heap objects
+ memtable_allocation_type: heap_buffers
+ 
+-# Limit memory usage for Merkle tree calculations during repairs. The default
+-# is 1/16th of the available heap. The main tradeoff is that smaller trees
+-# have less resolution, which can lead to over-streaming data. If you see heap
+-# pressure during repairs, consider lowering this, but you cannot go below
+-# one megabyte. If you see lots of over-streaming, consider raising
+-# this or using subrange repair.
++# Limit memory usage for Merkle tree calculations during repairs of a certain
++# table and common token range. Repair commands targetting multiple tables or
++# virtual nodes can exceed this limit depending on concurrent_merkle_tree_requests.
++#
++# The default is 1/16th of the available heap. The main tradeoff is that
++# smaller trees have less resolution, which can lead to over-streaming data.
++# If you see heap pressure during repairs, consider lowering this, but you
++# cannot go below one mebibyte. If you see lots of over-streaming, consider
++# raising this or using subrange repair.
+ #
+ # For more details see https://issues.apache.org/jira/browse/CASSANDRA-14096.
+ #
+ # repair_session_space_in_mb:
+ 
++# The number of simultaneous Merkle tree requests during repairs that can
++# be performed by a repair command. The size of each validation request is
++# limited by the repair_session_space property, so setting this to 1 will make
++# sure that a repair command doesn't exceed that limit, even if the repair
++# command is repairing multiple tables or multiple virtual nodes.
++#
++# There isn't a limit by default for backwards compatibility, but this can
++# produce OOM for  commands repairing multiple tables or multiple virtual nodes.
++# A limit of just 1 simultaneous Merkle tree request is generally recommended
++# with no virtual nodes so repair_session_space, and thereof the Merkle tree
++# resolution, can be high. For virtual nodes a value of 1 with the default
++# repair_session_space value will produce higher resolution Merkle trees
++# at the expense of speed. Alternatively, when working with virtual nodes it
++# can make sense to reduce the repair_session_space and increase the value of
++# concurrent_merkle_tree_requests because each range will contain fewer data.
++#
++# For more details see https://issues.apache.org/jira/browse/CASSANDRA-19336.
++#
++# A zero value means no limit.
++# concurrent_merkle_tree_requests: 0
++
+ # Total space to use for commit logs on disk.
+ #
+ # If space gets above this value, Cassandra will flush every dirty CF
+diff --git a/src/java/org/apache/cassandra/config/Config.java b/src/java/org/apache/cassandra/config/Config.java
+index f8d8d46db8..d7517124df 100644
+--- a/src/java/org/apache/cassandra/config/Config.java
++++ b/src/java/org/apache/cassandra/config/Config.java
+@@ -136,6 +136,8 @@ public class Config
+ 
+     public volatile long repair_request_timeout_in_ms = TimeUnit.MILLISECONDS.convert(1, TimeUnit.MINUTES);
+ 
++    public volatile int concurrent_merkle_tree_requests = 0;
++
+     public volatile boolean use_offheap_merkle_trees = true;
+ 
+     public int storage_port = 7000;
+diff --git a/src/java/org/apache/cassandra/config/DatabaseDescriptor.java b/src/java/org/apache/cassandra/config/DatabaseDescriptor.java
+index 8893f58e56..377f67117d 100644
+--- a/src/java/org/apache/cassandra/config/DatabaseDescriptor.java
++++ b/src/java/org/apache/cassandra/config/DatabaseDescriptor.java
+@@ -2880,6 +2880,16 @@ public class DatabaseDescriptor
+         conf.repair_session_space_in_mb = sizeInMegabytes;
+     }
+ 
++    public static int getConcurrentMerkleTreeRequests()
++    {
++        return conf.concurrent_merkle_tree_requests;
++    }
++
++    public static void setConcurrentMerkleTreeRequests(int value)
++    {
++        conf.concurrent_merkle_tree_requests = value;
++    }
++
+     public static Float getMemtableCleanupThreshold()
+     {
+         return conf.memtable_cleanup_threshold;
+diff --git a/src/java/org/apache/cassandra/repair/RepairJob.java b/src/java/org/apache/cassandra/repair/RepairJob.java
+index a9ac6af98e..95fe84f550 100644
+--- a/src/java/org/apache/cassandra/repair/RepairJob.java
++++ b/src/java/org/apache/cassandra/repair/RepairJob.java
+@@ -90,7 +90,7 @@ public class RepairJob extends AbstractFuture<RepairResult> implements Runnable
+ 
+     /**
+      * Runs repair job.
+-     *
++     * <p/>
+      * This sets up necessary task and runs them on given {@code taskExecutor}.
+      * After submitting all tasks, waits until validation with replica completes.
+      */
+@@ -103,11 +103,10 @@ public class RepairJob extends AbstractFuture<RepairResult> implements Runnable
+         List<InetAddressAndPort> allEndpoints = new ArrayList<>(session.commonRange.endpoints);
+         allEndpoints.add(FBUtilities.getBroadcastAddressAndPort());
+ 
+-        ListenableFuture<List<TreeResponse>> validations;
+         // Create a snapshot at all nodes unless we're using pure parallel repairs
++        ListenableFuture<List<InetAddressAndPort>> allSnapshotTasks;
+         if (parallelismDegree != RepairParallelism.PARALLEL)
+         {
+-            ListenableFuture<List<InetAddressAndPort>> allSnapshotTasks;
+             if (session.isIncremental)
+             {
+                 // consistent repair does it's own "snapshotting"
+@@ -125,29 +124,17 @@ public class RepairJob extends AbstractFuture<RepairResult> implements Runnable
+                 }
+                 allSnapshotTasks = Futures.allAsList(snapshotTasks);
+             }
+-
+-            // When all snapshot complete, send validation requests
+-            validations = Futures.transformAsync(allSnapshotTasks, new AsyncFunction<List<InetAddressAndPort>, List<TreeResponse>>()
+-            {
+-                public ListenableFuture<List<TreeResponse>> apply(List<InetAddressAndPort> endpoints)
+-                {
+-                    if (parallelismDegree == RepairParallelism.SEQUENTIAL)
+-                        return sendSequentialValidationRequest(endpoints);
+-                    else
+-                        return sendDCAwareValidationRequest(endpoints);
+-                }
+-            }, taskExecutor);
+         }
+         else
+         {
+-            // If not sequential, just send validation request to all replica
+-            validations = sendValidationRequest(allEndpoints);
++            allSnapshotTasks = null;
+         }
+ 
+-        // When all validations complete, submit sync tasks
+-        ListenableFuture<List<SyncStat>> syncResults = Futures.transformAsync(validations,
+-                                                                              session.optimiseStreams && !session.pullRepair ? this::optimisedSyncing : this::standardSyncing,
+-                                                                              taskExecutor);
++        // Run validations and the creation of sync tasks in the scheduler, so it can limit the number of Merkle trees
++        // that there are in memory at once. When all validations complete, submit sync tasks out of the scheduler.
++        ListenableFuture<List<SyncStat>> syncResults = Futures.transformAsync(
++                session.validationScheduler.schedule(() -> createSyncTasks(allSnapshotTasks, allEndpoints), taskExecutor),
++                this::executeTasks, taskExecutor);
+ 
+         // When all sync complete, set the final result
+         Futures.addCallback(syncResults, new FutureCallback<List<SyncStat>>()
+@@ -183,21 +170,44 @@ public class RepairJob extends AbstractFuture<RepairResult> implements Runnable
+         }, taskExecutor);
+     }
+ 
++    private ListenableFuture<List<SyncTask>> createSyncTasks(ListenableFuture<List<InetAddressAndPort>> allSnapshotTasks, List<InetAddressAndPort> allEndpoints)
++    {
++        ListenableFuture<List<TreeResponse>> validations;
++        if (allSnapshotTasks != null)
++        {
++            // When all snapshot complete, send validation requests
++            validations = Futures.transformAsync(allSnapshotTasks, endpoints -> {
++                if (parallelismDegree == RepairParallelism.SEQUENTIAL)
++                    return sendSequentialValidationRequest(endpoints);
++                else
++                    return sendDCAwareValidationRequest(endpoints);
++            }, taskExecutor);
++        }
++        else
++        {
++            // If not sequential, just send validation request to all replica
++            validations = sendValidationRequest(allEndpoints);
++        }
++
++        return Futures.transform(validations,
++                                 session.optimiseStreams && !session.pullRepair ? this::optimisedSyncing : this::standardSyncing,
++                                 taskExecutor);
++    }
++
+     private boolean isTransient(InetAddressAndPort ep)
+     {
+         return session.commonRange.transEndpoints.contains(ep);
+     }
+ 
+-    private ListenableFuture<List<SyncStat>> standardSyncing(List<TreeResponse> trees)
++    private List<SyncTask> standardSyncing(List<TreeResponse> trees)
+     {
+-        List<SyncTask> syncTasks = createStandardSyncTasks(desc,
+-                                                           trees,
+-                                                           FBUtilities.getLocalAddressAndPort(),
+-                                                           this::isTransient,
+-                                                           session.isIncremental,
+-                                                           session.pullRepair,
+-                                                           session.previewKind);
+-        return executeTasks(syncTasks);
++        return createStandardSyncTasks(desc,
++                                       trees,
++                                       FBUtilities.getLocalAddressAndPort(),
++                                       this::isTransient,
++                                       session.isIncremental,
++                                       session.pullRepair,
++                                       session.previewKind);
+     }
+ 
+     static List<SyncTask> createStandardSyncTasks(RepairJobDesc desc,
+@@ -267,17 +277,15 @@ public class RepairJob extends AbstractFuture<RepairResult> implements Runnable
+         return syncTasks;
+     }
+ 
+-    private ListenableFuture<List<SyncStat>> optimisedSyncing(List<TreeResponse> trees)
++    private List<SyncTask> optimisedSyncing(List<TreeResponse> trees)
+     {
+-        List<SyncTask> syncTasks = createOptimisedSyncingSyncTasks(desc,
+-                                                                   trees,
+-                                                                   FBUtilities.getLocalAddressAndPort(),
+-                                                                   this::isTransient,
+-                                                                   this::getDC,
+-                                                                   session.isIncremental,
+-                                                                   session.previewKind);
+-
+-        return executeTasks(syncTasks);
++        return createOptimisedSyncingSyncTasks(desc,
++                                               trees,
++                                               FBUtilities.getLocalAddressAndPort(),
++                                               this::isTransient,
++                                               this::getDC,
++                                               session.isIncremental,
++                                               session.previewKind);
+     }
+ 
+     @SuppressWarnings("UnstableApiUsage")
+@@ -448,12 +456,7 @@ public class RepairJob extends AbstractFuture<RepairResult> implements Runnable
+         for (InetAddressAndPort endpoint : endpoints)
+         {
+             String dc = DatabaseDescriptor.getEndpointSnitch().getDatacenter(endpoint);
+-            Queue<InetAddressAndPort> queue = requestsByDatacenter.get(dc);
+-            if (queue == null)
+-            {
+-                queue = new LinkedList<>();
+-                requestsByDatacenter.put(dc, queue);
+-            }
++            Queue<InetAddressAndPort> queue = requestsByDatacenter.computeIfAbsent(dc, k -> new LinkedList<>());
+             queue.add(endpoint);
+         }
+ 
+diff --git a/src/java/org/apache/cassandra/repair/RepairRunnable.java b/src/java/org/apache/cassandra/repair/RepairRunnable.java
+index 48a7e36adc..14fab59741 100644
+--- a/src/java/org/apache/cassandra/repair/RepairRunnable.java
++++ b/src/java/org/apache/cassandra/repair/RepairRunnable.java
+@@ -114,6 +114,7 @@ public class RepairRunnable implements Runnable, ProgressEventNotifier
+ 
+     private static final AtomicInteger threadCounter = new AtomicInteger(1);
+     private final AtomicReference<Throwable> firstError = new AtomicReference<>(null);
++    private final Scheduler validationScheduler;
+ 
+     private TraceState traceState;
+ 
+@@ -123,6 +124,7 @@ public class RepairRunnable implements Runnable, ProgressEventNotifier
+         this.cmd = cmd;
+         this.options = options;
+         this.keyspace = keyspace;
++        this.validationScheduler = Scheduler.build(DatabaseDescriptor.getConcurrentMerkleTreeRequests());
+ 
+         this.tag = "repair:" + cmd;
+         // get valid column families, calculate neighbors, validation, prepare for repair + number of ranges to repair
+@@ -437,7 +439,7 @@ public class RepairRunnable implements Runnable, ProgressEventNotifier
+         ListeningExecutorService executor = createExecutor();
+ 
+         // Setting the repairedAt time to UNREPAIRED_SSTABLE causes the repairedAt times to be preserved across streamed sstables
+-        final ListenableFuture<List<RepairSessionResult>> allSessions = submitRepairSessions(parentSession, false, executor, commonRanges, cfnames);
++        final ListenableFuture<List<RepairSessionResult>> allSessions = submitRepairSessions(parentSession, false, executor, validationScheduler, commonRanges, cfnames);
+ 
+         // After all repair sessions completes(successful or not),
+         // run anticompaction if necessary and send finish notice back to client
+@@ -497,7 +499,7 @@ public class RepairRunnable implements Runnable, ProgressEventNotifier
+         CoordinatorSession coordinatorSession = ActiveRepairService.instance.consistent.coordinated.registerSession(parentSession, allParticipants, neighborsAndRanges.shouldExcludeDeadParticipants);
+         ListeningExecutorService executor = createExecutor();
+         AtomicBoolean hasFailure = new AtomicBoolean(false);
+-        ListenableFuture repairResult = coordinatorSession.execute(() -> submitRepairSessions(parentSession, true, executor, allRanges, cfnames),
++        ListenableFuture repairResult = coordinatorSession.execute(() -> submitRepairSessions(parentSession, true, executor, validationScheduler, allRanges, cfnames),
+                                                                    hasFailure);
+         Collection<Range<Token>> ranges = new HashSet<>();
+         for (Collection<Range<Token>> range : Iterables.transform(allRanges, cr -> cr.ranges))
+@@ -520,7 +522,7 @@ public class RepairRunnable implements Runnable, ProgressEventNotifier
+         // Set up RepairJob executor for this repair command.
+         ListeningExecutorService executor = createExecutor();
+ 
+-        final ListenableFuture<List<RepairSessionResult>> allSessions = submitRepairSessions(parentSession, false, executor, commonRanges, cfnames);
++        final ListenableFuture<List<RepairSessionResult>> allSessions = submitRepairSessions(parentSession, false, executor, validationScheduler, commonRanges, cfnames);
+ 
+         Futures.addCallback(allSessions, new FutureCallback<List<RepairSessionResult>>()
+         {
+@@ -635,6 +637,7 @@ public class RepairRunnable implements Runnable, ProgressEventNotifier
+     private ListenableFuture<List<RepairSessionResult>> submitRepairSessions(UUID parentSession,
+                                                                              boolean isIncremental,
+                                                                              ListeningExecutorService executor,
++                                                                             Scheduler validationScheduler,
+                                                                              List<CommonRange> commonRanges,
+                                                                              String... cfnames)
+     {
+@@ -652,6 +655,7 @@ public class RepairRunnable implements Runnable, ProgressEventNotifier
+                                                                                      options.getPreviewKind(),
+                                                                                      options.optimiseStreams(),
+                                                                                      executor,
++                                                                                     validationScheduler,
+                                                                                      cfnames);
+             if (session == null)
+                 continue;
+diff --git a/src/java/org/apache/cassandra/repair/RepairSession.java b/src/java/org/apache/cassandra/repair/RepairSession.java
+index 692cdcf90c..1036f00f74 100644
+--- a/src/java/org/apache/cassandra/repair/RepairSession.java
++++ b/src/java/org/apache/cassandra/repair/RepairSession.java
+@@ -113,6 +113,7 @@ public class RepairSession extends AbstractFuture<RepairSessionResult> implement
+     // Tasks(snapshot, validate request, differencing, ...) are run on taskExecutor
+     public final ListeningExecutorService taskExecutor;
+     public final boolean optimiseStreams;
++    public final Scheduler validationScheduler;
+ 
+     private volatile boolean terminated = false;
+ 
+@@ -128,6 +129,7 @@ public class RepairSession extends AbstractFuture<RepairSessionResult> implement
+      */
+     public RepairSession(UUID parentRepairSession,
+                          UUID id,
++                         Scheduler validationScheduler,
+                          CommonRange commonRange,
+                          String keyspace,
+                          RepairParallelism parallelismDegree,
+@@ -139,6 +141,7 @@ public class RepairSession extends AbstractFuture<RepairSessionResult> implement
+     {
+         assert cfnames.length > 0 : "Repairing no column families seems pointless, doesn't it";
+ 
++        this.validationScheduler = validationScheduler;
+         this.parentRepairSession = parentRepairSession;
+         this.id = id;
+         this.parallelismDegree = parallelismDegree;
+diff --git a/src/java/org/apache/cassandra/repair/Scheduler.java b/src/java/org/apache/cassandra/repair/Scheduler.java
+new file mode 100644
+index 0000000000..c15113ffe1
+--- /dev/null
++++ b/src/java/org/apache/cassandra/repair/Scheduler.java
+@@ -0,0 +1,142 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.cassandra.repair;
++
++import java.util.LinkedList;
++import java.util.Queue;
++import java.util.concurrent.Executor;
++import java.util.function.Supplier;
++import javax.annotation.concurrent.GuardedBy;
++
++import com.google.common.util.concurrent.AbstractFuture;
++import com.google.common.util.concurrent.FutureCallback;
++import com.google.common.util.concurrent.Futures;
++import com.google.common.util.concurrent.ListenableFuture;
++
++import org.apache.cassandra.utils.Pair;
++
++/**
++ * Task scheduler that limits the number of concurrent tasks across multiple executors.
++ */
++public interface Scheduler
++{
++    default <T> ListenableFuture<T> schedule(Supplier<ListenableFuture<T>> task, Executor executor)
++    {
++        return schedule(new Task<>(task, executor), executor);
++    }
++
++    <T> Task<T> schedule(Task<T> task, Executor executor);
++
++    static Scheduler build(int concurrentValidations)
++    {
++        return concurrentValidations <= 0
++               ? new NoopScheduler()
++               : new LimitedConcurrentScheduler(concurrentValidations);
++    }
++
++    final class NoopScheduler implements Scheduler
++    {
++        @Override
++        public <T> Task<T> schedule(Task<T> task, Executor executor)
++        {
++            executor.execute(task);
++            return task;
++        }
++    }
++
++    final class LimitedConcurrentScheduler implements Scheduler
++    {
++        private final int concurrentValidations;
++        @GuardedBy("this")
++        private int inflight = 0;
++        @GuardedBy("this")
++        private final Queue<Pair<Task<?>, Executor>> tasks = new LinkedList<>();
++
++        LimitedConcurrentScheduler(int concurrentValidations)
++        {
++            this.concurrentValidations = concurrentValidations;
++        }
++
++        @Override
++        public synchronized <T> Task<T> schedule(Task<T> task, Executor executor)
++        {
++            tasks.offer(Pair.create(task, executor));
++            maybeSchedule();
++            return task;
++        }
++
++        private synchronized void onDone()
++        {
++            inflight--;
++            maybeSchedule();
++        }
++
++        private void maybeSchedule()
++        {
++            if (inflight == concurrentValidations || tasks.isEmpty())
++                return;
++            inflight++;
++            Pair<Task<?>, Executor> pair = tasks.poll();
++            Futures.addCallback(pair.left, new FutureCallback<Object>() {
++                @Override
++                public void onSuccess(Object result)
++                {
++                    onDone();
++                }
++
++                @Override
++                public void onFailure(Throwable t)
++                {
++                    onDone();
++                }
++            }, pair.right);
++            pair.right.execute(pair.left);
++        }
++    }
++
++    class Task<T> extends AbstractFuture<T> implements Runnable
++    {
++        private final Supplier<ListenableFuture<T>> supplier;
++        private final Executor executor;
++
++        public Task(Supplier<ListenableFuture<T>> supplier, Executor executor)
++        {
++            this.supplier = supplier;
++            this.executor = executor;
++        }
++
++        @Override
++        public void run()
++        {
++            Futures.addCallback(supplier.get(), new FutureCallback<T>() {
++                @Override
++                public void onSuccess(T result)
++                {
++                    set(result);
++                }
++
++                @Override
++                public void onFailure(Throwable t)
++                {
++                    setException(t);
++                }
++            }, executor);
++        }
++    }
++}
+\ No newline at end of file
+diff --git a/src/java/org/apache/cassandra/service/ActiveRepairService.java b/src/java/org/apache/cassandra/service/ActiveRepairService.java
+index e3ec218f6d..99c93a1d7b 100644
+--- a/src/java/org/apache/cassandra/service/ActiveRepairService.java
++++ b/src/java/org/apache/cassandra/service/ActiveRepairService.java
+@@ -73,6 +73,7 @@ import org.apache.cassandra.repair.CommonRange;
+ import org.apache.cassandra.repair.RepairJobDesc;
+ import org.apache.cassandra.repair.RepairParallelism;
+ import org.apache.cassandra.repair.RepairSession;
++import org.apache.cassandra.repair.Scheduler;
+ import org.apache.cassandra.repair.consistent.CoordinatorSessions;
+ import org.apache.cassandra.repair.consistent.LocalSessions;
+ import org.apache.cassandra.repair.consistent.admin.CleanupSummary;
+@@ -338,6 +339,7 @@ public class ActiveRepairService implements IEndpointStateChangeSubscriber, IFai
+                                              PreviewKind previewKind,
+                                              boolean optimiseStreams,
+                                              ListeningExecutorService executor,
++                                             Scheduler validationScheduler,
+                                              String... cfnames)
+     {
+         if (range.endpoints.isEmpty())
+@@ -346,7 +348,8 @@ public class ActiveRepairService implements IEndpointStateChangeSubscriber, IFai
+         if (cfnames.length == 0)
+             return null;
+ 
+-        final RepairSession session = new RepairSession(parentRepairSession, UUIDGen.getTimeUUID(), range, keyspace,
++        final RepairSession session = new RepairSession(parentRepairSession, UUIDGen.getTimeUUID(),
++                                                        validationScheduler, range, keyspace,
+                                                         parallelismDegree, isIncremental, pullRepair,
+                                                         previewKind, optimiseStreams, cfnames);
+ 
+diff --git a/test/distributed/org/apache/cassandra/distributed/test/OptimiseStreamsRepairTest.java b/test/distributed/org/apache/cassandra/distributed/test/OptimiseStreamsRepairTest.java
+index 14d49dc0ca..e2529b4915 100644
+--- a/test/distributed/org/apache/cassandra/distributed/test/OptimiseStreamsRepairTest.java
++++ b/test/distributed/org/apache/cassandra/distributed/test/OptimiseStreamsRepairTest.java
+@@ -29,8 +29,6 @@ import java.util.Map;
+ import java.util.Random;
+ import java.util.Set;
+ import java.util.concurrent.Callable;
+-import java.util.function.Function;
+-import java.util.function.Predicate;
+ 
+ import java.util.concurrent.TimeoutException;
+ import org.junit.Test;
+@@ -48,12 +46,11 @@ import org.apache.cassandra.locator.InetAddressAndPort;
+ import org.apache.cassandra.repair.AsymmetricRemoteSyncTask;
+ import org.apache.cassandra.repair.LocalSyncTask;
+ import org.apache.cassandra.repair.RepairJob;
+-import org.apache.cassandra.repair.RepairJobDesc;
+ import org.apache.cassandra.repair.SyncTask;
+ import org.apache.cassandra.repair.TreeResponse;
+-import org.apache.cassandra.streaming.PreviewKind;
+ 
+ import static net.bytebuddy.matcher.ElementMatchers.named;
++import static net.bytebuddy.matcher.ElementMatchers.takesArguments;
+ import static org.apache.cassandra.distributed.api.Feature.GOSSIP;
+ import static org.apache.cassandra.distributed.api.Feature.NETWORK;
+ import static org.junit.Assert.assertEquals;
+@@ -108,22 +105,17 @@ public class OptimiseStreamsRepairTest extends TestBaseImpl
+         public static void install(ClassLoader cl, int id)
+         {
+             new ByteBuddy().rebase(RepairJob.class)
+-                           .method(named("createOptimisedSyncingSyncTasks"))
++                           .method(named("createOptimisedSyncingSyncTasks").and(takesArguments(1)))
+                            .intercept(MethodDelegation.to(BBHelper.class))
+                            .make()
+                            .load(cl, ClassLoadingStrategy.Default.INJECTION);
+         }
+ 
+-        public static List<SyncTask> createOptimisedSyncingSyncTasks(RepairJobDesc desc,
+-                                                                     List<TreeResponse> trees,
+-                                                                     InetAddressAndPort local,
+-                                                                     Predicate<InetAddressAndPort> isTransient,
+-                                                                     Function<InetAddressAndPort, String> getDC,
+-                                                                     boolean isIncremental,
+-                                                                     PreviewKind previewKind,
++        @SuppressWarnings("unused")
++        public static List<SyncTask> createOptimisedSyncingSyncTasks(List<TreeResponse> trees,
+                                                                      @SuperCall Callable<List<SyncTask>> zuperCall)
+         {
+-            List<SyncTask> tasks = null;
++            List<SyncTask> tasks;
+             try
+             {
+                 tasks = zuperCall.call();
+diff --git a/test/distributed/org/apache/cassandra/distributed/test/repair/ConcurrentValidationRequestsTest.java b/test/distributed/org/apache/cassandra/distributed/test/repair/ConcurrentValidationRequestsTest.java
+new file mode 100644
+index 0000000000..82a0b73371
+--- /dev/null
++++ b/test/distributed/org/apache/cassandra/distributed/test/repair/ConcurrentValidationRequestsTest.java
+@@ -0,0 +1,136 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.cassandra.distributed.test.repair;
++
++import java.util.concurrent.Callable;
++import java.util.concurrent.atomic.AtomicInteger;
++
++import org.junit.Test;
++
++import net.bytebuddy.ByteBuddy;
++import net.bytebuddy.dynamic.loading.ClassLoadingStrategy;
++import net.bytebuddy.implementation.MethodDelegation;
++import net.bytebuddy.implementation.bind.annotation.SuperCall;
++import org.apache.cassandra.distributed.Cluster;
++import org.apache.cassandra.distributed.api.ConsistencyLevel;
++import org.apache.cassandra.distributed.api.NodeToolResult;
++import org.apache.cassandra.distributed.test.TestBaseImpl;
++import org.apache.cassandra.repair.ValidationTask;
++import org.apache.cassandra.utils.MerkleTrees;
++
++import static net.bytebuddy.matcher.ElementMatchers.named;
++import static org.apache.cassandra.distributed.api.Feature.GOSSIP;
++import static org.apache.cassandra.distributed.api.Feature.NETWORK;
++
++/**
++ * Verifies that the config property {@code concurrent_merkle_tree_requests} limits the number of concurrent validation
++ * requests.
++ */
++public class ConcurrentValidationRequestsTest extends TestBaseImpl
++{
++    private static final int NODES = 4;
++    private static final int RF = 3;
++    private static final int TABLES = 5;
++    private static final int ROWS = 100;
++    private static final int MAX_REQUESTS = 1;
++
++    @Test
++    public void testConcurrentValidations() throws Throwable
++    {
++        try (Cluster cluster = init(builder().withNodes(NODES)
++                                             .withInstanceInitializer(ConcurrentValidationRequestsTest.BBHelper::install)
++                                             .withConfig(c -> c.set("concurrent_merkle_tree_requests", MAX_REQUESTS)
++                                                               .with(NETWORK, GOSSIP))
++                                             .start(), RF))
++        {
++            for (int t = 1; t <= TABLES; t++)
++                cluster.schemaChange(withKeyspace("CREATE TABLE %s.t" + t + " (k int PRIMARY KEY, v int)"));
++
++            int v = 0;
++            for (int k = 0; k < ROWS; k++)
++            {
++                v++;
++                for (int t = 1; t <= TABLES; t++)
++                {
++                    String insert = withKeyspace("INSERT INTO %s.t" + t + " (k, v) VALUES (?, ?)");
++                    cluster.coordinator(1).execute(insert, ConsistencyLevel.ALL, k, v);
++                }
++            }
++            cluster.forEach(x -> x.flush(KEYSPACE));
++
++            NodeToolResult res = cluster.get(1).nodetoolResult("repair", "-j=4", KEYSPACE);
++            res.asserts().success();
++        }
++    }
++
++    public static class BBHelper
++    {
++        /**
++         * Keeps track of the number of concurrent validation requests, which should never be greater than RF times
++         * the value of the {@code concurrent_merkle_tree_requests} config property.
++         */
++        public static volatile AtomicInteger requests = new AtomicInteger(0);
++
++        public static void install(ClassLoader cl, int node)
++        {
++            if (node != 1)
++                return;
++
++            new ByteBuddy().rebase(ValidationTask.class)
++                           .method(named("run"))
++                           .intercept(MethodDelegation.to(ConcurrentValidationRequestsTest.BBHelper.class))
++                           .method(named("treesReceived"))
++                           .intercept(MethodDelegation.to(ConcurrentValidationRequestsTest.BBHelper.class))
++                           .make()
++                           .load(cl, ClassLoadingStrategy.Default.INJECTION);
++        }
++
++        @SuppressWarnings("unused")
++        public static void run(@SuperCall Callable<Void> zuper)
++        {
++            try
++            {
++                zuper.call();
++            }
++            catch (Exception e)
++            {
++                throw new RuntimeException(e);
++            }
++
++            int requests = BBHelper.requests.incrementAndGet();
++            if (requests > MAX_REQUESTS * RF)
++                throw new AssertionError("Too many concurrent validation requests: " + requests);
++        }
++
++        @SuppressWarnings("unused")
++        public static void treesReceived(MerkleTrees trees, @SuperCall Callable<Void> zuperCall)
++        {
++            requests.decrementAndGet();
++
++            try
++            {
++                zuperCall.call();
++            }
++            catch (Exception e)
++            {
++                throw new RuntimeException(e);
++            }
++        }
++    }
++}
+\ No newline at end of file
+diff --git a/test/unit/org/apache/cassandra/repair/RepairJobTest.java b/test/unit/org/apache/cassandra/repair/RepairJobTest.java
+index 87863b5b67..8d3b6a7099 100644
+--- a/test/unit/org/apache/cassandra/repair/RepairJobTest.java
++++ b/test/unit/org/apache/cassandra/repair/RepairJobTest.java
+@@ -110,7 +110,8 @@ public class RepairJobTest
+                                         RepairParallelism parallelismDegree, boolean isIncremental, boolean pullRepair,
+                                         PreviewKind previewKind, boolean optimiseStreams, String... cfnames)
+         {
+-            super(parentRepairSession, id, commonRange, keyspace, parallelismDegree, isIncremental, pullRepair, previewKind, optimiseStreams, cfnames);
++            super(parentRepairSession, id, Scheduler.build(0), commonRange, keyspace, parallelismDegree, isIncremental,
++                  pullRepair, previewKind, optimiseStreams, cfnames);
+         }
+ 
+         protected DebuggableThreadPoolExecutor createExecutor()
+diff --git a/test/unit/org/apache/cassandra/repair/RepairSessionTest.java b/test/unit/org/apache/cassandra/repair/RepairSessionTest.java
+index 2ad5831fc9..77b7102117 100644
+--- a/test/unit/org/apache/cassandra/repair/RepairSessionTest.java
++++ b/test/unit/org/apache/cassandra/repair/RepairSessionTest.java
+@@ -63,7 +63,7 @@ public class RepairSessionTest
+         IPartitioner p = Murmur3Partitioner.instance;
+         Range<Token> repairRange = new Range<>(p.getToken(ByteBufferUtil.bytes(0)), p.getToken(ByteBufferUtil.bytes(100)));
+         Set<InetAddressAndPort> endpoints = Sets.newHashSet(remote);
+-        RepairSession session = new RepairSession(parentSessionId, sessionId,
++        RepairSession session = new RepairSession(parentSessionId, sessionId, Scheduler.build(0),
+                                                   new CommonRange(endpoints, Collections.emptySet(), Arrays.asList(repairRange)),
+                                                   "Keyspace1", RepairParallelism.SEQUENTIAL,
+                                                   false, false,

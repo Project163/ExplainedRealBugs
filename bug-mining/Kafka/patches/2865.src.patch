@@ -1,0 +1,145 @@
+diff --git a/core/src/main/scala/kafka/log/Log.scala b/core/src/main/scala/kafka/log/Log.scala
+index 47d6b92a2b..336fbe4650 100644
+--- a/core/src/main/scala/kafka/log/Log.scala
++++ b/core/src/main/scala/kafka/log/Log.scala
+@@ -270,6 +270,10 @@ class Log(@volatile private var _dir: File,
+ 
+   @volatile private var nextOffsetMetadata: LogOffsetMetadata = _
+ 
++  // Log dir failure is handled asynchronously we need to prevent threads
++  // from reading inconsistent state caused by a failure in another thread
++  @volatile private var logDirOffline = false
++
+   /* The earliest offset which is part of an incomplete transaction. This is used to compute the
+    * last stable offset (LSO) in ReplicaManager. Note that it is possible that the "true" first unstable offset
+    * gets removed from the log (through record or segment deletion). In this case, the first unstable offset
+@@ -1092,19 +1096,21 @@ class Log(@volatile private var _dir: File,
+                      assignOffsets: Boolean,
+                      leaderEpoch: Int,
+                      ignoreRecordSize: Boolean): LogAppendInfo = {
+-    maybeHandleIOException(s"Error while appending records to $topicPartition in dir ${dir.getParent}") {
+-      val appendInfo = analyzeAndValidateRecords(records, origin, ignoreRecordSize)
+ 
+-      // return if we have no valid messages or if this is a duplicate of the last appended entry
+-      if (appendInfo.shallowCount == 0) appendInfo
+-      else {
++    val appendInfo = analyzeAndValidateRecords(records, origin, ignoreRecordSize)
+ 
+-        // trim any invalid bytes or partial messages before appending it to the on-disk log
+-        var validRecords = trimInvalidBytes(records, appendInfo)
++    // return if we have no valid messages or if this is a duplicate of the last appended entry
++    if (appendInfo.shallowCount == 0) appendInfo
++    else {
+ 
+-        // they are valid, insert them in the log
+-        lock synchronized {
++      // trim any invalid bytes or partial messages before appending it to the on-disk log
++      var validRecords = trimInvalidBytes(records, appendInfo)
++
++      // they are valid, insert them in the log
++      lock synchronized {
++        maybeHandleIOException(s"Error while appending records to $topicPartition in dir ${dir.getParent}") {
+           checkIfMemoryMappedBufferClosed()
++
+           if (assignOffsets) {
+             // assign offsets to the message set
+             val offset = new LongRef(nextOffsetMetadata.messageOffset)
+@@ -1262,6 +1268,12 @@ class Log(@volatile private var _dir: File,
+     }
+   }
+ 
++  private def checkForLogDirFailure(): Unit = {
++    if (logDirOffline) {
++      throw new KafkaStorageException(s"The log dir $parentDir is offline due to a previous IO exception.");
++    }
++  }
++
+   def maybeAssignEpochStartOffset(leaderEpoch: Int, startOffset: Long): Unit = {
+     leaderEpochCache.foreach { cache =>
+       cache.assign(leaderEpoch, startOffset)
+@@ -2347,9 +2359,11 @@ class Log(@volatile private var _dir: File,
+ 
+   private def maybeHandleIOException[T](msg: => String)(fun: => T): T = {
+     try {
++      checkForLogDirFailure()
+       fun
+     } catch {
+       case e: IOException =>
++        logDirOffline = true
+         logDirFailureChannel.maybeAddOfflineLogDir(dir.getParent, msg, e)
+         throw new KafkaStorageException(msg, e)
+     }
+diff --git a/core/src/test/scala/unit/kafka/log/LogTest.scala b/core/src/test/scala/unit/kafka/log/LogTest.scala
+index b107c213df..5c7154c1ea 100755
+--- a/core/src/test/scala/unit/kafka/log/LogTest.scala
++++ b/core/src/test/scala/unit/kafka/log/LogTest.scala
+@@ -969,7 +969,7 @@ class LogTest {
+       producerIdExpirationCheckIntervalMs = 30000,
+       topicPartition = Log.parseTopicPartitionName(logDir),
+       producerStateManager = stateManager,
+-      logDirFailureChannel = null,
++      logDirFailureChannel = new LogDirFailureChannel(1),
+       hadCleanShutdown = false)
+ 
+     EasyMock.verify(stateManager)
+@@ -2833,6 +2833,25 @@ class LogTest {
+       new SimpleRecord(RecordBatch.NO_TIMESTAMP, "key".getBytes, "value".getBytes)), leaderEpoch = 0)
+   }
+ 
++  @Test
++  def testAppendToOrReadFromLogInFailedLogDir(): Unit = {
++    val pid = 1L
++    val epoch = 0.toShort
++    val log = createLog(logDir, LogConfig())
++    log.appendAsLeader(TestUtils.singletonRecords(value = null), leaderEpoch = 0)
++    assertEquals(0, readLog(log, 0, 4096).records.records.iterator.next().offset)
++    val append = appendTransactionalAsLeader(log, pid, epoch)
++    append(10)
++    // Kind of a hack, but renaming the index to a directory ensures that the append
++    // to the index will fail.
++    log.activeSegment.txnIndex.renameTo(log.dir)
++    assertThrows[KafkaStorageException] {
++      appendEndTxnMarkerAsLeader(log, pid, epoch, ControlRecordType.ABORT, coordinatorEpoch = 1)
++    }
++    assertThrows[KafkaStorageException](log.appendAsLeader(TestUtils.singletonRecords(value = null), leaderEpoch = 0))
++    assertThrows[KafkaStorageException](readLog(log, 0, 4096).records.records.iterator.next().offset)
++  }
++
+   @Test
+   def testCorruptLog(): Unit = {
+     // append some messages to create some segments
+@@ -4452,23 +4471,25 @@ class LogTest {
+     assertEquals(11L, log.logEndOffset)
+     assertEquals(0L, log.lastStableOffset)
+ 
+-    // Try the append a second time. The appended offset in the log should still increase.
+-    // Note that the second append does not write to the transaction index because the producer
+-    // state has already been updated and we do not write index entries for empty transactions.
+-    // In the future, we may strengthen the fencing logic so that additional writes to the
+-    // log are not possible after an IO error (see KAFKA-10778).
+-    appendEndTxnMarkerAsLeader(log, pid, epoch, ControlRecordType.ABORT, coordinatorEpoch = 1)
+-    assertEquals(12L, log.logEndOffset)
++    // Try the append a second time. The appended offset in the log should not increase
++    // because the log dir is marked as failed.  Nor will there be a write to the transaction
++    // index.
++    assertThrows[KafkaStorageException] {
++      appendEndTxnMarkerAsLeader(log, pid, epoch, ControlRecordType.ABORT, coordinatorEpoch = 1)
++    }
++    assertEquals(11L, log.logEndOffset)
+     assertEquals(0L, log.lastStableOffset)
+ 
+     // Even if the high watermark is updated, the first unstable offset does not move
+     log.updateHighWatermark(12L)
+     assertEquals(0L, log.lastStableOffset)
+ 
+-    log.close()
++    assertThrows[KafkaStorageException] {
++      log.close()
++    }
+ 
+     val reopenedLog = createLog(logDir, logConfig, lastShutdownClean = false)
+-    assertEquals(12L, reopenedLog.logEndOffset)
++    assertEquals(11L, reopenedLog.logEndOffset)
+     assertEquals(1, reopenedLog.activeSegment.txnIndex.allAbortedTxns.size)
+     reopenedLog.updateHighWatermark(12L)
+     assertEquals(None, reopenedLog.firstUnstableOffset)

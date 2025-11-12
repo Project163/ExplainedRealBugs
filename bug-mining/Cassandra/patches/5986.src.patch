@@ -1,0 +1,818 @@
+diff --git a/CHANGES.txt b/CHANGES.txt
+index 9fb172919b..8fcebb0797 100644
+--- a/CHANGES.txt
++++ b/CHANGES.txt
+@@ -1,4 +1,5 @@
+ 4.0.4
++ * Shut repair task executor down without interruption to avoid compromising shared channel proxies (CASSANDRA-17466)
+  * Generate valid KEYSPACE / MATERIALIZED VIEW for CQL for views (CASSANDRA-17266)
+  * Fix timestamp tz parsing (CASSANDRA-17467)
+  * Suppress CVE-2021-44521 from driver (CASSANDRA-17459)
+diff --git a/src/java/org/apache/cassandra/repair/LocalSyncTask.java b/src/java/org/apache/cassandra/repair/LocalSyncTask.java
+index 5916401508..ffa786cc10 100644
+--- a/src/java/org/apache/cassandra/repair/LocalSyncTask.java
++++ b/src/java/org/apache/cassandra/repair/LocalSyncTask.java
+@@ -36,11 +36,11 @@ import org.apache.cassandra.streaming.StreamEvent;
+ import org.apache.cassandra.streaming.StreamEventHandler;
+ import org.apache.cassandra.streaming.StreamOperation;
+ import org.apache.cassandra.streaming.StreamPlan;
++import org.apache.cassandra.streaming.StreamSession;
+ import org.apache.cassandra.streaming.StreamState;
+ import org.apache.cassandra.tracing.TraceState;
+ import org.apache.cassandra.tracing.Tracing;
+ import org.apache.cassandra.utils.FBUtilities;
+-import org.apache.cassandra.utils.MerkleTrees;
+ 
+ /**
+  * LocalSyncTask performs streaming between local(coordinator) node and remote replica.
+@@ -58,6 +58,9 @@ public class LocalSyncTask extends SyncTask implements StreamEventHandler
+     @VisibleForTesting
+     public final boolean transferRanges;
+ 
++    private boolean active = true;
++    private StreamPlan streamPlan;
++
+     public LocalSyncTask(RepairJobDesc desc, InetAddressAndPort local, InetAddressAndPort remote,
+                          List<Range<Token>> diff, UUID pendingRepair,
+                          boolean requestRanges, boolean transferRanges, PreviewKind previewKind)
+@@ -102,15 +105,19 @@ public class LocalSyncTask extends SyncTask implements StreamEventHandler
+      * that will be called out of band once the streams complete.
+      */
+     @Override
+-    protected void startSync()
++    protected synchronized void startSync()
+     {
+-        InetAddressAndPort remote = nodePair.peer;
++        if (active)
++        {
++            InetAddressAndPort remote = nodePair.peer;
+ 
+-        String message = String.format("Performing streaming repair of %d ranges with %s", rangesToSync.size(), remote);
+-        logger.info("{} {}", previewKind.logPrefix(desc.sessionId), message);
+-        Tracing.traceRepair(message);
++            String message = String.format("Performing streaming repair of %d ranges with %s", rangesToSync.size(), remote);
++            logger.info("{} {}", previewKind.logPrefix(desc.sessionId), message);
++            Tracing.traceRepair(message);
+ 
+-        createStreamPlan().execute();
++            streamPlan = createStreamPlan();
++            streamPlan.execute();
++        }
+     }
+ 
+     @Override
+@@ -145,19 +152,31 @@ public class LocalSyncTask extends SyncTask implements StreamEventHandler
+         }
+     }
+ 
+-    public void onSuccess(StreamState result)
++    @Override
++    public synchronized void onSuccess(StreamState result)
+     {
+-        String message = String.format("Sync complete using session %s between %s and %s on %s", desc.sessionId, nodePair.coordinator, nodePair.peer, desc.columnFamily);
+-        logger.info("{} {}", previewKind.logPrefix(desc.sessionId), message);
+-        Tracing.traceRepair(message);
+-        set(stat.withSummaries(result.createSummaries()));
+-        finished();
++        if (active)
++        {
++            active = false;
++            String status = result.hasAbortedSession() ? "aborted" : "complete";
++            String message = String.format("Sync %s using session %s between %s and %s on %s",
++                                           status, desc.sessionId, nodePair.coordinator, nodePair.peer, desc.columnFamily);
++            logger.info("{} {}", previewKind.logPrefix(desc.sessionId), message);
++            Tracing.traceRepair(message);
++            set(result.hasAbortedSession() ? stat : stat.withSummaries(result.createSummaries()));
++            finished();
++        }
+     }
+ 
+-    public void onFailure(Throwable t)
++    @Override
++    public synchronized void onFailure(Throwable t)
+     {
+-        setException(t);
+-        finished();
++        if (active)
++        {
++            active = false;
++            setException(t);
++            finished();
++        }
+     }
+ 
+     @Override
+@@ -170,4 +189,24 @@ public class LocalSyncTask extends SyncTask implements StreamEventHandler
+                ", nodePair=" + nodePair +
+                '}';
+     }
++
++    @Override
++    public synchronized void abort()
++    {
++        if (active)
++        {
++            if (streamPlan == null)
++            {
++                active = false;
++                String message = String.format("Sync for session %s between %s and %s on %s aborted before starting",
++                                               desc.sessionId, nodePair.coordinator, nodePair.peer, desc.columnFamily);
++                logger.debug("{} {}", previewKind.logPrefix(desc.sessionId), message);
++                set(stat);
++            }
++            else
++            {
++                streamPlan.getCoordinator().getAllStreamSessions().forEach(StreamSession::abort);
++            }
++        }
++    }
+ }
+diff --git a/src/java/org/apache/cassandra/repair/RepairJob.java b/src/java/org/apache/cassandra/repair/RepairJob.java
+index 4fdba6e10a..a9ac6af98e 100644
+--- a/src/java/org/apache/cassandra/repair/RepairJob.java
++++ b/src/java/org/apache/cassandra/repair/RepairJob.java
+@@ -18,6 +18,7 @@
+ package org.apache.cassandra.repair;
+ 
+ import java.util.*;
++import java.util.concurrent.CopyOnWriteArrayList;
+ import java.util.function.Predicate;
+ import java.util.function.Function;
+ import java.util.stream.Collectors;
+@@ -57,6 +58,8 @@ public class RepairJob extends AbstractFuture<RepairResult> implements Runnable
+     private final RepairJobDesc desc;
+     private final RepairParallelism parallelismDegree;
+     private final ListeningExecutorService taskExecutor;
++    
++    private final List<SyncTask> syncTasks = new CopyOnWriteArrayList<>();
+ 
+     /**
+      * Create repair job to run on specific columnfamily
+@@ -91,6 +94,7 @@ public class RepairJob extends AbstractFuture<RepairResult> implements Runnable
+      * This sets up necessary task and runs them on given {@code taskExecutor}.
+      * After submitting all tasks, waits until validation with replica completes.
+      */
++    @SuppressWarnings("UnstableApiUsage")
+     public void run()
+     {
+         Keyspace ks = Keyspace.open(desc.keyspace);
+@@ -148,6 +152,7 @@ public class RepairJob extends AbstractFuture<RepairResult> implements Runnable
+         // When all sync complete, set the final result
+         Futures.addCallback(syncResults, new FutureCallback<List<SyncStat>>()
+         {
++            @Override
+             public void onSuccess(List<SyncStat> stats)
+             {
+                 if (!session.previewKind.isPreview())
+@@ -162,8 +167,11 @@ public class RepairJob extends AbstractFuture<RepairResult> implements Runnable
+             /**
+              * Snapshot, validation and sync failures are all handled here
+              */
++            @Override
+             public void onFailure(Throwable t)
+             {
++                syncTasks.forEach(SyncTask::abort);
++
+                 if (!session.previewKind.isPreview())
+                 {
+                     logger.warn("{} {}.{} sync failed", session.previewKind.logPrefix(session.getId()), desc.keyspace, desc.columnFamily);
+@@ -272,19 +280,22 @@ public class RepairJob extends AbstractFuture<RepairResult> implements Runnable
+         return executeTasks(syncTasks);
+     }
+ 
++    @SuppressWarnings("UnstableApiUsage")
+     @VisibleForTesting
+-    ListenableFuture<List<SyncStat>> executeTasks(List<SyncTask> syncTasks)
++    ListenableFuture<List<SyncStat>> executeTasks(List<SyncTask> tasks)
+     {
+         // this throws if the parent session has failed
+         ActiveRepairService.instance.getParentRepairSession(desc.parentSessionId);
+-        for (SyncTask task : syncTasks)
++        syncTasks.addAll(tasks);
++
++        for (SyncTask task : tasks)
+         {
+             if (!task.isLocal())
+                 session.trackSyncCompletion(Pair.create(desc, task.nodePair()), (CompletableRemoteSyncTask) task);
+             taskExecutor.submit(task);
+         }
+ 
+-        return Futures.allAsList(syncTasks);
++        return Futures.allAsList(tasks);
+     }
+ 
+     static List<SyncTask> createOptimisedSyncingSyncTasks(RepairJobDesc desc,
+@@ -362,6 +373,7 @@ public class RepairJob extends AbstractFuture<RepairResult> implements Runnable
+      * @param endpoints Endpoint addresses to send validation request
+      * @return Future that can get all {@link TreeResponse} from replica, if all validation succeed.
+      */
++    @SuppressWarnings("UnstableApiUsage")
+     private ListenableFuture<List<TreeResponse>> sendValidationRequest(Collection<InetAddressAndPort> endpoints)
+     {
+         String message = String.format("Requesting merkle trees for %s (to %s)", desc.columnFamily, endpoints);
+diff --git a/src/java/org/apache/cassandra/repair/RepairRunnable.java b/src/java/org/apache/cassandra/repair/RepairRunnable.java
+index 5ada11661e..48a7e36adc 100644
+--- a/src/java/org/apache/cassandra/repair/RepairRunnable.java
++++ b/src/java/org/apache/cassandra/repair/RepairRunnable.java
+@@ -563,7 +563,7 @@ public class RepairRunnable implements Runnable, ProgressEventNotifier
+                 }
+                 finally
+                 {
+-                    executor.shutdownNow();
++                    executor.shutdown();
+                 }
+             }
+ 
+@@ -571,7 +571,7 @@ public class RepairRunnable implements Runnable, ProgressEventNotifier
+             {
+                 notifyError(t);
+                 fail("Error completing preview repair: " + t.getMessage());
+-                executor.shutdownNow();
++                executor.shutdown();
+             }
+         }, MoreExecutors.directExecutor());
+     }
+@@ -738,14 +738,14 @@ public class RepairRunnable implements Runnable, ProgressEventNotifier
+                 success("Repair completed successfully");
+                 ActiveRepairService.instance.cleanUp(parentSession, preparedEndpoints);
+             }
+-            executor.shutdownNow();
++            executor.shutdown();
+         }
+ 
+         public void onFailure(Throwable t)
+         {
+             notifyError(t);
+             fail(t.getMessage());
+-            executor.shutdownNow();
++            executor.shutdown();
+         }
+     }
+ 
+diff --git a/src/java/org/apache/cassandra/repair/RepairSession.java b/src/java/org/apache/cassandra/repair/RepairSession.java
+index 75ed1a3cec..692cdcf90c 100644
+--- a/src/java/org/apache/cassandra/repair/RepairSession.java
++++ b/src/java/org/apache/cassandra/repair/RepairSession.java
+@@ -21,6 +21,7 @@ import java.io.IOException;
+ import java.util.*;
+ import java.util.concurrent.ConcurrentHashMap;
+ import java.util.concurrent.ConcurrentMap;
++import java.util.concurrent.TimeUnit;
+ import java.util.concurrent.atomic.AtomicBoolean;
+ 
+ import com.google.common.annotations.VisibleForTesting;
+@@ -87,7 +88,7 @@ public class RepairSession extends AbstractFuture<RepairSessionResult> implement
+                                                                                   IFailureDetectionEventListener,
+                                                                                   LocalSessions.Listener
+ {
+-    private static Logger logger = LoggerFactory.getLogger(RepairSession.class);
++    private static final Logger logger = LoggerFactory.getLogger(RepairSession.class);
+ 
+     public final UUID parentRepairSession;
+     /** Repair session ID */
+@@ -215,7 +216,7 @@ public class RepairSession extends AbstractFuture<RepairSessionResult> implement
+         CompletableRemoteSyncTask task = syncingTasks.remove(Pair.create(desc, nodes));
+         if (task == null)
+         {
+-            assert terminated;
++            assert terminated : "The repair session should be terminated if the sync task we're completing no longer exists.";
+             return;
+         }
+ 
+@@ -247,6 +248,7 @@ public class RepairSession extends AbstractFuture<RepairSessionResult> implement
+      *
+      * @param executor Executor to run validation
+      */
++    @SuppressWarnings("UnstableApiUsage")
+     public void start(ListeningExecutorService executor)
+     {
+         String message;
+@@ -308,10 +310,10 @@ public class RepairSession extends AbstractFuture<RepairSessionResult> implement
+                 logger.info("{} {}", previewKind.logPrefix(getId()), "Session completed successfully");
+                 Tracing.traceRepair("Completed sync of range {}", commonRange);
+                 set(new RepairSessionResult(id, keyspace, commonRange.ranges, results, commonRange.hasSkippedReplicas));
+-
+                 taskExecutor.shutdown();
+                 // mark this session as terminated
+                 terminate();
++                awaitTaskExecutorTermination();
+             }
+ 
+             public void onFailure(Throwable t)
+@@ -320,7 +322,7 @@ public class RepairSession extends AbstractFuture<RepairSessionResult> implement
+                 Tracing.traceRepair("Session completed with the following error: {}", t);
+                 forceShutdown(t);
+             }
+-        }, MoreExecutors.directExecutor());
++        }, executor);
+     }
+ 
+     public void terminate()
+@@ -338,8 +340,24 @@ public class RepairSession extends AbstractFuture<RepairSessionResult> implement
+     public void forceShutdown(Throwable reason)
+     {
+         setException(reason);
+-        taskExecutor.shutdownNow();
++        taskExecutor.shutdown();
+         terminate();
++        awaitTaskExecutorTermination();
++    }
++
++    private void awaitTaskExecutorTermination()
++    {
++        try
++        {
++            if (taskExecutor.awaitTermination(30, TimeUnit.SECONDS))
++                logger.debug("{} session task executor shut down gracefully", previewKind.logPrefix(getId()));
++            else
++                logger.warn("{} session task executor unable to shut down gracefully", previewKind.logPrefix(getId()));
++        }
++        catch (InterruptedException e)
++        {
++            Thread.currentThread().interrupt();
++        }
+     }
+ 
+     public void onRemove(InetAddressAndPort endpoint)
+diff --git a/src/java/org/apache/cassandra/repair/SnapshotTask.java b/src/java/org/apache/cassandra/repair/SnapshotTask.java
+index 40e4b3d093..46532fb535 100644
+--- a/src/java/org/apache/cassandra/repair/SnapshotTask.java
++++ b/src/java/org/apache/cassandra/repair/SnapshotTask.java
+@@ -83,7 +83,6 @@ public class SnapshotTask extends AbstractFuture<InetAddressAndPort> implements
+         @Override
+         public void onFailure(InetAddressAndPort from, RequestFailureReason failureReason)
+         {
+-            //listener.failedSnapshot();
+             task.setException(new RuntimeException("Could not create snapshot at " + from));
+         }
+     }
+diff --git a/src/java/org/apache/cassandra/repair/SyncTask.java b/src/java/org/apache/cassandra/repair/SyncTask.java
+index a63f037162..fe9f09ed7e 100644
+--- a/src/java/org/apache/cassandra/repair/SyncTask.java
++++ b/src/java/org/apache/cassandra/repair/SyncTask.java
+@@ -37,7 +37,7 @@ import org.apache.cassandra.tracing.Tracing;
+ 
+ public abstract class SyncTask extends AbstractFuture<SyncStat> implements Runnable
+ {
+-    private static Logger logger = LoggerFactory.getLogger(SyncTask.class);
++    private static final Logger logger = LoggerFactory.getLogger(SyncTask.class);
+ 
+     protected final RepairJobDesc desc;
+     @VisibleForTesting
+@@ -99,4 +99,6 @@ public abstract class SyncTask extends AbstractFuture<SyncStat> implements Runna
+         if (startTime != Long.MIN_VALUE)
+             Keyspace.open(desc.keyspace).getColumnFamilyStore(desc.columnFamily).metric.repairSyncTime.update(System.currentTimeMillis() - startTime, TimeUnit.MILLISECONDS);
+     }
++
++    public void abort() {}
+ }
+diff --git a/src/java/org/apache/cassandra/service/ActiveRepairService.java b/src/java/org/apache/cassandra/service/ActiveRepairService.java
+index f2e8b6edec..4a990f662c 100644
+--- a/src/java/org/apache/cassandra/service/ActiveRepairService.java
++++ b/src/java/org/apache/cassandra/service/ActiveRepairService.java
+@@ -897,4 +897,10 @@ public class ActiveRepairService implements IEndpointStateChangeSubscriber, IFai
+     {
+         return parentRepairSessions.size();
+     }
++
++    @VisibleForTesting
++    public int sessionCount()
++    {
++        return sessions.size();
++    }
+ }
+diff --git a/src/java/org/apache/cassandra/streaming/SessionInfo.java b/src/java/org/apache/cassandra/streaming/SessionInfo.java
+index 4b4bbed142..c77e90d982 100644
+--- a/src/java/org/apache/cassandra/streaming/SessionInfo.java
++++ b/src/java/org/apache/cassandra/streaming/SessionInfo.java
+@@ -69,6 +69,11 @@ public final class SessionInfo implements Serializable
+         return state == StreamSession.State.FAILED;
+     }
+ 
++    public boolean isAborted()
++    {
++        return state == StreamSession.State.ABORTED;
++    }
++
+     /**
+      * Update progress of receiving/sending stream.
+      *
+diff --git a/src/java/org/apache/cassandra/streaming/StreamCoordinator.java b/src/java/org/apache/cassandra/streaming/StreamCoordinator.java
+index e590e9682f..8bcf54ef7a 100644
+--- a/src/java/org/apache/cassandra/streaming/StreamCoordinator.java
++++ b/src/java/org/apache/cassandra/streaming/StreamCoordinator.java
+@@ -18,6 +18,7 @@
+ package org.apache.cassandra.streaming;
+ 
+ import java.util.*;
++import java.util.concurrent.ConcurrentHashMap;
+ 
+ import com.google.common.annotations.VisibleForTesting;
+ import org.slf4j.Logger;
+@@ -39,7 +40,7 @@ public class StreamCoordinator
+ 
+     private final boolean connectSequentially;
+ 
+-    private final Map<InetAddressAndPort, HostStreamingData> peerSessions = new HashMap<>();
++    private final Map<InetAddressAndPort, HostStreamingData> peerSessions = new ConcurrentHashMap<>();
+     private final StreamOperation streamOperation;
+     private final int connectionsPerHost;
+     private final boolean follower;
+diff --git a/src/java/org/apache/cassandra/streaming/StreamResultFuture.java b/src/java/org/apache/cassandra/streaming/StreamResultFuture.java
+index 89a6cf13f4..3b8ffdc32e 100644
+--- a/src/java/org/apache/cassandra/streaming/StreamResultFuture.java
++++ b/src/java/org/apache/cassandra/streaming/StreamResultFuture.java
+@@ -119,7 +119,7 @@ public final class StreamResultFuture extends AbstractFuture<StreamState>
+             future = new StreamResultFuture(planId, streamOperation, pendingRepair, previewKind);
+             StreamManager.instance.registerFollower(future);
+         }
+-        future.attachConnection(from, sessionIndex, channel);
++        future.attachConnection(from, sessionIndex);
+         logger.info("[Stream #{}, ID#{}] Received streaming plan for {} from {} channel.remote {} channel.local {} channel.id {}",
+                     planId, sessionIndex, streamOperation.getDescription(), from, channel.remoteAddress(), channel.localAddress(), channel.id());
+         return future;
+@@ -137,12 +137,13 @@ public final class StreamResultFuture extends AbstractFuture<StreamState>
+         return coordinator;
+     }
+ 
+-    private void attachConnection(InetAddressAndPort from, int sessionIndex, Channel channel)
++    private void attachConnection(InetAddressAndPort from, int sessionIndex)
+     {
+         StreamSession session = coordinator.getOrCreateSessionById(from, sessionIndex);
+         session.init(this);
+     }
+ 
++    @SuppressWarnings("UnstableApiUsage")
+     public void addEventListener(StreamEventHandler listener)
+     {
+         Futures.addCallback(this, listener, MoreExecutors.directExecutor());
+@@ -219,6 +220,11 @@ public final class StreamResultFuture extends AbstractFuture<StreamState>
+                 logger.warn("[Stream #{}] Stream failed", planId);
+                 setException(new StreamException(finalState, "Stream failed"));
+             }
++            else if (finalState.hasAbortedSession())
++            {
++                logger.info("[Stream #{}] Stream aborted", planId);
++                set(finalState);
++            }
+             else
+             {
+                 logger.info("[Stream #{}] All sessions completed", planId);
+diff --git a/src/java/org/apache/cassandra/streaming/StreamSession.java b/src/java/org/apache/cassandra/streaming/StreamSession.java
+index 0b4c0cd2ae..9a3428591c 100644
+--- a/src/java/org/apache/cassandra/streaming/StreamSession.java
++++ b/src/java/org/apache/cassandra/streaming/StreamSession.java
+@@ -170,31 +170,31 @@ public class StreamSession implements IEndpointStateChangeSubscriber
+     // threads(serialization/deserialization) and stream messaging processing thread, causing connection closed before
+     // receiving peer's CompleteMessage.
+     private boolean maybeCompleted = false;
+-    private Future closeFuture;
++    private Future<?> closeFuture;
+ 
+     private final UUID pendingRepair;
+     private final PreviewKind previewKind;
+ 
+-    /**
+-     * State Transition:
+-     *
+-     * <pre>
+-     *  +------------------+----------> FAILED <--------------------+
+-     *  |                  |              ^                         |
+-     *  |                  |              |       initiator         |
+-     *  INITIALIZED --> PREPARING --> STREAMING ------------> WAIT_COMPLETE ----> COMPLETED
+-     *  |                  |              |                         ^                 ^
+-     *  |                  |              |       follower          |                 |
+-     *  |                  |              +-------------------------)-----------------+
+-     *  |                  |                                        |                 |
+-     *  |                  |         if preview                     |                 |
+-     *  |                  +----------------------------------------+                 |
+-     *  |               nothing to request or to transfer                             |
+-     *  +-----------------------------------------------------------------------------+
+-     *                  nothing to request or to transfer
+-     *
+-     *  </pre>
+-     */
++/**
++ * State Transition:
++ *
++ * <pre>
++ *  +------------------+-----> FAILED | ABORTED <---------------+
++ *  |                  |              ^                         |
++ *  |                  |              |       initiator         |
++ *  INITIALIZED --> PREPARING --> STREAMING ------------> WAIT_COMPLETE ----> COMPLETED
++ *  |                  |              |                         ^                 ^
++ *  |                  |              |       follower          |                 |
++ *  |                  |              +-------------------------)-----------------+
++ *  |                  |                                        |                 |
++ *  |                  |         if preview                     |                 |
++ *  |                  +----------------------------------------+                 |
++ *  |               nothing to request or to transfer                             |
++ *  +-----------------------------------------------------------------------------+
++ *                  nothing to request or to transfer
++ *
++ *  </pre>
++ */
+     public enum State
+     {
+         INITIALIZED(false),
+@@ -202,7 +202,8 @@ public class StreamSession implements IEndpointStateChangeSubscriber
+         STREAMING(false),
+         WAIT_COMPLETE(false),
+         COMPLETE(true),
+-        FAILED(true);
++        FAILED(true),
++        ABORTED(true);
+ 
+         private final boolean finalState;
+ 
+@@ -212,7 +213,7 @@ public class StreamSession implements IEndpointStateChangeSubscriber
+         }
+ 
+         /**
+-         * @return true if current state is final, either COMPLETE OR FAILED.
++         * @return true if current state is final, either COMPLETE, FAILED, or ABORTED.
+          */
+         public boolean isFinalState()
+         {
+@@ -479,7 +480,7 @@ public class StreamSession implements IEndpointStateChangeSubscriber
+         }
+     }
+ 
+-    private synchronized Future closeSession(State finalState)
++    private synchronized Future<?> closeSession(State finalState)
+     {
+         // it's session is already closed
+         if (closeFuture != null)
+@@ -487,11 +488,11 @@ public class StreamSession implements IEndpointStateChangeSubscriber
+ 
+         state(finalState);
+ 
+-        List<Future> futures = new ArrayList<>();
++        List<Future<?>> futures = new ArrayList<>();
+ 
+         // ensure aborting the tasks do not happen on the network IO thread (read: netty event loop)
+         // as we don't want any blocking disk IO to stop the network thread
+-        if (finalState == State.FAILED)
++        if (finalState == State.FAILED || finalState == State.ABORTED)
+             futures.add(ScheduledExecutors.nonPeriodicTasks.submit(this::abortTasks));
+ 
+         // Channels should only be closed by the initiator; but, if this session closed
+@@ -628,7 +629,7 @@ public class StreamSession implements IEndpointStateChangeSubscriber
+      * after completion or because the peer was down, otherwise sends a {@link SessionFailedMessage} and closes
+      * the session as {@link State#FAILED}.
+      */
+-    public synchronized Future onError(Throwable e)
++    public synchronized Future<?> onError(Throwable e)
+     {
+         boolean isEofException = e instanceof EOFException;
+         if (isEofException)
+@@ -1035,4 +1036,21 @@ public class StreamSession implements IEndpointStateChangeSubscriber
+          */
+         public void onClose(InetAddressAndPort from);
+     }
++
++    public synchronized void abort()
++    {
++        logger.info("[Stream #{}] Aborting stream session with peer {}...", planId(), peer);
++
++        if (getMessageSender().connected())
++            getMessageSender().sendMessage(new SessionFailedMessage());
++
++        try
++        {
++            closeSession(State.ABORTED);
++        }
++        catch (Exception e)
++        {
++            logger.error("[Stream #{}] Error aborting stream session with peer {}", planId(), peer);
++        }
++    }
+ }
+diff --git a/src/java/org/apache/cassandra/streaming/StreamState.java b/src/java/org/apache/cassandra/streaming/StreamState.java
+index be376775ea..1b7c042c3e 100644
+--- a/src/java/org/apache/cassandra/streaming/StreamState.java
++++ b/src/java/org/apache/cassandra/streaming/StreamState.java
+@@ -22,7 +22,6 @@ import java.util.List;
+ import java.util.Set;
+ import java.util.UUID;
+ 
+-import com.google.common.base.Predicate;
+ import com.google.common.collect.Iterables;
+ import com.google.common.collect.Lists;
+ 
+@@ -44,13 +43,12 @@ public class StreamState implements Serializable
+ 
+     public boolean hasFailedSession()
+     {
+-        return Iterables.any(sessions, new Predicate<SessionInfo>()
+-        {
+-            public boolean apply(SessionInfo session)
+-            {
+-                return session.isFailed();
+-            }
+-        });
++        return Iterables.any(sessions, SessionInfo::isFailed);
++    }
++
++    public boolean hasAbortedSession()
++    {
++        return Iterables.any(sessions, SessionInfo::isAborted);
+     }
+ 
+     public List<SessionSummary> createSummaries()
+diff --git a/src/java/org/apache/cassandra/utils/FBUtilities.java b/src/java/org/apache/cassandra/utils/FBUtilities.java
+index 3b63d9a40c..63ffc63dc5 100644
+--- a/src/java/org/apache/cassandra/utils/FBUtilities.java
++++ b/src/java/org/apache/cassandra/utils/FBUtilities.java
+@@ -532,7 +532,7 @@ public class FBUtilities
+     /**
+      * Returns a new {@link Future} wrapping the given list of futures and returning a list of their results.
+      */
+-    public static Future<List> allOf(Collection<Future> futures)
++    public static Future<List> allOf(Collection<Future<?>> futures)
+     {
+         if (futures.isEmpty())
+             return CompletableFuture.completedFuture(null);
+diff --git a/test/distributed/org/apache/cassandra/distributed/test/RepairErrorsTest.java b/test/distributed/org/apache/cassandra/distributed/test/RepairErrorsTest.java
+new file mode 100644
+index 0000000000..8b77b3f056
+--- /dev/null
++++ b/test/distributed/org/apache/cassandra/distributed/test/RepairErrorsTest.java
+@@ -0,0 +1,165 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.cassandra.distributed.test;
++
++import java.util.concurrent.Callable;
++import java.util.concurrent.Future;
++import java.util.concurrent.TimeUnit;
++
++import net.bytebuddy.ByteBuddy;
++import net.bytebuddy.dynamic.loading.ClassLoadingStrategy;
++import net.bytebuddy.implementation.MethodDelegation;
++import net.bytebuddy.implementation.bind.annotation.SuperCall;
++import org.junit.Test;
++
++import org.apache.cassandra.concurrent.DebuggableThreadPoolExecutor;
++import org.apache.cassandra.db.SystemKeyspace;
++import org.apache.cassandra.distributed.Cluster;
++import org.apache.cassandra.distributed.api.ConsistencyLevel;
++import org.apache.cassandra.distributed.api.NodeToolResult;
++import org.apache.cassandra.locator.InetAddressAndPort;
++import org.apache.cassandra.service.ActiveRepairService;
++import org.apache.cassandra.streaming.StreamSession;
++
++import static net.bytebuddy.matcher.ElementMatchers.named;
++import static net.bytebuddy.matcher.ElementMatchers.takesArguments;
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertTrue;
++
++import static org.apache.cassandra.distributed.api.Feature.GOSSIP;
++import static org.apache.cassandra.distributed.api.Feature.NETWORK;
++
++public class RepairErrorsTest extends TestBaseImpl
++{
++    @SuppressWarnings("Convert2MethodRef")
++    @Test
++    public void testRemoteSyncFailure() throws Exception
++    {
++        try (Cluster cluster = init(Cluster.build(3)
++                                           .withConfig(config -> config.with(GOSSIP)
++                                                                       .with(NETWORK)
++                                                                       .set("disk_failure_policy", "stop")
++                                                                       .set("disk_access_mode", "mmap_index_only"))
++                                           .withInstanceInitializer(ByteBuddyHelper::installStreamPlanExecutionFailure).start()))
++        {
++            cluster.schemaChange("create table " + KEYSPACE + ".tbl (id int primary key, x int)");
++            
++            // On repair, this data layout will require two (local) syncs from node 1 and one remote sync from node 2:
++            cluster.get(1).executeInternal("insert into " + KEYSPACE + ".tbl (id, x) VALUES (?,?)", 1, 1);
++            cluster.get(2).executeInternal("insert into " + KEYSPACE + ".tbl (id, x) VALUES (?,?)", 2, 2);
++            cluster.get(3).executeInternal("insert into " + KEYSPACE + ".tbl (id, x) VALUES (?,?)", 3, 3);
++            cluster.forEach(i -> i.flush(KEYSPACE));
++            
++            // Flush system.peers_v2, or there won't be any SSTables...
++            cluster.forEach(i -> i.flush("system"));
++            
++            // The remote sync started from node 2 will fail on plan execution and propagate the error...
++            NodeToolResult result = cluster.get(1).nodetoolResult("repair", KEYSPACE);
++            result.asserts().failure().errorContains("Sync failed between /127.0.0.2:7012 and /127.0.0.3:7012");
++
++            // Before CASSANDRA-17466 added an abort mechanism for local sync tasks and switched the repair task
++            // executor to shut down without interrupting its threads, we could trigger the disk failure policy, as
++            // interruption could accidentally close shared channels in the middle of a blocking operation. To see
++            // this, simply revert those changes in RepairJob (aborting sync tasks) and RepairSession (shutdown()
++            // rather than shutdownNow() on failure).
++            assertTrue(cluster.get(1).logs().grep("Stopping transports as disk_failure_policy is stop").getResult().isEmpty());
++            assertTrue(cluster.get(1).logs().grep("FSReadError").getResult().isEmpty());
++            assertTrue(cluster.get(1).logs().grep("ClosedByInterruptException").getResult().isEmpty());
++
++            // Make sync unnecessary, and repair should succeed:
++            cluster.coordinator(1).execute("insert into " + KEYSPACE + ".tbl (id, x) VALUES (?,?)", ConsistencyLevel.ALL, 1, 1);
++            cluster.coordinator(1).execute("insert into " + KEYSPACE + ".tbl (id, x) VALUES (?,?)", ConsistencyLevel.ALL, 2, 2);
++            cluster.coordinator(1).execute("insert into " + KEYSPACE + ".tbl (id, x) VALUES (?,?)", ConsistencyLevel.ALL, 3, 3);
++            cluster.forEach(i -> i.flush(KEYSPACE));
++            result = cluster.get(1).nodetoolResult("repair", KEYSPACE);
++            result.asserts().success();
++
++            // Make sure we've cleaned up sessions and parent sessions:
++            Integer parents = cluster.get(1).callOnInstance(() -> ActiveRepairService.instance.parentRepairSessionCount());
++            assertEquals(0, parents.intValue());
++            Integer sessions = cluster.get(1).callOnInstance(() -> ActiveRepairService.instance.sessionCount());
++            assertEquals(0, sessions.intValue());
++        }
++    }
++
++    public static class ByteBuddyHelper
++    {
++        public static void installStreamPlanExecutionFailure(ClassLoader cl, int nodeNumber)
++        {
++            if (nodeNumber == 2)
++            {
++                new ByteBuddy().rebase(StreamSession.class)
++                               .method(named("onInitializationComplete"))
++                               .intercept(MethodDelegation.to(ByteBuddyHelper.class))
++                               .make()
++                               .load(cl, ClassLoadingStrategy.Default.INJECTION);
++            }
++
++            if (nodeNumber == 1)
++            {
++                new ByteBuddy().rebase(SystemKeyspace.class)
++                        .method(named("getPreferredIP"))
++                        .intercept(MethodDelegation.to(ByteBuddyHelper.class))
++                        .make()
++                        .load(cl, ClassLoadingStrategy.Default.INJECTION);
++
++                new ByteBuddy().rebase(DebuggableThreadPoolExecutor.class)
++                        .method(named("extractThrowable").and(takesArguments(Future.class)))
++                        .intercept(MethodDelegation.to(ByteBuddyHelper.class))
++                        .make()
++                        .load(cl, ClassLoadingStrategy.Default.INJECTION);
++            }
++        }
++
++        @SuppressWarnings("unused")
++        public static void onInitializationComplete()
++        {
++            throw new RuntimeException("Failing stream session initialization from test!");
++        }
++
++        @SuppressWarnings("unused")
++        public static InetAddressAndPort getPreferredIP(InetAddressAndPort ep, @SuperCall Callable<InetAddressAndPort> zuper) throws Exception
++        {
++            if (Thread.currentThread().getName().contains("RepairJobTask"))
++            {
++                try
++                {
++                    TimeUnit.SECONDS.sleep(60);
++                }
++                catch (InterruptedException e)
++                {
++                    // Leave the interrupt flag intact for the ChannelProxy downstream...
++                    Thread.currentThread().interrupt();
++                }
++            }
++
++            return zuper.call();
++        }
++
++        @SuppressWarnings({"unused", "ResultOfMethodCallIgnored"})
++        public static Throwable extractThrowable(Future<?> future, @SuperCall Callable<Throwable> zuper) throws Exception
++        {
++            if (Thread.currentThread().getName().contains("RepairJobTask"))
++                // Clear the interrupt flag so the FSReadError is propagated correctly in DebuggableThreadPoolExecutor:
++                Thread.interrupted();
++            
++            return zuper.call();
++        }
++    }
++}
+diff --git a/test/distributed/org/apache/cassandra/distributed/test/StreamingTest.java b/test/distributed/org/apache/cassandra/distributed/test/StreamingTest.java
+index b68d268ee5..8fff004ad1 100644
+--- a/test/distributed/org/apache/cassandra/distributed/test/StreamingTest.java
++++ b/test/distributed/org/apache/cassandra/distributed/test/StreamingTest.java
+@@ -34,7 +34,6 @@ import com.google.common.annotations.VisibleForTesting;
+ import org.junit.Assert;
+ import org.junit.Test;
+ 
+-import org.apache.cassandra.db.Keyspace;
+ import org.apache.cassandra.distributed.Cluster;
+ import org.apache.cassandra.distributed.api.IInvokableInstance;
+ import org.apache.cassandra.locator.InetAddressAndPort;

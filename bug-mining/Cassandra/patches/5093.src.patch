@@ -1,0 +1,277 @@
+diff --git a/CHANGES.txt b/CHANGES.txt
+index 195c97c93a..43628b258a 100644
+--- a/CHANGES.txt
++++ b/CHANGES.txt
+@@ -1,4 +1,5 @@
+ 3.0.18
++ * DESC order reads can fail to return the last Unfiltered in the partition (CASSANDRA-14766)
+  * Fix corrupted collection deletions for dropped columns in 3.0 <-> 2.{1,2} messages (CASSANDRA-14568)
+  * Fix corrupted static collection deletions in 3.0 <-> 2.{1,2} messages (CASSANDRA-14568)
+  * Handle failures in parallelAllSSTableOperation (cleanup/upgradesstables/etc) (CASSANDRA-14657)
+diff --git a/src/java/org/apache/cassandra/db/UnfilteredDeserializer.java b/src/java/org/apache/cassandra/db/UnfilteredDeserializer.java
+index 0aa574151c..62ad76a1b3 100644
+--- a/src/java/org/apache/cassandra/db/UnfilteredDeserializer.java
++++ b/src/java/org/apache/cassandra/db/UnfilteredDeserializer.java
+@@ -245,10 +245,14 @@ public abstract class UnfilteredDeserializer
+ 
+         // The next Unfiltered to return, computed by hasNext()
+         private Unfiltered next;
+-        // A temporary storage for an unfiltered that isn't returned next but should be looked at just afterwards
+-        private Unfiltered saved;
+ 
+-        private boolean isFirst = true;
++        // Saved position in the input after the next Unfiltered that will be consumed
++        private long nextConsumedPosition;
++
++        // A temporary storage for an Unfiltered that isn't returned next but should be looked at just afterwards
++        private Stash stash;
++
++        private boolean couldBeStartOfPartition = true;
+ 
+         // The Unfiltered as read from the old format input
+         private final UnfilteredIterator iterator;
+@@ -258,7 +262,15 @@ public abstract class UnfilteredDeserializer
+ 
+         // Tracks the size of the last LegacyAtom read from disk, because this needs to be accounted
+         // for when marking lastConsumedPosition after readNext/skipNext
+-        private long bytesReadForNextAtom;
++        // Reading/skipping an Unfiltered consumes LegacyAtoms from the underlying legacy atom iterator
++        // e.g. hasNext() -> iterator.hasNext() -> iterator.readRow() -> atoms.next()
++        // The stop condition of the loop which groups legacy atoms into rows causes that AtomIterator
++        // to read in the first atom which doesn't belong in the row. So by that point, our position
++        // is actually past the end of the next Unfiltered. To compensate, we record the size of
++        // the last LegacyAtom read and subtract it from the current position when we calculate lastConsumedPosition.
++        // If we don't, then when reading an indexed block, we can over correct and may think that we've
++        // exhausted the block before we actually have.
++        private long bytesReadForNextAtom = 0L;
+ 
+         private OldFormatDeserializer(CFMetaData metadata,
+                                       DataInputPlus in,
+@@ -313,27 +325,55 @@ public abstract class UnfilteredDeserializer
+             {
+                 while (next == null)
+                 {
+-                    if (saved == null && !iterator.hasNext())
+-                        return false;
+-
+-                    next = saved == null ? iterator.next() : saved;
+-                    saved = null;
+-
+-                    // The sstable iterators assume that if there is one, the static row is the first thing this deserializer will return.
+-                    // However, in the old format, a range tombstone with an empty start would sort before any static cell. So we should
+-                    // detect that case and return the static parts first if necessary.
+-                    if (isFirst && iterator.hasNext() && isStatic(iterator.peek()))
++                    if (null != stash)
++                    {
++                        next = stash.unfiltered;
++                        nextConsumedPosition = stash.consumedPosition;
++                        stash = null;
++                    }
++                    else
+                     {
+-                        saved = next;
++                        if (!iterator.hasNext())
++                            return false;
+                         next = iterator.next();
++                        nextConsumedPosition = currentPosition() - bytesReadForNextAtom;
++                    }
++
++                    /*
++                     * The sstable iterators assume that if there is one, the static row is the first thing this deserializer will return.
++                     * However, in the old format, a range tombstone with an empty start would sort before any static cell. So we should
++                     * detect that case and return the static parts first if necessary.
++                     */
++                    if (couldBeStartOfPartition && next.isRangeTombstoneMarker() && next.clustering().size() == 0 && iterator.hasNext())
++                    {
++                        Unfiltered unfiltered = iterator.next();
++                        long consumedPosition = currentPosition() - bytesReadForNextAtom;
++
++                        stash = new Stash(unfiltered, consumedPosition);
++
++                        /*
++                         * reorder next and stash (see the comment above that explains why), but retain their positions
++                         * it's ok to do so since consumedPosition value is only used to determine if we have gone past
++                         * the end of the index ‘block’; since the edge case requires that the first value be the ‘bottom’
++                         * RT bound (i.e. with no byte buffers), this has a small and well-defined size, and it must be
++                         * the case that both unfiltered are in the same index ‘block’ if we began at the beginning of it.
++                         * if we don't do this, however, we risk aborting early and not returning the BOTTOM rt bound,
++                         * if the static row is large enough to cross block boundaries.
++                         */
++                        if (isStatic(unfiltered))
++                        {
++                            stash.unfiltered = next;
++                            next = unfiltered;
++                        }
+                     }
+-                    isFirst = false;
++                    couldBeStartOfPartition = false;
+ 
+                     // When reading old tables, we sometimes want to skip static data (due to how staticly defined column of compact
+                     // tables are handled).
+                     if (skipStatic && isStatic(next))
+                         next = null;
+                 }
++
+                 return true;
+             }
+             catch (IOError e)
+@@ -376,18 +416,17 @@ public abstract class UnfilteredDeserializer
+                 throw new IllegalStateException();
+             Unfiltered toReturn = next;
+             next = null;
+-            lastConsumedPosition = currentPosition() - bytesReadForNextAtom();
++            lastConsumedPosition = nextConsumedPosition;
+             return toReturn;
+         }
+ 
+         public void skipNext() throws IOException
+         {
+-            if (!hasNext())
+-                throw new UnsupportedOperationException();
+-            next = null;
+-            lastConsumedPosition = currentPosition() - bytesReadForNextAtom();
++            readNext();
+         }
+ 
++        // in case we had to reorder an empty RT bound with a static row, this won't be returning the precise unconsumed size,
++        // that corresponds to the last returned Unfiltered, but use the natural order in the sstable instead
+         public long bytesReadForUnconsumedData()
+         {
+             if (!(in instanceof FileDataInput))
+@@ -396,28 +435,26 @@ public abstract class UnfilteredDeserializer
+             return currentPosition() - lastConsumedPosition;
+         }
+ 
+-        // Reading/skipping an Unfiltered consumes LegacyAtoms from the underlying legacy atom iterator
+-        // e.g. hasNext() -> iterator.hasNext() -> iterator.readRow() -> atoms.next()
+-        // The stop condition of the loop which groups legacy atoms into rows causes that AtomIterator
+-        // to read in the first atom which doesn't belong in the row. So by that point, our position
+-        // is actually past the end of the next Unfiltered. To compensate, we record the size of
+-        // the last LegacyAtom read and subtract it from the current position when we calculate lastConsumedPosition.
+-        // If we don't, then when reading an indexed block, we can over correct and may think that we've
+-        // exhausted the block before we actually have.
+-        private long bytesReadForNextAtom()
+-        {
+-            // If we've read anything at all then we will have recorded this in bytesReadForNextAtom,
+-            // but being extra careful here just incase this method is called before any reads happen.
+-            return iterator.atoms.next == null ? 0 : bytesReadForNextAtom;
+-        }
+-
+         public void clearState()
+         {
+             next = null;
+-            saved = null;
++            stash = null;
++            couldBeStartOfPartition = true;
+             iterator.clearState();
+             lastConsumedPosition = currentPosition();
+-            bytesReadForNextAtom = 0;
++            bytesReadForNextAtom = 0L;
++        }
++
++        private static final class Stash
++        {
++            private Unfiltered unfiltered;
++            long consumedPosition;
++
++            private Stash(Unfiltered unfiltered, long consumedPosition)
++            {
++                this.unfiltered = unfiltered;
++                this.consumedPosition = consumedPosition;
++            }
+         }
+ 
+         // Groups atoms from the input into proper Unfiltered.
+@@ -543,7 +580,7 @@ public abstract class UnfilteredDeserializer
+             // Wraps the input of the deserializer to provide an iterator (and skip shadowed atoms).
+             // Note: this could use guava AbstractIterator except that we want to be able to clear
+             // the internal state of the iterator so it's cleaner to do it ourselves.
+-            private class AtomIterator implements PeekingIterator<LegacyLayout.LegacyAtom>
++            private static class AtomIterator implements PeekingIterator<LegacyLayout.LegacyAtom>
+             {
+                 private final Supplier<LegacyLayout.LegacyAtom> atomReader;
+                 private boolean isDone;
+diff --git a/test/data/legacy-sstables/ka/legacy_tables/legacy_ka_14766/legacy_tables-legacy_ka_14766-ka-1-CompressionInfo.db b/test/data/legacy-sstables/ka/legacy_tables/legacy_ka_14766/legacy_tables-legacy_ka_14766-ka-1-CompressionInfo.db
+new file mode 100644
+index 0000000000..b5b5246f11
+Binary files /dev/null and b/test/data/legacy-sstables/ka/legacy_tables/legacy_ka_14766/legacy_tables-legacy_ka_14766-ka-1-CompressionInfo.db differ
+diff --git a/test/data/legacy-sstables/ka/legacy_tables/legacy_ka_14766/legacy_tables-legacy_ka_14766-ka-1-Data.db b/test/data/legacy-sstables/ka/legacy_tables/legacy_ka_14766/legacy_tables-legacy_ka_14766-ka-1-Data.db
+new file mode 100644
+index 0000000000..18cf47848f
+Binary files /dev/null and b/test/data/legacy-sstables/ka/legacy_tables/legacy_ka_14766/legacy_tables-legacy_ka_14766-ka-1-Data.db differ
+diff --git a/test/data/legacy-sstables/ka/legacy_tables/legacy_ka_14766/legacy_tables-legacy_ka_14766-ka-1-Digest.sha1 b/test/data/legacy-sstables/ka/legacy_tables/legacy_ka_14766/legacy_tables-legacy_ka_14766-ka-1-Digest.sha1
+new file mode 100644
+index 0000000000..f37a2b3b2d
+--- /dev/null
++++ b/test/data/legacy-sstables/ka/legacy_tables/legacy_ka_14766/legacy_tables-legacy_ka_14766-ka-1-Digest.sha1
+@@ -0,0 +1 @@
++1576541413
+\ No newline at end of file
+diff --git a/test/data/legacy-sstables/ka/legacy_tables/legacy_ka_14766/legacy_tables-legacy_ka_14766-ka-1-Filter.db b/test/data/legacy-sstables/ka/legacy_tables/legacy_ka_14766/legacy_tables-legacy_ka_14766-ka-1-Filter.db
+new file mode 100644
+index 0000000000..7a3104813c
+Binary files /dev/null and b/test/data/legacy-sstables/ka/legacy_tables/legacy_ka_14766/legacy_tables-legacy_ka_14766-ka-1-Filter.db differ
+diff --git a/test/data/legacy-sstables/ka/legacy_tables/legacy_ka_14766/legacy_tables-legacy_ka_14766-ka-1-Index.db b/test/data/legacy-sstables/ka/legacy_tables/legacy_ka_14766/legacy_tables-legacy_ka_14766-ka-1-Index.db
+new file mode 100644
+index 0000000000..5e4995c2c7
+Binary files /dev/null and b/test/data/legacy-sstables/ka/legacy_tables/legacy_ka_14766/legacy_tables-legacy_ka_14766-ka-1-Index.db differ
+diff --git a/test/data/legacy-sstables/ka/legacy_tables/legacy_ka_14766/legacy_tables-legacy_ka_14766-ka-1-Statistics.db b/test/data/legacy-sstables/ka/legacy_tables/legacy_ka_14766/legacy_tables-legacy_ka_14766-ka-1-Statistics.db
+new file mode 100644
+index 0000000000..d4b0526c32
+Binary files /dev/null and b/test/data/legacy-sstables/ka/legacy_tables/legacy_ka_14766/legacy_tables-legacy_ka_14766-ka-1-Statistics.db differ
+diff --git a/test/data/legacy-sstables/ka/legacy_tables/legacy_ka_14766/legacy_tables-legacy_ka_14766-ka-1-Summary.db b/test/data/legacy-sstables/ka/legacy_tables/legacy_ka_14766/legacy_tables-legacy_ka_14766-ka-1-Summary.db
+new file mode 100644
+index 0000000000..38cc933548
+Binary files /dev/null and b/test/data/legacy-sstables/ka/legacy_tables/legacy_ka_14766/legacy_tables-legacy_ka_14766-ka-1-Summary.db differ
+diff --git a/test/data/legacy-sstables/ka/legacy_tables/legacy_ka_14766/legacy_tables-legacy_ka_14766-ka-1-TOC.txt b/test/data/legacy-sstables/ka/legacy_tables/legacy_ka_14766/legacy_tables-legacy_ka_14766-ka-1-TOC.txt
+new file mode 100644
+index 0000000000..db5ac46dd6
+--- /dev/null
++++ b/test/data/legacy-sstables/ka/legacy_tables/legacy_ka_14766/legacy_tables-legacy_ka_14766-ka-1-TOC.txt
+@@ -0,0 +1,8 @@
++Data.db
++TOC.txt
++Digest.sha1
++Filter.db
++Statistics.db
++CompressionInfo.db
++Summary.db
++Index.db
+diff --git a/test/unit/org/apache/cassandra/io/sstable/LegacySSTableTest.java b/test/unit/org/apache/cassandra/io/sstable/LegacySSTableTest.java
+index ede4ab6ade..f10114baa9 100644
+--- a/test/unit/org/apache/cassandra/io/sstable/LegacySSTableTest.java
++++ b/test/unit/org/apache/cassandra/io/sstable/LegacySSTableTest.java
+@@ -188,7 +188,32 @@ public class LegacySSTableTest
+     }
+ 
+     @Test
+-    public void verifyOldSSTables() throws Exception
++    public void test14766() throws Exception
++    {
++        /*
++         * During upgrades from 2.1 to 3.0, reading from old sstables in reverse order could omit the very last row if the
++         * last indexed block had only two Unfiltered-s. See CASSANDRA-14766 for details.
++         *
++         * The sstable used here has two indexed blocks, with 2 cells/rows of ~500 bytes each, with column index interval of 1kb.
++         * Without the fix SELECT * returns 4 rows in ASC order, but only 3 rows in DESC order, omitting the last one.
++         */
++
++        QueryProcessor.executeInternal("CREATE TABLE legacy_tables.legacy_ka_14766 (pk int, ck int, value text, PRIMARY KEY (pk, ck));");
++        loadLegacyTable("legacy_%s_14766%s", "ka", "");
++
++        UntypedResultSet rs;
++
++        // read all rows in ASC order, expect all 4 to be returned
++        rs = QueryProcessor.executeInternal("SELECT * FROM legacy_tables.legacy_ka_14766 WHERE pk = 0 ORDER BY ck ASC;");
++        Assert.assertEquals(4, rs.size());
++
++        // read all rows in DESC order, expect all 4 to be returned
++        rs = QueryProcessor.executeInternal("SELECT * FROM legacy_tables.legacy_ka_14766 WHERE pk = 0 ORDER BY ck DESC;");
++        Assert.assertEquals(4, rs.size());
++    }
++
++    @Test
++    public void testVerifyOldSSTables() throws Exception
+     {
+         for (String legacyVersion : legacyVersions)
+         {

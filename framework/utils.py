@@ -7,6 +7,7 @@ import sys
 import requests  
 import requests.adapters 
 import json
+import time
 from urllib.parse import urlparse, urlunparse 
 
 # Read debug flag from environment variable
@@ -76,22 +77,54 @@ def download_report_data(uri, save_to):
             headers['Authorization'] = f"token {os.environ.get('GH_TOKEN')}"
             # print(f"  -> [GitHub] Using token for authentication")
 
-        response = session.get(api_uri, headers=headers, timeout=20)
-        response.raise_for_status()
-        
+        max_app_retries = 4
+        retry_delay = 15
+        response_text = None
+
+        for attempt in range(max_app_retries):
+            try:
+                response = session.get(api_uri, headers=headers, timeout=30)
+                response.raise_for_status()
+                response_text = response.text
+                break
+            except requests.exceptions.RequestException as e:
+                if attempt == 0:
+                    print("FAIL", file=sys.stderr) 
+                
+                print(f"  -> (Attempt {attempt + 1}/{max_app_retries}) Error downloading {api_uri}: {e}", file=sys.stderr)
+                
+                if 'Network is unreachable' in str(e) or 'Name or service not known' in str(e) or 'Failed to establish a new connection' in str(e):
+                    print(f"  -> Transient network error detected. Retrying in {retry_delay}s...", file=sys.stderr)
+                elif hasattr(e, 'response') and e.response is not None and e.response.status_code in [502, 503, 504, 520, 524]:
+                     print(f"  -> Server error {e.response.status_code} (Gateway/Timeout). Retrying in {retry_delay}s...", file=sys.stderr)
+                
+                if attempt + 1 == max_app_retries:
+                    print(f"  -> CRITICAL: Giving up on {api_uri} after {max_app_retries} extra attempts.", file=sys.stderr)
+                    if os.path.exists(save_to):
+                        os.remove(save_to)
+                    return False
+                
+                time.sleep(retry_delay)
+                retry_delay *= 2 # 指数退避 (15s, 30s, 60s)
+
+        if response_text is None:
+            if os.path.exists(save_to):
+                os.remove(save_to)
+            return False
+
         with open(save_to, 'w', encoding='utf-8') as f:
-            f.write(response.text)
-        print("OK", file=sys.stderr)
+            f.write(response_text)
+        
+        if 'FAIL' not in locals().get('fail_printed', ''):
+             print("OK", file=sys.stderr)
+        else:
+             print("  -> RECOVERED", file=sys.stderr)
+
         return True
-    except requests.exceptions.RequestException as e:
-        print("FAIL", file=sys.stderr)
-        print(f"  -> Error downloading {api_uri}: {e}", file=sys.stderr)
-        if os.path.exists(save_to):
-            os.remove(save_to) 
-        return False
+    
     except Exception as e:
         print("FAIL", file=sys.stderr)
-        print(f"  -> An unexpected error occurred: {e}", file=sys.stderr)
+        print(f"  -> An unexpected error occurred (pre-download): {e}", file=sys.stderr)
         if os.path.exists(save_to):
             os.remove(save_to)
         return False
@@ -131,7 +164,7 @@ def exec_cmd(cmd_list, desc, output_file=None):
                     encoding='utf-8',
                     errors='ignore',
                     stdin=subprocess.DEVNULL,
-                    timeout=1800,
+                    timeout=5400,
                     env=emd_env
                 )
                 log = f"(stdout written to {output_file})\n" + (result.stderr or "")
@@ -152,7 +185,7 @@ def exec_cmd(cmd_list, desc, output_file=None):
                 encoding='utf-8',
                 errors='ignore',
                 stdin=subprocess.DEVNULL,
-                timeout=1800,
+                timeout=5400,
                 env=emd_env
             )
             log = (result.stdout or "") + (result.stderr or "")
