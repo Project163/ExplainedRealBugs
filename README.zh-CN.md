@@ -306,6 +306,31 @@ python framework/fast_bug_miner.py
     python framework/clean_bug_and_cache.py -i path/to/your/project_list.txt
     ```
 
+## 高级功能：LLM 辅助分析
+
+为了提高缺陷挖掘的准确性和数据的可用性，我们引入了基于 LLM 的辅助工具。使用这些功能需要配置 `SILICONCLOUD_API_KEY` 环境变量。
+
+### 1. GitHub 交叉引用 (LLM Cross-Reference)
+脚本: `framework/llm_xref.py`
+
+此脚本利用 LLM（如 Qwen）来智能分析 Git 提交信息与 Issue 之间的关系。
+- **功能**: 区分提交信息中提到的 Issue 是被“修复 (Fixed)”还是仅仅是“相关 (Related)”。
+- **原理**: 首先通过正则筛选潜在关联，然后将提交信息发送给 LLM 进行语义判定，最后输出精准的 `active-bugs.csv`。
+
+### 2. 缺陷报告格式化 (Report Parsing)
+脚本: `framework/parse_reports.py`
+
+将来自不同源（Jira, GitHub, Google Code）的原始缺陷报告统一转换为适合 LLM 处理的 JSONL 格式。
+- **功能**: 提取标题、描述和评论，去除 HTML 标签和代码块，生成清晰的文本摘要。
+- **输出**: `bug-classification/parsed_data.jsonl`
+
+### 3. 缺陷分类 (Bug Classification)
+脚本: `framework/classify_bugs_llm.py` / `framework/classify_bugs_embedding.py`
+
+提供两种方式对缺陷进行自动分类（如 Crash, UI, Logic 等）。
+- **基于 LLM (`classify_bugs_llm.py`)**: 直接询问 LLM 对缺陷描述进行分类，准确度高但速度受限于 API。
+- **基于 Embedding (`classify_bugs_embedding.py`)**: 计算缺陷描述与预定义类别的向量相似度，速度快且成本低。
+
 ### 输出
 
 每个项目的挖掘数据将存储在 `bug-mining/` 目录中。对于输入文件中定义的每个 `project_id`，您将找到一个相应的文件夹：
@@ -321,3 +346,5 @@ bug-mining/
         ├── 1.report.xxx
         └── ...
 ```
+
+分类结果将存储在 `bug-classification/classified_data_embedding.jsonl` 或 `bug-classification/classified_data_llm.jsonl` 中，具体取决于使用的分类方法。

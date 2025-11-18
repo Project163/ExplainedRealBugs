@@ -29,7 +29,7 @@ def get_http_session():
     return _session
 
 
-def download_report_data(uri, save_to):
+def download_report_data(uri, save_to, tracker_base_url=None):
     """
     从指定的 URI 下载报告数据并保存到本地文件。
     """
@@ -38,10 +38,17 @@ def download_report_data(uri, save_to):
     api_uri = uri
     
     try:
+        base_jira_url = None
+
+        if tracker_base_url and 'jira' in tracker_base_url.lower() and tracker_base_url in uri:
+            base_jira_url = tracker_base_url.rstrip('/') + '/'
+        elif 'issues.apache.org/jira/' in uri:
+            base_jira_url = 'https://issues.apache.org/jira/'
+
         # check and convert known issue tracker URLs to API/raw data URLs
-        if 'issues.apache.org/jira/' in uri:
+        if base_jira_url:
             issue_key = uri.split('/')[-1].split('?')[0] # 移除可能的查询参数
-            api_uri = f"https://issues.apache.org/jira/si/jira.issueviews:issue-xml/{issue_key}/{issue_key}.xml"
+            api_uri = f"{base_jira_url}si/jira.issueviews:issue-xml/{issue_key}/{issue_key}.xml"
             print(f"  -> [JIRA] Remapped to XML view")
 
         elif 'github.com/' in uri and '/issues/' in uri and 'api.github.com' not in uri:

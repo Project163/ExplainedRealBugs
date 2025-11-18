@@ -38,6 +38,7 @@ def main():
         sys.exit(1)
 
     all_project_stats = []
+    total_bug_count = 0  # <--- 在这里初始化总缺陷计数器
 
     # --- 2. 遍历 bug-mining 目录 ---
     for project_id in sorted(os.listdir(BUG_MINING_DIR)):
@@ -93,6 +94,7 @@ def main():
                     # 将 [1, 5, 10] 转换为 "1,5,10"
                     issue_ids_str = ",".join(issue_ids)
                     all_project_stats.append([project_id, bug_count, issue_ids_str])
+                    total_bug_count += bug_count # <--- 在这里累加每个项目的缺陷数
                 else:
                     print(f"     [Info] {project_id} 已处理, 但未找到缺陷行。")
 
@@ -121,6 +123,7 @@ def main():
         sys.exit(1)
 
     print("汇总完成。")
+    print(f"\n所有项目的缺陷总数 (Total Bug Count): {total_bug_count}") # <--- 在最后打印总和
 
 if __name__ == "__main__":
     main()

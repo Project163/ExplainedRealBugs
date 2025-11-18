@@ -23,7 +23,7 @@ class Tee(object):
         for f in self.files:
             f.flush()
 
-def process_project(project_id, project_name, repository_url, issue_tracker_name, issue_tracker_project_id, bug_fix_regex, sub_project_path):
+def process_project(project_id, project_name, repository_url, issue_tracker_name, issue_tracker_project_id, bug_fix_regex, sub_project_path, tracker_base_url=None):
     """
     处理单个项目的完整挖掘流程。
     如果成功，返回 True；如果任何关键步骤失败，返回 False。
@@ -84,6 +84,11 @@ def process_project(project_id, project_name, repository_url, issue_tracker_name
             '-o', cache_issues_dir,
             '-f', cache_issues_file
         ]
+
+        if tracker_base_url:
+            cmd_dl_list.extend(['-u', tracker_base_url])
+            print(f"Using tracker base URL: {tracker_base_url}")
+
         success, _ = utils.exec_cmd(cmd_dl_list, f"Downloading issues for {issue_cache_key}")
         if not success:
             print(f"[Error]: Failed to download issues for {issue_cache_key}. Skipping.", file=sys.stderr)
@@ -122,19 +127,36 @@ def process_project(project_id, project_name, repository_url, issue_tracker_name
             print(f"[Error]: Cannot write header to {output_csv_file}: {e}. Skipping.", file=sys.stderr)
             return False
 
-        print(f"Regex for bug-fixing commits: {bug_fix_regex!r}")
+        cmd_xref_list = []
         
-        cmd_xref_list = [
-            PYTHON_EXECUTABLE,
-            os.path.join(config.SCRIPT_DIR, 'vcs_log_xref.py'),
-            '-e', bug_fix_regex,
-            '-l', cache_gitlog_file,
-            '-r', cache_repo_dir,
-            '-i', cache_issues_file,
-            '-f', output_csv_file,
-            '-ru', repository_url,
-            '-pid', project_id
-        ]
+        # --- 分支逻辑：GitHub 使用 LLM，其他使用 Regex ---
+        if issue_tracker_name == 'github':
+            print(f"Using LLM cross-referencing for GitHub project {project_id}...")
+            cmd_xref_list = [
+                PYTHON_EXECUTABLE,
+                os.path.join(config.SCRIPT_DIR, 'llm_xref.py'), # <-- 新脚本
+                '-l', cache_gitlog_file,
+                '-r', cache_repo_dir,
+                '-i', cache_issues_file,
+                '-f', output_csv_file,
+                '-ru', repository_url,
+                '-pid', project_id
+            ]
+        else:
+            print(f"Using Regex cross-referencing for {issue_tracker_name} project {project_id}...")
+            print(f"Regex for bug-fixing commits: {bug_fix_regex!r}")
+            cmd_xref_list = [
+                PYTHON_EXECUTABLE,
+                os.path.join(config.SCRIPT_DIR, 'vcs_log_xref.py'), # <-- 旧脚本
+                '-e', bug_fix_regex, # <-- 传统 regex
+                '-l', cache_gitlog_file,
+                '-r', cache_repo_dir,
+                '-i', cache_issues_file,
+                '-f', output_csv_file,
+                '-ru', repository_url,
+                '-pid', project_id
+            ]
+
         success, _ = utils.exec_cmd(cmd_xref_list, f"Cross-referencing log for {project_id}")
         if not success:
             print(f"[Error]: Failed to cross-reference log for {project_id}. Skipping.", file=sys.stderr)
@@ -176,7 +198,8 @@ def process_project(project_id, project_name, repository_url, issue_tracker_name
                 if not report_url or report_url == "NA":
                     print(f"  -> Skipping report for bug {bug_id} (missing URL).")
                 else: 
-                    if 'issues.apache.org/jira' in report_url or 'bz.apache.org/bugzilla' in report_url:
+                    if ('jira' in report_url and ('.atlassian.net' in report_url or 'issues.apache.org/jira/' in report_url or (tracker_base_url and 'jira' in tracker_base_url))) \
+                       or ('bugzilla' in report_url and 'bz.apache.org/bugzilla' in report_url or (tracker_base_url and 'bugzilla' in tracker_base_url)):
                         ext = '.xml' 
                     
                     report_file = os.path.join(output_reports_dir, f"{bug_id}{ext}")
@@ -185,7 +208,7 @@ def process_project(project_id, project_name, repository_url, issue_tracker_name
                         pass 
                     else:
                         print(f"  -> Downloading report for repo {repo_name} bug {bug_id}...", end="")
-                        utils.download_report_data(report_url, report_file)
+                        utils.download_report_data(report_url, report_file, tracker_base_url)
                         
                 # 4a.1 Download timeline if GitHub issue
                 if ext == '.json' and report_file and os.path.exists(report_file):
@@ -210,7 +233,7 @@ def process_project(project_id, project_name, repository_url, issue_tracker_name
                         if timeline_url:
                             print(f"  -> Downloading timeline (discussion) for repo {repo_name} bug {bug_id}...", end="")
 
-                            utils.download_report_data(timeline_url, timeline_file)                
+                            utils.download_report_data(timeline_url, timeline_file, tracker_base_url)                
 
                 # 4b. Generate Patch
                 if not commit_buggy or not commit_fixed:
@@ -284,7 +307,7 @@ def main():
         with open(ERROR_LOG_FILE, 'w', encoding='utf-8') as error_log:
             sys.stderr = Tee(original_stderr, error_log)
             
-            input_file = os.path.join(config.SCRIPT_DIR, 'example.txt')
+            input_file = os.path.join(config.SCRIPT_DIR, 'test.txt')
             
             if not os.path.exists(input_file):
                 print(f"Error: Input file not found at {input_file}", file=sys.stderr)
@@ -309,6 +332,10 @@ def main():
                         sub_project_path = "."
                         if len(parts) > 6 and parts[6].strip() and parts[6].strip() != ".":
                             sub_project_path = parts[6].strip()
+
+                        tracker_base_url = None
+                        if len(parts) > 7 and parts[7].strip() and parts[7].strip() != "NA":
+                            tracker_base_url = parts[7].strip() 
                             
                     except IndexError:
                         print(f"Skipping malformed line (expected at least 6 tab-separated parts): {line}", file=sys.stderr)
@@ -324,7 +351,8 @@ def main():
                         issue_tracker_name, 
                         issue_tracker_project_id, 
                         bug_fix_regex, 
-                        sub_project_path
+                        sub_project_path,
+                        tracker_base_url
                     )
 
                     # Check success and clean up on failure
