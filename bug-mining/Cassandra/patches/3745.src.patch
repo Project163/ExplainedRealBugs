@@ -1,0 +1,129 @@
+diff --git a/CHANGES.txt b/CHANGES.txt
+index 7d8453843c..905445e475 100644
+--- a/CHANGES.txt
++++ b/CHANGES.txt
+@@ -1,4 +1,5 @@
+ 2.0.17
++ * Make getFullyExpiredSSTables less expensive (CASSANDRA-9882)
+  * Add tool to find why expired sstables are not getting dropped (CASSANDRA-10015)
+  * Remove erroneous pending HH tasks from tpstats/jmx (CASSANDRA-9129)
+  * Don't cast expected bf size to an int (CASSANDRA-9959)
+diff --git a/src/java/org/apache/cassandra/db/ColumnFamilyStore.java b/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
+index c125cf0749..eb688f7449 100644
+--- a/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
++++ b/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
+@@ -1028,17 +1028,56 @@ public class ColumnFamilyStore implements ColumnFamilyStoreMBean
+         if (sstables.isEmpty())
+             return ImmutableSet.of();
+ 
+-        DataTracker.SSTableIntervalTree tree = data.getView().intervalTree;
+-
+-        Set<SSTableReader> results = null;
+-        for (SSTableReader sstable : sstables)
++        List<SSTableReader> sortedByFirst = new ArrayList<>(sstables);
++        Collections.sort(sortedByFirst, new Comparator<SSTableReader>()
+         {
+-            Set<SSTableReader> overlaps = ImmutableSet.copyOf(tree.search(Interval.<RowPosition, SSTableReader>create(sstable.first, sstable.last)));
+-            results = results == null ? overlaps : Sets.union(results, overlaps).immutableCopy();
++            @Override
++            public int compare(SSTableReader o1, SSTableReader o2)
++            {
++                return o1.first.compareTo(o2.first);
++            }
++        });
++        List<Interval<RowPosition, SSTableReader>> intervals = new ArrayList<>();
++        DecoratedKey first = null, last = null;
++        /*
++        normalize the intervals covered by the sstables
++        assume we have sstables like this (brackets representing first/last key in the sstable);
++        [   ] [   ]    [   ]   [  ]
++           [   ]         [       ]
++        then we can, instead of searching the interval tree 6 times, normalize the intervals and
++        only query the tree 2 times, for these intervals;
++        [         ]    [          ]
++         */
++        for (SSTableReader sstable : sortedByFirst)
++        {
++            if (first == null)
++            {
++                first = sstable.first;
++                last = sstable.last;
++            }
++            else
++            {
++                if (sstable.first.compareTo(last) <= 0) // we do overlap
++                {
++                    if (sstable.last.compareTo(last) > 0)
++                        last = sstable.last;
++                }
++                else
++                {
++                    intervals.add(Interval.<RowPosition, SSTableReader>create(first, last));
++                    first = sstable.first;
++                    last = sstable.last;
++                }
++            }
+         }
+-        results = Sets.difference(results, ImmutableSet.copyOf(sstables));
++        intervals.add(Interval.<RowPosition, SSTableReader>create(first, last));
++        DataTracker.SSTableIntervalTree tree = data.getView().intervalTree;
++        Set<SSTableReader> results = new HashSet<>();
++
++        for (Interval<RowPosition, SSTableReader> interval : intervals)
++            results.addAll(tree.search(interval));
+ 
+-        return results;
++        return Sets.difference(results, ImmutableSet.copyOf(sstables));
+     }
+ 
+     /**
+diff --git a/src/java/org/apache/cassandra/db/compaction/DateTieredCompactionStrategy.java b/src/java/org/apache/cassandra/db/compaction/DateTieredCompactionStrategy.java
+index df28bd48f7..fea499553a 100644
+--- a/src/java/org/apache/cassandra/db/compaction/DateTieredCompactionStrategy.java
++++ b/src/java/org/apache/cassandra/db/compaction/DateTieredCompactionStrategy.java
+@@ -18,6 +18,7 @@
+ package org.apache.cassandra.db.compaction;
+ 
+ import java.util.*;
++import java.util.concurrent.TimeUnit;
+ 
+ import com.google.common.annotations.VisibleForTesting;
+ import com.google.common.base.Predicate;
+@@ -37,6 +38,8 @@ public class DateTieredCompactionStrategy extends AbstractCompactionStrategy
+ 
+     protected DateTieredCompactionStrategyOptions options;
+     protected volatile int estimatedRemainingTasks;
++    @VisibleForTesting
++    long lastExpiredCheck;
+ 
+     public DateTieredCompactionStrategy(ColumnFamilyStore cfs, Map<String, String> options)
+     {
+@@ -83,8 +86,14 @@ public class DateTieredCompactionStrategy extends AbstractCompactionStrategy
+ 
+         Set<SSTableReader> uncompacting = cfs.getUncompactingSSTables();
+ 
+-        // Find fully expired SSTables. Those will be included no matter what.
+-        Set<SSTableReader> expired = CompactionController.getFullyExpiredSSTables(cfs, uncompacting, cfs.getOverlappingSSTables(uncompacting), gcBefore);
++        Set<SSTableReader> expired = Collections.emptySet();
++        // we only check for expired sstables every 10 minutes due to it being an expensive operation
++        if (System.currentTimeMillis() - lastExpiredCheck > TimeUnit.MINUTES.toMillis(10))
++        {
++            // Find fully expired SSTables. Those will be included no matter what.
++            expired = CompactionController.getFullyExpiredSSTables(cfs, uncompacting, cfs.getOverlappingSSTables(uncompacting), gcBefore);
++            lastExpiredCheck = System.currentTimeMillis();
++        }
+         Set<SSTableReader> candidates = Sets.newHashSet(filterSuspectSSTables(uncompacting));
+ 
+         List<SSTableReader> compactionCandidates = new ArrayList<>(getNextNonExpiredSSTables(Sets.difference(candidates, expired), gcBefore));
+diff --git a/test/unit/org/apache/cassandra/db/compaction/DateTieredCompactionStrategyTest.java b/test/unit/org/apache/cassandra/db/compaction/DateTieredCompactionStrategyTest.java
+index d7caf6b701..0084a164c0 100644
+--- a/test/unit/org/apache/cassandra/db/compaction/DateTieredCompactionStrategyTest.java
++++ b/test/unit/org/apache/cassandra/db/compaction/DateTieredCompactionStrategyTest.java
+@@ -308,6 +308,7 @@ public class DateTieredCompactionStrategyTest extends SchemaLoader
+         DateTieredCompactionStrategy dtcs = new DateTieredCompactionStrategy(cfs, options);
+         dtcs.startup();
+         assertNull(dtcs.getNextBackgroundTask((int) (System.currentTimeMillis() / 1000)));
++        dtcs.lastExpiredCheck = 0;
+         Thread.sleep(2000);
+         AbstractCompactionTask t = dtcs.getNextBackgroundTask((int) (System.currentTimeMillis()/1000));
+         assertNotNull(t);

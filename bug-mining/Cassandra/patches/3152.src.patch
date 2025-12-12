@@ -1,0 +1,676 @@
+diff --git a/CHANGES.txt b/CHANGES.txt
+index 3454928104..c9b4e5994e 100644
+--- a/CHANGES.txt
++++ b/CHANGES.txt
+@@ -1,5 +1,6 @@
+ 2.0.11:
+  * Better validation of collection values (CASSANDRA-7833)
++ * Track min/max timestamps correctly (CASSANDRA-7969)
+  * Fix possible overflow while sorting CL segments for replay (CASSANDRA-7992)
+  * Increase nodetool Xmx (CASSANDRA-7956)
+  * Archive any commitlog segments present at startup (CASSANDRA-6904)
+diff --git a/src/java/org/apache/cassandra/db/ColumnFamily.java b/src/java/org/apache/cassandra/db/ColumnFamily.java
+index 95e5645484..7edf825439 100644
+--- a/src/java/org/apache/cassandra/db/ColumnFamily.java
++++ b/src/java/org/apache/cassandra/db/ColumnFamily.java
+@@ -412,38 +412,47 @@ public abstract class ColumnFamily implements Iterable<Column>, IRowCacheEntry
+ 
+     public ColumnStats getColumnStats()
+     {
+-        long minTimestampSeen = deletionInfo().isLive() ? Long.MAX_VALUE : deletionInfo().minTimestamp();
+-        long maxTimestampSeen = deletionInfo().maxTimestamp();
++        // note that we default to MIN_VALUE/MAX_VALUE here to be able to override them later in this method
++        // we are checking row/range tombstones and actual cells - there should always be data that overrides
++        // these with actual values
++        ColumnStats.MinTracker<Long> minTimestampTracker = new ColumnStats.MinTracker<>(Long.MIN_VALUE);
++        ColumnStats.MaxTracker<Long> maxTimestampTracker = new ColumnStats.MaxTracker<>(Long.MAX_VALUE);
+         StreamingHistogram tombstones = new StreamingHistogram(SSTable.TOMBSTONE_HISTOGRAM_BIN_SIZE);
+-        int maxLocalDeletionTime = Integer.MIN_VALUE;
++        ColumnStats.MaxTracker<Integer> maxDeletionTimeTracker = new ColumnStats.MaxTracker<>(Integer.MAX_VALUE);
+         List<ByteBuffer> minColumnNamesSeen = Collections.emptyList();
+         List<ByteBuffer> maxColumnNamesSeen = Collections.emptyList();
+ 
+         if (deletionInfo().getTopLevelDeletion().localDeletionTime < Integer.MAX_VALUE)
++        {
+             tombstones.update(deletionInfo().getTopLevelDeletion().localDeletionTime);
++            maxDeletionTimeTracker.update(deletionInfo().getTopLevelDeletion().localDeletionTime);
++            minTimestampTracker.update(deletionInfo().getTopLevelDeletion().markedForDeleteAt);
++            maxTimestampTracker.update(deletionInfo().getTopLevelDeletion().markedForDeleteAt);
++        }
+         Iterator<RangeTombstone> it = deletionInfo().rangeIterator();
+         while (it.hasNext())
+         {
+             RangeTombstone rangeTombstone = it.next();
+             tombstones.update(rangeTombstone.getLocalDeletionTime());
+-            minTimestampSeen = Math.min(minTimestampSeen, rangeTombstone.minTimestamp());
+-            maxTimestampSeen = Math.max(maxTimestampSeen, rangeTombstone.maxTimestamp());
++            minTimestampTracker.update(rangeTombstone.minTimestamp());
++            maxTimestampTracker.update(rangeTombstone.maxTimestamp());
++            maxDeletionTimeTracker.update(rangeTombstone.getLocalDeletionTime());
+             minColumnNamesSeen = ColumnNameHelper.minComponents(minColumnNamesSeen, rangeTombstone.min, metadata.comparator);
+             maxColumnNamesSeen = ColumnNameHelper.maxComponents(maxColumnNamesSeen, rangeTombstone.max, metadata.comparator);
+         }
+ 
+         for (Column column : this)
+         {
+-            minTimestampSeen = Math.min(minTimestampSeen, column.minTimestamp());
+-            maxTimestampSeen = Math.max(maxTimestampSeen, column.maxTimestamp());
+-            maxLocalDeletionTime = Math.max(maxLocalDeletionTime, column.getLocalDeletionTime());
++            minTimestampTracker.update(column.minTimestamp());
++            maxTimestampTracker.update(column.maxTimestamp());
++            maxDeletionTimeTracker.update(column.getLocalDeletionTime());
+             int deletionTime = column.getLocalDeletionTime();
+             if (deletionTime < Integer.MAX_VALUE)
+                 tombstones.update(deletionTime);
+             minColumnNamesSeen = ColumnNameHelper.minComponents(minColumnNamesSeen, column.name, metadata.comparator);
+             maxColumnNamesSeen = ColumnNameHelper.maxComponents(maxColumnNamesSeen, column.name, metadata.comparator);
+         }
+-        return new ColumnStats(getColumnCount(), minTimestampSeen, maxTimestampSeen, maxLocalDeletionTime, tombstones, minColumnNamesSeen, maxColumnNamesSeen);
++        return new ColumnStats(getColumnCount(), minTimestampTracker.get(), maxTimestampTracker.get(), maxDeletionTimeTracker.get(), tombstones, minColumnNamesSeen, maxColumnNamesSeen);
+     }
+ 
+     public boolean isMarkedForDelete()
+diff --git a/src/java/org/apache/cassandra/db/DeletionTime.java b/src/java/org/apache/cassandra/db/DeletionTime.java
+index a1b9f170b1..dd2ccaf633 100644
+--- a/src/java/org/apache/cassandra/db/DeletionTime.java
++++ b/src/java/org/apache/cassandra/db/DeletionTime.java
+@@ -26,6 +26,7 @@ import com.google.common.base.Objects;
+ 
+ import org.apache.cassandra.io.ISerializer;
+ import org.apache.cassandra.utils.ObjectSizes;
++import org.codehaus.jackson.annotate.JsonIgnore;
+ 
+ /**
+  * A top-level (row) tombstone.
+@@ -59,6 +60,15 @@ public class DeletionTime implements Comparable<DeletionTime>
+         this.localDeletionTime = localDeletionTime;
+     }
+ 
++    /**
++     * Returns whether this DeletionTime is live, that is deletes no columns.
++     */
++    @JsonIgnore
++    public boolean isLive()
++    {
++        return markedForDeleteAt == Long.MIN_VALUE && localDeletionTime == Integer.MAX_VALUE;
++    }
++
+     @Override
+     public boolean equals(Object o)
+     {
+diff --git a/src/java/org/apache/cassandra/db/compaction/LazilyCompactedRow.java b/src/java/org/apache/cassandra/db/compaction/LazilyCompactedRow.java
+index 957387400a..2757411399 100644
+--- a/src/java/org/apache/cassandra/db/compaction/LazilyCompactedRow.java
++++ b/src/java/org/apache/cassandra/db/compaction/LazilyCompactedRow.java
+@@ -111,9 +111,9 @@ public class LazilyCompactedRow extends AbstractCompactedRow implements Iterable
+         // reach into the reducer (created during iteration) to get column count, size, max column timestamp
+         // (however, if there are zero columns, iterator() will not be called by ColumnIndexer and reducer will be null)
+         columnStats = new ColumnStats(reducer == null ? 0 : reducer.columns,
+-                                      reducer == null ? Long.MAX_VALUE : reducer.minTimestampSeen,
+-                                      reducer == null ? emptyColumnFamily.maxTimestamp() : Math.max(emptyColumnFamily.maxTimestamp(), reducer.maxTimestampSeen),
+-                                      reducer == null ? Integer.MIN_VALUE : reducer.maxLocalDeletionTimeSeen,
++                                      reducer == null ? Long.MAX_VALUE : reducer.minTimestampTracker.get(),
++                                      reducer == null ? emptyColumnFamily.maxTimestamp() : Math.max(emptyColumnFamily.maxTimestamp(), reducer.maxTimestampTracker.get()),
++                                      reducer == null ? Integer.MIN_VALUE : reducer.maxDeletionTimeTracker.get(),
+                                       reducer == null ? new StreamingHistogram(SSTable.TOMBSTONE_HISTOGRAM_BIN_SIZE) : reducer.tombstones,
+                                       reducer == null ? Collections.<ByteBuffer>emptyList() : reducer.minColumnNameSeen,
+                                       reducer == null ? Collections.<ByteBuffer>emptyList() : reducer.maxColumnNameSeen
+@@ -201,13 +201,26 @@ public class LazilyCompactedRow extends AbstractCompactedRow implements Iterable
+         RangeTombstone tombstone;
+ 
+         int columns = 0;
+-        long minTimestampSeen = Long.MAX_VALUE;
+-        long maxTimestampSeen = Long.MIN_VALUE;
+-        int maxLocalDeletionTimeSeen = Integer.MIN_VALUE;
++        // if the row tombstone is 'live' we need to set timestamp to MAX_VALUE to be able to overwrite it later
++        // markedForDeleteAt is MIN_VALUE for 'live' row tombstones (which we use to default maxTimestampSeen)
++
++        ColumnStats.MinTracker<Long> minTimestampTracker = new ColumnStats.MinTracker<>(Long.MIN_VALUE);
++        ColumnStats.MaxTracker<Long> maxTimestampTracker = new ColumnStats.MaxTracker<>(Long.MAX_VALUE);
++        // we need to set MIN_VALUE if we are 'live' since we want to overwrite it later
++        // we are bound to have either a RangeTombstone or standard cells will set this properly:
++        ColumnStats.MaxTracker<Integer> maxDeletionTimeTracker = new ColumnStats.MaxTracker<>(Integer.MAX_VALUE);
++
+         StreamingHistogram tombstones = new StreamingHistogram(SSTable.TOMBSTONE_HISTOGRAM_BIN_SIZE);
+         List<ByteBuffer> minColumnNameSeen = Collections.emptyList();
+         List<ByteBuffer> maxColumnNameSeen = Collections.emptyList();
+ 
++        public Reducer()
++        {
++            minTimestampTracker.update(maxRowTombstone.isLive() ? Long.MAX_VALUE : maxRowTombstone.markedForDeleteAt);
++            maxTimestampTracker.update(maxRowTombstone.markedForDeleteAt);
++            maxDeletionTimeTracker.update(maxRowTombstone.isLive() ? Integer.MIN_VALUE : maxRowTombstone.localDeletionTime);
++        }
++
+         /**
+          * Called once per version of a cell that we need to merge, after which getReduced() is called.  In other words,
+          * this will be called one or more times with cells that share the same column name.
+@@ -254,8 +267,9 @@ public class LazilyCompactedRow extends AbstractCompactedRow implements Iterable
+                 else
+                 {
+                     tombstones.update(t.getLocalDeletionTime());
+-                    minTimestampSeen = Math.min(minTimestampSeen, t.minTimestamp());
+-                    maxTimestampSeen = Math.max(maxTimestampSeen, t.maxTimestamp());
++                    minTimestampTracker.update(t.minTimestamp());
++                    maxTimestampTracker.update(t.maxTimestamp());
++                    maxDeletionTimeTracker.update(t.getLocalDeletionTime());
+                     minColumnNameSeen = ColumnNameHelper.minComponents(minColumnNameSeen, t.min, controller.cfs.metadata.comparator);
+                     maxColumnNameSeen = ColumnNameHelper.maxComponents(maxColumnNameSeen, t.max, controller.cfs.metadata.comparator);
+ 
+@@ -287,9 +301,9 @@ public class LazilyCompactedRow extends AbstractCompactedRow implements Iterable
+                 if (localDeletionTime < Integer.MAX_VALUE)
+                     tombstones.update(localDeletionTime);
+                 columns++;
+-                minTimestampSeen = Math.min(minTimestampSeen, reduced.minTimestamp());
+-                maxTimestampSeen = Math.max(maxTimestampSeen, reduced.maxTimestamp());
+-                maxLocalDeletionTimeSeen = Math.max(maxLocalDeletionTimeSeen, reduced.getLocalDeletionTime());
++                minTimestampTracker.update(reduced.minTimestamp());
++                maxTimestampTracker.update(reduced.maxTimestamp());
++                maxDeletionTimeTracker.update(reduced.getLocalDeletionTime());
+                 minColumnNameSeen = ColumnNameHelper.minComponents(minColumnNameSeen, reduced.name(), controller.cfs.metadata.comparator);
+                 maxColumnNameSeen = ColumnNameHelper.maxComponents(maxColumnNameSeen, reduced.name(), controller.cfs.metadata.comparator);
+ 
+diff --git a/src/java/org/apache/cassandra/io/sstable/ColumnStats.java b/src/java/org/apache/cassandra/io/sstable/ColumnStats.java
+index bd3bd1cc16..446c41c816 100644
+--- a/src/java/org/apache/cassandra/io/sstable/ColumnStats.java
++++ b/src/java/org/apache/cassandra/io/sstable/ColumnStats.java
+@@ -18,6 +18,7 @@
+ package org.apache.cassandra.io.sstable;
+ 
+ import java.nio.ByteBuffer;
++import java.util.Comparator;
+ import java.util.List;
+ 
+ import org.apache.cassandra.utils.StreamingHistogram;
+@@ -51,4 +52,70 @@ public class ColumnStats
+         this.minColumnNames = minColumnNames;
+         this.maxColumnNames = maxColumnNames;
+     }
++
++    public static class MinTracker<T extends Comparable<T>>
++    {
++        private final T defaultValue;
++        private boolean isSet = false;
++        private T value;
++
++        public MinTracker(T defaultValue)
++        {
++            this.defaultValue = defaultValue;
++        }
++
++        public void update(T value)
++        {
++            if (!isSet)
++            {
++                this.value = value;
++                isSet = true;
++            }
++            else
++            {
++                if (value.compareTo(this.value) < 0)
++                    this.value = value;
++            }
++        }
++
++        public T get()
++        {
++            if (isSet)
++                return value;
++            return defaultValue;
++        }
++    }
++
++    public static class MaxTracker<T extends Comparable<T>>
++    {
++        private final T defaultValue;
++        private boolean isSet = false;
++        private T value;
++
++        public MaxTracker(T defaultValue)
++        {
++            this.defaultValue = defaultValue;
++        }
++
++        public void update(T value)
++        {
++            if (!isSet)
++            {
++                this.value = value;
++                isSet = true;
++            }
++            else
++            {
++                if (value.compareTo(this.value) > 0)
++                    this.value = value;
++            }
++        }
++
++        public T get()
++        {
++            if (isSet)
++                return value;
++            return defaultValue;
++        }
++    }
+ }
+diff --git a/src/java/org/apache/cassandra/io/sstable/SSTableWriter.java b/src/java/org/apache/cassandra/io/sstable/SSTableWriter.java
+index 8a9bb18520..4619ddc472 100644
+--- a/src/java/org/apache/cassandra/io/sstable/SSTableWriter.java
++++ b/src/java/org/apache/cassandra/io/sstable/SSTableWriter.java
+@@ -213,10 +213,9 @@ public class SSTableWriter extends SSTable
+     {
+         long currentPosition = beforeAppend(key);
+ 
+-        // deserialize each column to obtain maxTimestamp and immediately serialize it.
+-        long minTimestamp = Long.MAX_VALUE;
+-        long maxTimestamp = Long.MIN_VALUE;
+-        int maxLocalDeletionTime = Integer.MIN_VALUE;
++        ColumnStats.MaxTracker<Long> maxTimestampTracker = new ColumnStats.MaxTracker<>(Long.MAX_VALUE);
++        ColumnStats.MinTracker<Long> minTimestampTracker = new ColumnStats.MinTracker<>(Long.MIN_VALUE);
++        ColumnStats.MaxTracker<Integer> maxDeletionTimeTracker = new ColumnStats.MaxTracker<>(Integer.MAX_VALUE);
+         List<ByteBuffer> minColumnNames = Collections.emptyList();
+         List<ByteBuffer> maxColumnNames = Collections.emptyList();
+         StreamingHistogram tombstones = new StreamingHistogram(TOMBSTONE_HISTOGRAM_BIN_SIZE);
+@@ -236,16 +235,21 @@ public class SSTableWriter extends SSTable
+             columnCount = in.readInt();
+ 
+         if (cf.deletionInfo().getTopLevelDeletion().localDeletionTime < Integer.MAX_VALUE)
++        {
+             tombstones.update(cf.deletionInfo().getTopLevelDeletion().localDeletionTime);
++            maxDeletionTimeTracker.update(cf.deletionInfo().getTopLevelDeletion().localDeletionTime);
++            minTimestampTracker.update(cf.deletionInfo().getTopLevelDeletion().markedForDeleteAt);
++            maxTimestampTracker.update(cf.deletionInfo().getTopLevelDeletion().markedForDeleteAt);
++        }
+ 
+         Iterator<RangeTombstone> rangeTombstoneIterator = cf.deletionInfo().rangeIterator();
+         while (rangeTombstoneIterator.hasNext())
+         {
+             RangeTombstone rangeTombstone = rangeTombstoneIterator.next();
+             tombstones.update(rangeTombstone.getLocalDeletionTime());
+-            minTimestamp = Math.min(minTimestamp, rangeTombstone.minTimestamp());
+-            maxTimestamp = Math.max(maxTimestamp, rangeTombstone.maxTimestamp());
+-
++            minTimestampTracker.update(rangeTombstone.minTimestamp());
++            maxTimestampTracker.update(rangeTombstone.maxTimestamp());
++            maxDeletionTimeTracker.update(rangeTombstone.getLocalDeletionTime());
+             minColumnNames = ColumnNameHelper.minComponents(minColumnNames, rangeTombstone.min, metadata.comparator);
+             maxColumnNames = ColumnNameHelper.maxComponents(maxColumnNames, rangeTombstone.max, metadata.comparator);
+         }
+@@ -255,8 +259,6 @@ public class SSTableWriter extends SSTable
+         {
+             while (iter.hasNext())
+             {
+-                // deserialize column with PRESERVE_SIZE because we've written the dataSize based on the
+-                // data size received, so we must reserialize the exact same data
+                 OnDiskAtom atom = iter.next();
+                 if (atom == null)
+                     break;
+@@ -268,11 +270,11 @@ public class SSTableWriter extends SSTable
+                 {
+                     tombstones.update(deletionTime);
+                 }
+-                minTimestamp = Math.min(minTimestamp, atom.minTimestamp());
+-                maxTimestamp = Math.max(maxTimestamp, atom.maxTimestamp());
++                minTimestampTracker.update(atom.minTimestamp());
++                maxTimestampTracker.update(atom.maxTimestamp());
+                 minColumnNames = ColumnNameHelper.minComponents(minColumnNames, atom.name(), metadata.comparator);
+                 maxColumnNames = ColumnNameHelper.maxComponents(maxColumnNames, atom.name(), metadata.comparator);
+-                maxLocalDeletionTime = Math.max(maxLocalDeletionTime, atom.getLocalDeletionTime());
++                maxDeletionTimeTracker.update(atom.getLocalDeletionTime());
+ 
+                 columnIndexer.add(atom); // This write the atom on disk too
+             }
+@@ -285,9 +287,9 @@ public class SSTableWriter extends SSTable
+             throw new FSWriteError(e, dataFile.getPath());
+         }
+ 
+-        sstableMetadataCollector.updateMinTimestamp(minTimestamp);
+-        sstableMetadataCollector.updateMaxTimestamp(maxTimestamp);
+-        sstableMetadataCollector.updateMaxLocalDeletionTime(maxLocalDeletionTime);
++        sstableMetadataCollector.updateMinTimestamp(minTimestampTracker.get());
++        sstableMetadataCollector.updateMaxTimestamp(maxTimestampTracker.get());
++        sstableMetadataCollector.updateMaxLocalDeletionTime(maxDeletionTimeTracker.get());
+         sstableMetadataCollector.addRowSize(dataFile.getFilePointer() - currentPosition);
+         sstableMetadataCollector.addColumnCount(columnIndexer.writtenAtomCount());
+         sstableMetadataCollector.mergeTombstoneHistogram(tombstones);
+diff --git a/test/unit/org/apache/cassandra/cql3/SSTableMetadataTrackingTest.java b/test/unit/org/apache/cassandra/cql3/SSTableMetadataTrackingTest.java
+new file mode 100644
+index 0000000000..91042692b5
+--- /dev/null
++++ b/test/unit/org/apache/cassandra/cql3/SSTableMetadataTrackingTest.java
+@@ -0,0 +1,223 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.cassandra.cql3;
++
++import org.junit.AfterClass;
++import org.junit.Before;
++import org.junit.BeforeClass;
++import org.junit.Test;
++
++import org.apache.cassandra.SchemaLoader;
++import org.apache.cassandra.db.ColumnFamilyStore;
++import org.apache.cassandra.db.ConsistencyLevel;
++import org.apache.cassandra.db.Keyspace;
++import org.apache.cassandra.gms.Gossiper;
++import org.apache.cassandra.io.sstable.SSTableMetadata;
++import org.apache.cassandra.service.ClientState;
++import static org.apache.cassandra.cql3.QueryProcessor.process;
++import static org.apache.cassandra.cql3.QueryProcessor.processInternal;
++import static org.junit.Assert.assertEquals;
++
++public class SSTableMetadataTrackingTest
++{
++    private static String keyspace = "sstable_metadata_tracking_test";
++    private static ClientState clientState;
++
++    @BeforeClass
++    public static void setup() throws Throwable
++    {
++        SchemaLoader.loadSchema();
++        createKeyspace("CREATE KEYSPACE IF NOT EXISTS %s WITH replication = {'class': 'SimpleStrategy', 'replication_factor': '1'}");
++        clientState = ClientState.forInternalCalls();
++    }
++
++    
++    @Test
++    public void baseCheck() throws Throwable
++    {
++        createTable("CREATE TABLE %s.basecheck (a int, b int, c text, PRIMARY KEY (a, b))");
++        ColumnFamilyStore cfs = Keyspace.open(keyspace).getColumnFamilyStore("basecheck");
++        execute("INSERT INTO %s.basecheck (a,b,c) VALUES (1,1,'1') using timestamp 9999");
++        cfs.forceBlockingFlush();
++        SSTableMetadata metadata = cfs.getSSTables().iterator().next().getSSTableMetadata();
++        assertEquals(9999, metadata.minTimestamp);
++        assertEquals(Integer.MAX_VALUE, metadata.maxLocalDeletionTime);
++        cfs.forceMajorCompaction();
++        metadata = cfs.getSSTables().iterator().next().getSSTableMetadata();
++        assertEquals(9999, metadata.minTimestamp);
++        assertEquals(Integer.MAX_VALUE, metadata.maxLocalDeletionTime);
++    }
++
++    @Test
++    public void testMinMaxtimestampRange() throws Throwable
++    {
++        createTable("CREATE TABLE %s.minmaxtsrange (a int, b int, c text, PRIMARY KEY (a, b))");
++        ColumnFamilyStore cfs = Keyspace.open(keyspace).getColumnFamilyStore("minmaxtsrange");
++        execute("INSERT INTO %s.minmaxtsrange (a,b,c) VALUES (1,1,'1') using timestamp 10000");
++        execute("DELETE FROM %s.minmaxtsrange USING TIMESTAMP 9999 WHERE a = 1 and b = 1");
++        cfs.forceBlockingFlush();
++        SSTableMetadata metadata = cfs.getSSTables().iterator().next().getSSTableMetadata();
++        assertEquals(9999, metadata.minTimestamp);
++        assertEquals(10000, metadata.maxTimestamp);
++        assertEquals(Integer.MAX_VALUE, metadata.maxLocalDeletionTime, 5);
++        cfs.forceMajorCompaction();
++        metadata = cfs.getSSTables().iterator().next().getSSTableMetadata();
++        assertEquals(9999, metadata.minTimestamp);
++        assertEquals(10000, metadata.maxTimestamp);
++        assertEquals(Integer.MAX_VALUE, metadata.maxLocalDeletionTime, 5);
++    }
++
++    @Test
++    public void testMinMaxtimestampRow() throws Throwable
++    {
++        createTable("CREATE TABLE %s.minmaxtsrow (a int, b int, c text, PRIMARY KEY (a, b))");
++        ColumnFamilyStore cfs = Keyspace.open(keyspace).getColumnFamilyStore("minmaxtsrow");
++        execute("INSERT INTO %s.minmaxtsrow (a,b,c) VALUES (1,1,'1') using timestamp 10000");
++        execute("DELETE FROM %s.minmaxtsrow USING TIMESTAMP 9999 WHERE a = 1");
++        cfs.forceBlockingFlush();
++        SSTableMetadata metadata = cfs.getSSTables().iterator().next().getSSTableMetadata();
++        assertEquals(9999, metadata.minTimestamp);
++        assertEquals(10000, metadata.maxTimestamp);
++        assertEquals(Integer.MAX_VALUE, metadata.maxLocalDeletionTime, 5);
++        cfs.forceMajorCompaction();
++        metadata = cfs.getSSTables().iterator().next().getSSTableMetadata();
++        assertEquals(9999, metadata.minTimestamp);
++        assertEquals(10000, metadata.maxTimestamp);
++        assertEquals(Integer.MAX_VALUE, metadata.maxLocalDeletionTime, 5);
++    }
++
++
++    @Test
++    public void testTrackMetadata_rangeTombstone() throws Throwable
++    {
++        createTable("CREATE TABLE %s.rangetombstone (a int, b int, c text, PRIMARY KEY (a, b)) WITH gc_grace_seconds = 10000");
++        ColumnFamilyStore cfs = Keyspace.open(keyspace).getColumnFamilyStore("rangetombstone");
++        execute("DELETE FROM %s.rangetombstone USING TIMESTAMP 9999 WHERE a = 1 and b = 1");
++        cfs.forceBlockingFlush();
++        assertEquals(1, cfs.getSSTables().size());
++        SSTableMetadata metadata = cfs.getSSTables().iterator().next().getSSTableMetadata();
++        assertEquals(9999, metadata.minTimestamp);
++        assertEquals(9999, metadata.maxTimestamp);
++        assertEquals(System.currentTimeMillis()/1000, metadata.maxLocalDeletionTime, 5);
++        cfs.forceMajorCompaction();
++        SSTableMetadata metadata2 = cfs.getSSTables().iterator().next().getSSTableMetadata();
++        assertEquals(metadata.maxLocalDeletionTime, metadata2.maxLocalDeletionTime);
++        assertEquals(metadata.minTimestamp, metadata2.minTimestamp);
++        assertEquals(metadata.maxTimestamp, metadata2.maxTimestamp);
++    }
++
++    @Test
++    public void testTrackMetadata_rowTombstone() throws Throwable
++    {
++        createTable("CREATE TABLE %s.rowtombstone (a int, b int, c text, PRIMARY KEY (a, b))");
++        ColumnFamilyStore cfs = Keyspace.open(keyspace).getColumnFamilyStore("rowtombstone");
++        execute("DELETE FROM %s.rowtombstone USING TIMESTAMP 9999 WHERE a = 1");
++
++        cfs.forceBlockingFlush();
++        assertEquals(1, cfs.getSSTables().size());
++        SSTableMetadata metadata = cfs.getSSTables().iterator().next().getSSTableMetadata();
++        assertEquals(9999, metadata.minTimestamp);
++        assertEquals(9999, metadata.maxTimestamp);
++        assertEquals(System.currentTimeMillis()/1000, metadata.maxLocalDeletionTime, 5);
++        cfs.forceMajorCompaction();
++        SSTableMetadata metadata2 = cfs.getSSTables().iterator().next().getSSTableMetadata();
++        assertEquals(metadata.maxLocalDeletionTime, metadata2.maxLocalDeletionTime);
++        assertEquals(metadata.minTimestamp, metadata2.minTimestamp);
++        assertEquals(metadata.maxTimestamp, metadata2.maxTimestamp);
++    }
++
++    @Test
++    public void testTrackMetadata_rowMarker() throws Throwable
++    {
++        createTable("CREATE TABLE %s.rowmarker (a int, PRIMARY KEY (a))");
++        ColumnFamilyStore cfs = Keyspace.open(keyspace).getColumnFamilyStore("rowmarker");
++        execute("INSERT INTO %s.rowmarker (a) VALUES (1) USING TIMESTAMP 9999");
++
++        cfs.forceBlockingFlush();
++        assertEquals(1, cfs.getSSTables().size());
++        SSTableMetadata metadata = cfs.getSSTables().iterator().next().getSSTableMetadata();
++        assertEquals(9999, metadata.minTimestamp);
++        assertEquals(9999, metadata.maxTimestamp);
++        assertEquals(Integer.MAX_VALUE, metadata.maxLocalDeletionTime);
++        cfs.forceMajorCompaction();
++        SSTableMetadata metadata2 = cfs.getSSTables().iterator().next().getSSTableMetadata();
++        assertEquals(metadata.maxLocalDeletionTime, metadata2.maxLocalDeletionTime);
++        assertEquals(metadata.minTimestamp, metadata2.minTimestamp);
++        assertEquals(metadata.maxTimestamp, metadata2.maxTimestamp);
++    }
++    @Test
++    public void testTrackMetadata_rowMarkerDelete() throws Throwable
++    {
++        createTable("CREATE TABLE %s.rowmarkerdel (a int, PRIMARY KEY (a))");
++        ColumnFamilyStore cfs = Keyspace.open(keyspace).getColumnFamilyStore("rowmarkerdel");
++        execute("DELETE FROM %s.rowmarkerdel USING TIMESTAMP 9999 WHERE a=1");
++        cfs.forceBlockingFlush();
++        assertEquals(1, cfs.getSSTables().size());
++        SSTableMetadata metadata = cfs.getSSTables().iterator().next().getSSTableMetadata();
++        assertEquals(9999, metadata.minTimestamp);
++        assertEquals(9999, metadata.maxTimestamp);
++        assertEquals(System.currentTimeMillis()/1000, metadata.maxLocalDeletionTime, 5);
++        cfs.forceMajorCompaction();
++        SSTableMetadata metadata2 = cfs.getSSTables().iterator().next().getSSTableMetadata();
++        assertEquals(metadata.maxLocalDeletionTime, metadata2.maxLocalDeletionTime);
++        assertEquals(metadata.minTimestamp, metadata2.minTimestamp);
++        assertEquals(metadata.maxTimestamp, metadata2.maxTimestamp);
++    }
++
++    @AfterClass
++    public static void stopGossiper()
++    {
++        Gossiper.instance.stop();
++    }
++
++    private static void createKeyspace(String query) throws Throwable
++    {
++        try
++        {
++            process(String.format(query, keyspace), ConsistencyLevel.ONE);
++        } catch (RuntimeException exc)
++        {
++            throw exc.getCause();
++        }
++    }
++
++
++    private void createTable(String query) throws Throwable
++    {
++        try
++        {
++            process(String.format(query, keyspace), ConsistencyLevel.ONE);
++        } catch (RuntimeException exc)
++        {
++            throw exc.getCause();
++        }
++    }
++
++    private UntypedResultSet execute(String query) throws Throwable
++    {
++        try
++        {
++            return processInternal(String.format(query, keyspace));
++        } catch (RuntimeException exc)
++        {
++            if (exc.getCause() != null)
++                throw exc.getCause();
++            throw exc;
++        }
++    }
++}
+diff --git a/test/unit/org/apache/cassandra/db/RangeTombstoneTest.java b/test/unit/org/apache/cassandra/db/RangeTombstoneTest.java
+index 7f1238f798..4dc7c0be5b 100644
+--- a/test/unit/org/apache/cassandra/db/RangeTombstoneTest.java
++++ b/test/unit/org/apache/cassandra/db/RangeTombstoneTest.java
+@@ -30,6 +30,7 @@ import org.apache.cassandra.db.columniterator.OnDiskAtomIterator;
+ import org.apache.cassandra.db.compaction.SizeTieredCompactionStrategy;
+ import org.apache.cassandra.db.index.*;
+ import org.apache.cassandra.exceptions.ConfigurationException;
++import org.apache.cassandra.io.sstable.SSTableMetadata;
+ import org.apache.cassandra.io.sstable.SSTableReader;
+ import org.apache.cassandra.thrift.IndexType;
+ 
+@@ -110,6 +111,99 @@ public class RangeTombstoneTest extends SchemaLoader
+             assert !isLive(cf, cf.getColumn(b(i))) : "Column " + i + " shouldn't be live";
+     }
+ 
++    @Test
++    public void testTrackTimesRowTombstone() throws ExecutionException, InterruptedException
++    {
++        Keyspace ks = Keyspace.open(KSNAME);
++        ColumnFamilyStore cfs = ks.getColumnFamilyStore(CFNAME);
++        cfs.truncateBlocking();
++        String key = "rt_times";
++        RowMutation rm = new RowMutation(KSNAME, ByteBufferUtil.bytes(key));
++        ColumnFamily cf = rm.addOrGet(CFNAME);
++        long timestamp = System.currentTimeMillis();
++        cf.delete(new DeletionInfo(1000, (int)(timestamp/1000)));
++        rm.apply();
++        cfs.forceBlockingFlush();
++        SSTableReader sstable = cfs.getSSTables().iterator().next();
++        assertTimes(sstable.getSSTableMetadata(), 1000, 1000, (int)(timestamp/1000));
++        cfs.forceMajorCompaction();
++        sstable = cfs.getSSTables().iterator().next();
++        assertTimes(sstable.getSSTableMetadata(), 1000, 1000, (int)(timestamp/1000));
++    }
++
++    @Test
++    public void testTrackTimesRowTombstoneWithData() throws ExecutionException, InterruptedException
++    {
++        Keyspace ks = Keyspace.open(KSNAME);
++        ColumnFamilyStore cfs = ks.getColumnFamilyStore(CFNAME);
++        cfs.truncateBlocking();
++        String key = "rt_times";
++        RowMutation rm = new RowMutation(KSNAME, ByteBufferUtil.bytes(key));
++        add(rm, 5, 999);
++        rm.apply();
++        key = "rt_times2";
++        rm = new RowMutation(KSNAME, ByteBufferUtil.bytes(key));
++        ColumnFamily cf = rm.addOrGet(CFNAME);
++        int timestamp = (int)(System.currentTimeMillis()/1000);
++        cf.delete(new DeletionInfo(1000, timestamp));
++        rm.apply();
++        cfs.forceBlockingFlush();
++        SSTableReader sstable = cfs.getSSTables().iterator().next();
++        assertTimes(sstable.getSSTableMetadata(), 999, 1000, Integer.MAX_VALUE);
++        cfs.forceMajorCompaction();
++        sstable = cfs.getSSTables().iterator().next();
++        assertTimes(sstable.getSSTableMetadata(), 999, 1000, Integer.MAX_VALUE);
++    }
++    @Test
++    public void testTrackTimesRangeTombstone() throws ExecutionException, InterruptedException
++    {
++        Keyspace ks = Keyspace.open(KSNAME);
++        ColumnFamilyStore cfs = ks.getColumnFamilyStore(CFNAME);
++        cfs.truncateBlocking();
++        String key = "rt_times";
++        RowMutation rm = new RowMutation(KSNAME, ByteBufferUtil.bytes(key));
++        ColumnFamily cf = rm.addOrGet(CFNAME);
++        long timestamp = System.currentTimeMillis();
++        cf.delete(new DeletionInfo(b(1), b(2), cfs.getComparator(), 1000, (int)(timestamp/1000)));
++        rm.apply();
++        cfs.forceBlockingFlush();
++        SSTableReader sstable = cfs.getSSTables().iterator().next();
++        assertTimes(sstable.getSSTableMetadata(), 1000, 1000, (int)(timestamp/1000));
++        cfs.forceMajorCompaction();
++        sstable = cfs.getSSTables().iterator().next();
++        assertTimes(sstable.getSSTableMetadata(), 1000, 1000, (int)(timestamp/1000));
++    }
++
++    @Test
++    public void testTrackTimesRangeTombstoneWithData() throws ExecutionException, InterruptedException
++    {
++        Keyspace ks = Keyspace.open(KSNAME);
++        ColumnFamilyStore cfs = ks.getColumnFamilyStore(CFNAME);
++        cfs.truncateBlocking();
++        String key = "rt_times";
++        RowMutation rm = new RowMutation(KSNAME, ByteBufferUtil.bytes(key));
++        add(rm, 5, 999);
++        rm.apply();
++        key = "rt_times2";
++        rm = new RowMutation(KSNAME, ByteBufferUtil.bytes(key));
++        ColumnFamily cf = rm.addOrGet(CFNAME);
++        int timestamp = (int)(System.currentTimeMillis()/1000);
++        cf.delete(new DeletionInfo(b(1), b(2), cfs.getComparator(), 1000, timestamp));
++        rm.apply();
++        cfs.forceBlockingFlush();
++        SSTableReader sstable = cfs.getSSTables().iterator().next();
++        assertTimes(sstable.getSSTableMetadata(), 999, 1000, Integer.MAX_VALUE);
++        cfs.forceMajorCompaction();
++        sstable = cfs.getSSTables().iterator().next();
++        assertTimes(sstable.getSSTableMetadata(), 999, 1000, Integer.MAX_VALUE);
++    }
++
++    private void assertTimes(SSTableMetadata metadata, long min, long max, int localDeletionTime)
++    {
++        assertEquals(min, metadata.minTimestamp);
++        assertEquals(max, metadata.maxTimestamp);
++        assertEquals(localDeletionTime, metadata.maxLocalDeletionTime);
++    }
+ 
+     @Test
+     public void test7810() throws ExecutionException, InterruptedException, IOException

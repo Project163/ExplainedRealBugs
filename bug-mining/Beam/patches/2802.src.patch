@@ -1,0 +1,205 @@
+diff --git a/sdks/java/io/google-cloud-platform/src/main/java/org/apache/beam/sdk/io/gcp/bigquery/BigQueryServicesImpl.java b/sdks/java/io/google-cloud-platform/src/main/java/org/apache/beam/sdk/io/gcp/bigquery/BigQueryServicesImpl.java
+index 0ac1eb97234..dec5ae8088c 100644
+--- a/sdks/java/io/google-cloud-platform/src/main/java/org/apache/beam/sdk/io/gcp/bigquery/BigQueryServicesImpl.java
++++ b/sdks/java/io/google-cloud-platform/src/main/java/org/apache/beam/sdk/io/gcp/bigquery/BigQueryServicesImpl.java
+@@ -151,6 +151,10 @@ class BigQueryServicesImpl implements BigQueryServices {
+   // The initial backoff for executing a BigQuery RPC.
+   private static final Duration INITIAL_RPC_BACKOFF = Duration.standardSeconds(1);
+ 
++  // The approximate maximum payload of rows for an insertAll request.
++  // We set it to 9MB, which leaves room for request overhead.
++  private static final Integer MAX_BQ_ROW_PAYLOAD = 9 * 1024 * 1024;
++
+   // The initial backoff for polling the status of a BigQuery job.
+   private static final Duration INITIAL_JOB_STATUS_POLL_BACKOFF = Duration.standardSeconds(1);
+ 
+@@ -981,21 +985,38 @@ class BigQueryServicesImpl implements BigQueryServices {
+           }
+ 
+           // The following scenario must be *extremely* rare.
+-          // If this row's encoding by itself is larger than the maxRowBatchSize, then it's
++          // If this row's encoding by itself is larger than the maximum row payload, then it's
+           // impossible to insert into BigQuery, and so we send it out through the dead-letter
+           // queue.
+-          if (nextRowSize >= maxRowBatchSize) {
+-            errorContainer.add(
+-                failedInserts,
++          if (nextRowSize >= MAX_BQ_ROW_PAYLOAD) {
++            InsertErrors error =
+                 new InsertErrors()
+-                    .setErrors(ImmutableList.of(new ErrorProto().setReason("row too large"))),
+-                ref,
+-                rowsToPublish.get(rowIndex));
+-            rowIndex++;
+-            continue;
++                    .setErrors(ImmutableList.of(new ErrorProto().setReason("row-too-large")));
++            // We verify whether the retryPolicy parameter expects us to retry. If it does, then
++            // it will return true. Otherwise it will return false.
++            Boolean isRetry = retryPolicy.shouldRetry(new InsertRetryPolicy.Context(error));
++            if (isRetry) {
++              throw new RuntimeException(
++                  String.format(
++                      "We have observed a row that is %s bytes in size. BigQuery supports"
++                          + " request sizes up to 10MB, and this row is too large. "
++                          + " You may change your retry strategy to unblock this pipeline, and "
++                          + " the row will be output as a failed insert.",
++                      nextRowSize));
++            } else {
++              errorContainer.add(failedInserts, error, ref, rowsToPublish.get(rowIndex));
++              failedIndices.add(rowIndex);
++              rowIndex++;
++              continue;
++            }
+           }
+ 
+-          if (nextRowSize + dataSize >= maxRowBatchSize || rows.size() + 1 > maxRowsPerBatch) {
++          // If adding the next row will push the request above BQ row limits, or
++          // if the current batch of elements is larger than the targeted request size,
++          // we immediately go and issue the data insertion.
++          if (dataSize + nextRowSize >= MAX_BQ_ROW_PAYLOAD
++              || dataSize >= maxRowBatchSize
++              || rows.size() + 1 > maxRowsPerBatch) {
+             // If the row does not fit into the insert buffer, then we take the current buffer,
+             // issue the insert call, and we retry adding the same row to the troublesome buffer.
+             // Add a future to insert the current batch into BQ.
+diff --git a/sdks/java/io/google-cloud-platform/src/main/java/org/apache/beam/sdk/io/gcp/bigquery/InsertRetryPolicy.java b/sdks/java/io/google-cloud-platform/src/main/java/org/apache/beam/sdk/io/gcp/bigquery/InsertRetryPolicy.java
+index 320b9e31b87..24b48d7dc24 100644
+--- a/sdks/java/io/google-cloud-platform/src/main/java/org/apache/beam/sdk/io/gcp/bigquery/InsertRetryPolicy.java
++++ b/sdks/java/io/google-cloud-platform/src/main/java/org/apache/beam/sdk/io/gcp/bigquery/InsertRetryPolicy.java
+@@ -46,7 +46,7 @@ public abstract class InsertRetryPolicy implements Serializable {
+ 
+   // A list of known persistent errors for which retrying never helps.
+   static final Set<String> PERSISTENT_ERRORS =
+-      ImmutableSet.of("invalid", "invalidQuery", "notImplemented");
++      ImmutableSet.of("invalid", "invalidQuery", "notImplemented", "row-too-large");
+ 
+   /** Return true if this failure should be retried. */
+   public abstract boolean shouldRetry(Context context);
+diff --git a/sdks/java/io/google-cloud-platform/src/test/java/org/apache/beam/sdk/io/gcp/bigquery/BigQueryServicesImplTest.java b/sdks/java/io/google-cloud-platform/src/test/java/org/apache/beam/sdk/io/gcp/bigquery/BigQueryServicesImplTest.java
+index 4ea3d9789a9..381f855219b 100644
+--- a/sdks/java/io/google-cloud-platform/src/test/java/org/apache/beam/sdk/io/gcp/bigquery/BigQueryServicesImplTest.java
++++ b/sdks/java/io/google-cloud-platform/src/test/java/org/apache/beam/sdk/io/gcp/bigquery/BigQueryServicesImplTest.java
+@@ -104,6 +104,7 @@ import org.apache.beam.sdk.transforms.windowing.PaneInfo;
+ import org.apache.beam.sdk.util.FluentBackoff;
+ import org.apache.beam.sdk.values.FailsafeValueInSingleWindow;
+ import org.apache.beam.sdk.values.ValueInSingleWindow;
++import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Strings;
+ import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Verify;
+ import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.ImmutableList;
+ import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.Lists;
+@@ -908,6 +909,106 @@ public class BigQueryServicesImplTest {
+     verifyWriteMetricWasSet("project", "dataset", "table", "ok", 3);
+   }
+ 
++  /** Tests that {@link DatasetServiceImpl#insertAll} does not go over limit of rows per request. */
++  @Test
++  public void testInsertWithinRequestByteSizeLimitsErrorsOut() throws Exception {
++    TableReference ref =
++        new TableReference().setProjectId("project").setDatasetId("dataset").setTableId("table");
++    List<FailsafeValueInSingleWindow<TableRow, TableRow>> rows =
++        ImmutableList.of(
++            wrapValue(new TableRow().set("row", Strings.repeat("abcdefghi", 1024 * 1025))),
++            wrapValue(new TableRow().set("row", "a")),
++            wrapValue(new TableRow().set("row", "b")));
++    List<String> insertIds = ImmutableList.of("a", "b", "c");
++
++    final TableDataInsertAllResponse allRowsSucceeded = new TableDataInsertAllResponse();
++
++    setupMockResponses(
++        response -> {
++          when(response.getContentType()).thenReturn(Json.MEDIA_TYPE);
++          when(response.getStatusCode()).thenReturn(200);
++          when(response.getContent()).thenReturn(toStream(allRowsSucceeded));
++        },
++        response -> {
++          when(response.getContentType()).thenReturn(Json.MEDIA_TYPE);
++          when(response.getStatusCode()).thenReturn(200);
++          when(response.getContent()).thenReturn(toStream(allRowsSucceeded));
++        });
++
++    DatasetServiceImpl dataService =
++        new DatasetServiceImpl(
++            bigquery, null, PipelineOptionsFactory.fromArgs("--maxStreamingBatchSize=15").create());
++    List<ValueInSingleWindow<TableRow>> failedInserts = Lists.newArrayList();
++    List<ValueInSingleWindow<TableRow>> successfulRows = Lists.newArrayList();
++    RuntimeException e =
++        assertThrows(
++            RuntimeException.class,
++            () ->
++                dataService.<TableRow>insertAll(
++                    ref,
++                    rows,
++                    insertIds,
++                    BackOffAdapter.toGcpBackOff(TEST_BACKOFF.backoff()),
++                    TEST_BACKOFF,
++                    new MockSleeper(),
++                    InsertRetryPolicy.alwaysRetry(),
++                    failedInserts,
++                    ErrorContainer.TABLE_ROW_ERROR_CONTAINER,
++                    false,
++                    false,
++                    false,
++                    successfulRows));
++
++    assertThat(e.getMessage(), containsString("this row is too large."));
++  }
++
++  @Test
++  public void testInsertRetryTransientsAboveRequestByteSizeLimits() throws Exception {
++    TableReference ref =
++        new TableReference().setProjectId("project").setDatasetId("dataset").setTableId("table");
++    List<FailsafeValueInSingleWindow<TableRow, TableRow>> rows =
++        ImmutableList.of(
++            wrapValue(new TableRow().set("row", Strings.repeat("abcdefghi", 1024 * 1025))),
++            wrapValue(new TableRow().set("row", "a")),
++            wrapValue(new TableRow().set("row", "b")));
++    List<String> insertIds = ImmutableList.of("a", "b", "c");
++
++    final TableDataInsertAllResponse allRowsSucceeded = new TableDataInsertAllResponse();
++
++    setupMockResponses(
++        response -> {
++          when(response.getContentType()).thenReturn(Json.MEDIA_TYPE);
++          when(response.getStatusCode()).thenReturn(200);
++          when(response.getContent()).thenReturn(toStream(allRowsSucceeded));
++        });
++
++    DatasetServiceImpl dataService =
++        new DatasetServiceImpl(
++            bigquery, null, PipelineOptionsFactory.fromArgs("--maxStreamingBatchSize=15").create());
++    List<ValueInSingleWindow<TableRow>> failedInserts = Lists.newArrayList();
++    List<ValueInSingleWindow<TableRow>> successfulRows = Lists.newArrayList();
++    dataService.<TableRow>insertAll(
++        ref,
++        rows,
++        insertIds,
++        BackOffAdapter.toGcpBackOff(TEST_BACKOFF.backoff()),
++        TEST_BACKOFF,
++        new MockSleeper(),
++        InsertRetryPolicy.retryTransientErrors(),
++        failedInserts,
++        ErrorContainer.TABLE_ROW_ERROR_CONTAINER,
++        false,
++        false,
++        false,
++        successfulRows);
++
++    assertEquals(1, failedInserts.size());
++    assertEquals(2, successfulRows.size());
++
++    verifyAllResponsesAreRead();
++    verifyWriteMetricWasSet("project", "dataset", "table", "ok", 1);
++  }
++
+   /** Tests that {@link DatasetServiceImpl#insertAll} does not go over limit of rows per request. */
+   @Test
+   public void testInsertWithinRequestByteSizeLimits() throws Exception {
+@@ -944,7 +1045,7 @@ public class BigQueryServicesImplTest {
+         BackOffAdapter.toGcpBackOff(TEST_BACKOFF.backoff()),
+         TEST_BACKOFF,
+         new MockSleeper(),
+-        InsertRetryPolicy.alwaysRetry(),
++        InsertRetryPolicy.retryTransientErrors(),
+         new ArrayList<>(),
+         ErrorContainer.TABLE_ROW_ERROR_CONTAINER,
+         false,

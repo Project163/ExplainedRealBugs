@@ -1,0 +1,297 @@
+diff --git a/sql/core/src/main/scala/org/apache/spark/sql/execution/streaming/state/RocksDBStateStoreProvider.scala b/sql/core/src/main/scala/org/apache/spark/sql/execution/streaming/state/RocksDBStateStoreProvider.scala
+index 78b8cc66f6d..7098fd41f40 100644
+--- a/sql/core/src/main/scala/org/apache/spark/sql/execution/streaming/state/RocksDBStateStoreProvider.scala
++++ b/sql/core/src/main/scala/org/apache/spark/sql/execution/streaming/state/RocksDBStateStoreProvider.scala
+@@ -767,7 +767,9 @@ private[sql] class RocksDBStateStoreProvider
+   }
+ 
+   override def close(): Unit = {
+-    rocksDB.close()
++    if (stateMachine.close()) {
++      rocksDB.close()
++    }
+   }
+ 
+   override def supportedCustomMetrics: Seq[StateStoreCustomMetric] = ALL_CUSTOM_METRICS
+diff --git a/sql/core/src/test/scala/org/apache/spark/sql/execution/streaming/state/RocksDBStateStoreLockHardeningSuite.scala b/sql/core/src/test/scala/org/apache/spark/sql/execution/streaming/state/RocksDBStateStoreLockHardeningSuite.scala
+index cb59e005dee..03e5bf692ef 100644
+--- a/sql/core/src/test/scala/org/apache/spark/sql/execution/streaming/state/RocksDBStateStoreLockHardeningSuite.scala
++++ b/sql/core/src/test/scala/org/apache/spark/sql/execution/streaming/state/RocksDBStateStoreLockHardeningSuite.scala
+@@ -620,6 +620,175 @@ class RocksDBStateStoreLockHardeningSuite extends SparkFunSuite
+     }
+   }
+ 
++  test("SPARK-53276: safe provider close during concurrent commit operations") {
++    // This test simulates the scenario fixed by SPARK-53276:
++    // - Multiple partitions are processing, some hit errors while others are committing
++    // - StateStore.stop() is called, which tries to close all providers
++    // - The fix ensures RocksDB is only closed when no other thread is using it
++
++    tryWithProviderResource(newStoreProvider(useColumnFamilies = false)) { provider =>
++      val commitInProgressLatch = new CountDownLatch(1)
++      val proceedWithCloseLatch = new CountDownLatch(1)
++      val commitCompletedLatch = new CountDownLatch(1)
++
++      @volatile var commitThreadException: Option[Throwable] = None
++      @volatile var closeResult: Option[Boolean] = None
++
++      // Thread 1: Simulate partition that's in the middle of commit (partition 1)
++      val commitFuture = Future {
++        val taskContext = TaskContext.empty()
++        TaskContext.setTaskContext(taskContext)
++
++        try {
++          val store = provider.getStore(0)
++          put(store, "partition1_key", 0, 1, StateStore.DEFAULT_COL_FAMILY_NAME)
++
++          // Signal that we're about to start commit
++          commitInProgressLatch.countDown()
++
++          // Wait for close thread to start attempting close
++          proceedWithCloseLatch.await(5, TimeUnit.SECONDS)
++
++          // Simulate some commit processing time
++          Thread.sleep(500)
++
++          // This commit should succeed even while close() is being called
++          val version = store.commit()
++          assert(version === 1)
++
++          commitCompletedLatch.countDown()
++        } catch {
++          case ex: Throwable =>
++            commitThreadException = Some(ex)
++            commitCompletedLatch.countDown()
++        }
++      }
++
++      // Thread 2: Simulate StateStore.stop() being called (from partition 0 error)
++      val closeFuture = Future {
++        try {
++          // Wait for commit thread to start its transaction
++          commitInProgressLatch.await(5, TimeUnit.SECONDS)
++
++          // Signal commit thread to proceed with its work
++          proceedWithCloseLatch.countDown()
++
++          // Attempt to close the provider (this simulates StateStore.stop())
++          // With the fix, this should wait until the commit thread releases the RocksDB
++          provider.close()
++          closeResult = Some(true)
++
++        } catch {
++          case ex: Throwable =>
++            // Log unexpected exceptions for debugging
++            logInfo(s"Close thread exception: ${ex.getClass.getName}: ${ex.getMessage}")
++        }
++      }
++
++      // Wait for both operations to complete
++      awaitResult(commitFuture, 10.seconds)
++      awaitResult(closeFuture, 10.seconds)
++
++      // Verify that commit completed successfully without exceptions
++      assert(commitCompletedLatch.await(1, TimeUnit.SECONDS),
++        "Commit should have completed")
++      assert(commitThreadException.isEmpty,
++        s"Commit should not have thrown exception: ${commitThreadException.map(_.getMessage)}")
++
++      // The state machine should have coordinated the close properly:
++      // - Either close() returned true (indicating it was safe to close)
++      // - Or close() waited until the commit completed before proceeding
++
++      // After everything completes, the provider should be properly closed
++      val stateMachine = PrivateMethod[Any](Symbol("stateMachine"))
++      val stateMachineObj = provider invokePrivate stateMachine()
++
++      // Attempting to get a new store should fail since provider is closed
++      val exception = intercept[StateStoreInvalidStateMachineTransition] {
++        provider.getStore(1)
++      }
++      assert(exception.getMessage.contains("Old state: CLOSED"))
++    }
++  }
++
++  test("SPARK-53276: close waits for concurrent operations to complete") {
++    // This test verifies that close() properly waits for ongoing operations
++    // to complete before actually closing the RocksDB instance
++
++    tryWithProviderResource(newStoreProvider(useColumnFamilies = false)) { provider =>
++      val operationStarted = new CountDownLatch(1)
++      val proceedWithClose = new CountDownLatch(1)
++      val operationCompleted = new CountDownLatch(1)
++
++      @volatile var operationException: Option[Throwable] = None
++      @volatile var closeStartTime: Long = 0
++      @volatile var closeEndTime: Long = 0
++
++      // Thread 1: Long-running operation
++      val operationFuture = Future {
++        val taskContext = TaskContext.empty()
++        TaskContext.setTaskContext(taskContext)
++
++        try {
++          val store = provider.getStore(0)
++          put(store, "key", 0, 1, StateStore.DEFAULT_COL_FAMILY_NAME)
++
++          operationStarted.countDown()
++
++          // Wait for close to be initiated
++          proceedWithClose.await(5, TimeUnit.SECONDS)
++
++          // Simulate some processing time
++          Thread.sleep(1000)
++
++          // This should complete successfully
++          store.commit()
++          operationCompleted.countDown()
++
++        } catch {
++          case ex: Throwable =>
++            operationException = Some(ex)
++            operationCompleted.countDown()
++        }
++      }
++
++      // Thread 2: Close operation
++      val closeFuture = Future {
++        // Wait for operation to start
++        operationStarted.await(5, TimeUnit.SECONDS)
++
++        // Signal operation to proceed
++        proceedWithClose.countDown()
++
++        // Start close - this should wait for the operation to complete
++        closeStartTime = System.currentTimeMillis()
++        provider.close()
++        closeEndTime = System.currentTimeMillis()
++      }
++
++      // Wait for both to complete
++      awaitResult(operationFuture, 10.seconds)
++      awaitResult(closeFuture, 10.seconds)
++
++      // Verify operation completed successfully
++      assert(operationCompleted.await(1, TimeUnit.SECONDS),
++        "Operation should have completed")
++      assert(operationException.isEmpty,
++        s"Operation should not have failed: ${operationException.map(_.getMessage)}")
++
++      // Verify close waited for operation (should take at least 1 second)
++      val closeDuration = closeEndTime - closeStartTime
++      assert(closeDuration >= 900, // Allow some margin for timing
++        s"Close should have waited for operation, but took only $closeDuration ms")
++
++      // Verify provider is properly closed
++      val exception = intercept[StateStoreInvalidStateMachineTransition] {
++        provider.getStore(1)
++      }
++      assert(exception.getMessage.contains("Old state: CLOSED"))
++    }
++  }
++
+   // Helper method to assert current thread has ownership
+   def assertAcquiredThreadIsCurrentThread(provider: RocksDBStateStoreProvider): Unit = {
+     val stateMachine = PrivateMethod[Any](Symbol("stateMachine"))
+diff --git a/sql/core/src/test/scala/org/apache/spark/sql/execution/streaming/state/RocksDBStateStoreSuite.scala b/sql/core/src/test/scala/org/apache/spark/sql/execution/streaming/state/RocksDBStateStoreSuite.scala
+index bb91878cd1d..b7ed4ba260c 100644
+--- a/sql/core/src/test/scala/org/apache/spark/sql/execution/streaming/state/RocksDBStateStoreSuite.scala
++++ b/sql/core/src/test/scala/org/apache/spark/sql/execution/streaming/state/RocksDBStateStoreSuite.scala
+@@ -279,19 +279,20 @@ class RocksDBStateStoreSuite extends StateStoreSuiteBase[RocksDBStateStoreProvid
+     keySchemaWithSomeUnsupportedTypeCols.fields.zipWithIndex.foreach { case (field, index) =>
+       val isAllowed = allowedRangeOrdinals.contains(index)
+ 
+-      val getStore = () => {
++      if (isAllowed) {
+         tryWithProviderResource(newStoreProvider(keySchemaWithSomeUnsupportedTypeCols,
+             RangeKeyScanStateEncoderSpec(keySchemaWithSomeUnsupportedTypeCols, Seq(index)),
+             colFamiliesEnabled)) { provider =>
+-            provider.getStore(0)
++          val store = provider.getStore(0)
++          store.abort()
+         }
+-      }
+-
+-      if (isAllowed) {
+-        getStore()
+       } else {
+         val ex = intercept[SparkUnsupportedOperationException] {
+-          getStore()
++          tryWithProviderResource(newStoreProvider(keySchemaWithSomeUnsupportedTypeCols,
++              RangeKeyScanStateEncoderSpec(keySchemaWithSomeUnsupportedTypeCols, Seq(index)),
++              colFamiliesEnabled)) { provider =>
++            provider.getStore(0)
++          }
+         }
+         checkError(
+           ex,
+@@ -653,6 +654,7 @@ class RocksDBStateStoreSuite extends StateStoreSuiteBase[RocksDBStateStoreProvid
+         (key._1, key._2)
+       }.toSeq
+       assert(result === timerTimestamps.sorted)
++      store.abort()
+     }
+   }
+ 
+@@ -1488,6 +1490,7 @@ class RocksDBStateStoreSuite extends StateStoreSuiteBase[RocksDBStateStoreProvid
+           (key._1, key._2)
+         }.toSeq
+       assert(result.map(_._1) === timerTimestamps.map(_._1).sorted)
++      store.abort()
+     }
+   }
+ 
+@@ -1533,6 +1536,7 @@ class RocksDBStateStoreSuite extends StateStoreSuiteBase[RocksDBStateStoreProvid
+         (key._1, key._2)
+       }.toSeq
+       assert(result === timerTimestamps.sorted)
++      store.abort()
+     }
+   }
+ 
+@@ -1648,6 +1652,7 @@ class RocksDBStateStoreSuite extends StateStoreSuiteBase[RocksDBStateStoreProvid
+       assert(valueRowToData(store.get(keyRow2)) === 2)
+       store.remove(keyRow2)
+       assert(store.get(keyRow2) === null)
++      store.abort()
+     }
+   }
+ 
+@@ -1756,6 +1761,7 @@ class RocksDBStateStoreSuite extends StateStoreSuiteBase[RocksDBStateStoreProvid
+         assert(!iterator2.hasNext)
+ 
+         assert(get(store, "a", 0).isEmpty)
++        store.abort()
+       }
+     }
+   }
+@@ -1795,6 +1801,7 @@ class RocksDBStateStoreSuite extends StateStoreSuiteBase[RocksDBStateStoreProvid
+           )
+         }
+       }
++      store.abort()
+     }
+   }
+ 
+@@ -1831,6 +1838,7 @@ class RocksDBStateStoreSuite extends StateStoreSuiteBase[RocksDBStateStoreProvid
+           )
+         }
+       }
++      store.abort()
+     }
+   }
+ 
+@@ -2667,7 +2675,12 @@ class RocksDBStateStoreSuite extends StateStoreSuiteBase[RocksDBStateStoreProvid
+     tryWithProviderResource(newStoreProvider(provider.stateStoreId,
+       useColumnFamilies)) { reloadedProvider =>
+       val versionToRead = if (version < 0) reloadedProvider.latestVersion else version
+-      reloadedProvider.getStore(versionToRead).iterator().map(rowPairToDataPair).toSet
++      val store = reloadedProvider.getStore(versionToRead)
++      try {
++        store.iterator().map(rowPairToDataPair).toSet
++      } finally {
++        if (!store.hasCommitted) store.abort()
++      }
+     }
+   }
+ 

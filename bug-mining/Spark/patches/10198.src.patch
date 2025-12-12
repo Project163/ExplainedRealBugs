@@ -1,0 +1,751 @@
+diff --git a/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/analysis/Analyzer.scala b/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/analysis/Analyzer.scala
+index 9ff0401cd02..299fba06cdd 100644
+--- a/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/analysis/Analyzer.scala
++++ b/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/analysis/Analyzer.scala
+@@ -1573,31 +1573,11 @@ class Analyzer(override val catalogManager: CatalogManager) extends RuleExecutor
+         )
+ 
+       case u @ Union(children, _, _)
+-        // if there are duplicate output columns, give them unique expr ids
+-        if (u.allChildrenCompatible &&
++          // if there are duplicate output columns, give them unique expr ids
++          if (u.allChildrenCompatible &&
+           conf.getConf(SQLConf.ENFORCE_TYPE_COERCION_BEFORE_UNION_DEDUPLICATION)) &&
+           children.exists(c => c.output.map(_.exprId).distinct.length < c.output.length) =>
+-        val newChildren = children.map { c =>
+-          if (c.output.map(_.exprId).distinct.length < c.output.length) {
+-            val existingExprIds = mutable.HashSet[ExprId]()
+-            val projectList = c.output.map { attr =>
+-              if (existingExprIds.contains(attr.exprId)) {
+-                // replace non-first duplicates with aliases and tag them
+-                val newMetadata = new MetadataBuilder().withMetadata(attr.metadata)
+-                  .putNull("__is_duplicate").build()
+-                Alias(attr, attr.name)(explicitMetadata = Some(newMetadata))
+-              } else {
+-                // leave first duplicate alone
+-                existingExprIds.add(attr.exprId)
+-                attr
+-              }
+-            }
+-            Project(projectList, c)
+-          } else {
+-            c
+-          }
+-        }
+-        u.withNewChildren(newChildren)
++        DeduplicateUnionChildOutput.deduplicateOutputPerChild(u)
+ 
+       // A special case for Generate, because the output of Generate should not be resolved by
+       // ResolveReferences. Attributes in the output will be resolved by ResolveGenerate.
+diff --git a/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/analysis/DeduplicateRelations.scala b/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/analysis/DeduplicateRelations.scala
+index 752a2a648ce..da940c9b8ea 100644
+--- a/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/analysis/DeduplicateRelations.scala
++++ b/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/analysis/DeduplicateRelations.scala
+@@ -60,22 +60,29 @@ object DeduplicateRelations extends Rule[LogicalPlan] {
+         e.copy(right = dedupRight(left, right))
+       // Only after we finish by-name resolution for Union
+       case u: Union if !u.byName && !u.duplicateResolved =>
++        val unionWithChildOutputsDeduplicated =
++          DeduplicateUnionChildOutput.deduplicateOutputPerChild(u)
+         // Use projection-based de-duplication for Union to avoid breaking the checkpoint sharing
+         // feature in streaming.
+-        val newChildren = u.children.foldRight(Seq.empty[LogicalPlan]) { (head, tail) =>
+-          head +: tail.map {
+-            case child if head.outputSet.intersect(child.outputSet).isEmpty =>
+-              child
+-            case child =>
+-              val projectList = child.output.map { attr =>
+-                Alias(attr, attr.name)()
++        val newChildren =
++          unionWithChildOutputsDeduplicated.children.foldRight(Seq.empty[LogicalPlan]) {
++            (head, tail) =>
++              head +: tail.map {
++                case child if head.outputSet.intersect(child.outputSet).isEmpty =>
++                  child
++                case child =>
++                  val projectList = child.output.map { attr =>
++                    Alias(attr, attr.name)()
++                  }
++                  val project = Project(projectList, child)
++                  project.setTagValue(
++                    DeduplicateRelations.PROJECT_FOR_EXPRESSION_ID_DEDUPLICATION,
++                    ()
++                  )
++                  project
+               }
+-              val project = Project(projectList, child)
+-              project.setTagValue(DeduplicateRelations.PROJECT_FOR_EXPRESSION_ID_DEDUPLICATION, ())
+-              project
+           }
+-        }
+-        u.copy(children = newChildren)
++        unionWithChildOutputsDeduplicated.copy(children = newChildren)
+       case merge: MergeIntoTable
+           if !merge.duplicateResolved && noMissingInput(merge.sourceTable) =>
+         merge.copy(sourceTable = dedupRight(merge.targetTable, merge.sourceTable))
+diff --git a/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/analysis/DeduplicateUnionChildOutput.scala b/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/analysis/DeduplicateUnionChildOutput.scala
+new file mode 100644
+index 00000000000..11a10710a61
+--- /dev/null
++++ b/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/analysis/DeduplicateUnionChildOutput.scala
+@@ -0,0 +1,82 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.spark.sql.catalyst.analysis
++
++import scala.collection.mutable
++
++import org.apache.spark.sql.catalyst.expressions.{Alias, ExprId}
++import org.apache.spark.sql.catalyst.plans.logical.{Project, Union}
++import org.apache.spark.sql.types.MetadataBuilder
++
++/**
++ * Deduplicates columns with same [[ExprId]]s in single [[Union]] child output, by placing aliases
++ * on non-first duplicates.
++ */
++object DeduplicateUnionChildOutput {
++
++  /**
++   * Deduplicate expression IDs at the scope of each individual child output. This is necessary to
++   * handle the following case:
++   *
++   * {{{
++   * -- The correct answer is (1, 1), (1, 2). Without deduplication it would be (1, 1), because
++   * -- aggregation would be done only based on the first column.
++   * SELECT
++   *   a, a
++   * FROM
++   *   VALUES (1, 1), (1, 2) AS t1 (a, b)
++   * UNION
++   * SELECT
++   *  a, b
++   * FROM
++   *   VALUES (1, 1), (1, 2) AS t2 (a, b)
++   * }}}
++   *
++   * Putting [[Alias]] introduces a new expression ID for the attribute duplicates in the output. We
++   * also add `__is_duplicate` metadata so that [[AttributeSeq.getCandidatesForResolution]] doesn't
++   * produce conflicting candidates when resolving names in the upper [[Project]] - this is
++   * technically still the same attribute.
++   *
++   * See SPARK-37865 for more details.
++   */
++  def deduplicateOutputPerChild(union: Union): Union = {
++    val newChildren = union.children.map { c =>
++      if (c.output.map(_.exprId).distinct.length < c.output.length) {
++        val existingExprIds = mutable.HashSet[ExprId]()
++        val projectList = c.output.map { attr =>
++          if (existingExprIds.contains(attr.exprId)) {
++            // replace non-first duplicates with aliases and tag them
++            val newMetadata = new MetadataBuilder()
++              .withMetadata(attr.metadata)
++              .putNull("__is_duplicate")
++              .build()
++            Alias(attr, attr.name)(explicitMetadata = Some(newMetadata))
++          } else {
++            // leave first duplicate alone
++            existingExprIds.add(attr.exprId)
++            attr
++          }
++        }
++        Project(projectList, c)
++      } else {
++        c
++      }
++    }
++    union.withNewChildren(newChildren).asInstanceOf[Union]
++  }
++}
+diff --git a/sql/core/src/test/resources/sql-tests/analyzer-results/union-per-child-output-deduplication.sql.out b/sql/core/src/test/resources/sql-tests/analyzer-results/union-per-child-output-deduplication.sql.out
+new file mode 100644
+index 00000000000..69d15793cdb
+--- /dev/null
++++ b/sql/core/src/test/resources/sql-tests/analyzer-results/union-per-child-output-deduplication.sql.out
+@@ -0,0 +1,312 @@
++-- Automatically generated by SQLQueryTestSuite
++-- !query
++DROP TABLE IF EXISTS t1
++-- !query analysis
++DropTable true, false
+++- ResolvedIdentifier V2SessionCatalog(spark_catalog), default.t1
++
++
++-- !query
++DROP VIEW  IF EXISTS v1
++-- !query analysis
++DropTableCommand `spark_catalog`.`default`.`v1`, true, true, false
++
++
++-- !query
++CREATE TABLE t1 (col1 STRING, col2 STRING, col3 STRING)
++-- !query analysis
++CreateDataSourceTableCommand `spark_catalog`.`default`.`t1`, false
++
++
++-- !query
++CREATE VIEW v1 as SELECT * FROM t1
++-- !query analysis
++CreateViewCommand `spark_catalog`.`default`.`v1`, SELECT * FROM t1, false, false, PersistedView, COMPENSATION, true
++   +- Project [col1#x, col2#x, col3#x]
++      +- SubqueryAlias spark_catalog.default.t1
++         +- Relation spark_catalog.default.t1[col1#x,col2#x,col3#x] parquet
++
++
++-- !query
++SELECT *
++FROM (
++         SELECT col1, col2 FROM t1
++         UNION
++         SELECT col3, col2 FROM t1
++         UNION
++         SELECT col2, col2 FROM t1
++     )
++-- !query analysis
++Project [col1#x, col2#x]
+++- SubqueryAlias __auto_generated_subquery_name
++   +- Distinct
++      +- Union false, false
++         :- Distinct
++         :  +- Union false, false
++         :     :- Project [col1#x, col2#x]
++         :     :  +- SubqueryAlias spark_catalog.default.t1
++         :     :     +- Relation spark_catalog.default.t1[col1#x,col2#x,col3#x] parquet
++         :     +- Project [col3#x, col2#x]
++         :        +- SubqueryAlias spark_catalog.default.t1
++         :           +- Relation spark_catalog.default.t1[col1#x,col2#x,col3#x] parquet
++         +- Project [col2#x, col2#x AS col2#x]
++            +- Project [col2#x, col2#x]
++               +- SubqueryAlias spark_catalog.default.t1
++                  +- Relation spark_catalog.default.t1[col1#x,col2#x,col3#x] parquet
++
++
++-- !query
++SELECT *
++FROM (
++         SELECT col1, col2 FROM v1
++         UNION
++         SELECT col3, col2 FROM v1
++         UNION
++         SELECT col2, col2 FROM v1
++     )
++-- !query analysis
++Project [col1#x, col2#x]
+++- SubqueryAlias __auto_generated_subquery_name
++   +- Distinct
++      +- Union false, false
++         :- Distinct
++         :  +- Union false, false
++         :     :- Project [col1#x, col2#x]
++         :     :  +- SubqueryAlias spark_catalog.default.v1
++         :     :     +- View (`spark_catalog`.`default`.`v1`, [col1#x, col2#x, col3#x])
++         :     :        +- Project [cast(col1#x as string) AS col1#x, cast(col2#x as string) AS col2#x, cast(col3#x as string) AS col3#x]
++         :     :           +- Project [col1#x, col2#x, col3#x]
++         :     :              +- SubqueryAlias spark_catalog.default.t1
++         :     :                 +- Relation spark_catalog.default.t1[col1#x,col2#x,col3#x] parquet
++         :     +- Project [col3#x, col2#x]
++         :        +- SubqueryAlias spark_catalog.default.v1
++         :           +- View (`spark_catalog`.`default`.`v1`, [col1#x, col2#x, col3#x])
++         :              +- Project [cast(col1#x as string) AS col1#x, cast(col2#x as string) AS col2#x, cast(col3#x as string) AS col3#x]
++         :                 +- Project [col1#x, col2#x, col3#x]
++         :                    +- SubqueryAlias spark_catalog.default.t1
++         :                       +- Relation spark_catalog.default.t1[col1#x,col2#x,col3#x] parquet
++         +- Project [col2#x, col2#x AS col2#x]
++            +- Project [col2#x, col2#x]
++               +- SubqueryAlias spark_catalog.default.v1
++                  +- View (`spark_catalog`.`default`.`v1`, [col1#x, col2#x, col3#x])
++                     +- Project [cast(col1#x as string) AS col1#x, cast(col2#x as string) AS col2#x, cast(col3#x as string) AS col3#x]
++                        +- Project [col1#x, col2#x, col3#x]
++                           +- SubqueryAlias spark_catalog.default.t1
++                              +- Relation spark_catalog.default.t1[col1#x,col2#x,col3#x] parquet
++
++
++-- !query
++SELECT *
++FROM (
++         SELECT col1, col2 FROM t1
++         UNION
++         SELECT col3, col2 FROM t1
++         UNION
++         SELECT col2, col2 FROM v1
++     )
++-- !query analysis
++Project [col1#x, col2#x]
+++- SubqueryAlias __auto_generated_subquery_name
++   +- Distinct
++      +- Union false, false
++         :- Distinct
++         :  +- Union false, false
++         :     :- Project [col1#x, col2#x]
++         :     :  +- SubqueryAlias spark_catalog.default.t1
++         :     :     +- Relation spark_catalog.default.t1[col1#x,col2#x,col3#x] parquet
++         :     +- Project [col3#x, col2#x]
++         :        +- SubqueryAlias spark_catalog.default.t1
++         :           +- Relation spark_catalog.default.t1[col1#x,col2#x,col3#x] parquet
++         +- Project [col2#x, col2#x AS col2#x]
++            +- Project [col2#x, col2#x]
++               +- SubqueryAlias spark_catalog.default.v1
++                  +- View (`spark_catalog`.`default`.`v1`, [col1#x, col2#x, col3#x])
++                     +- Project [cast(col1#x as string) AS col1#x, cast(col2#x as string) AS col2#x, cast(col3#x as string) AS col3#x]
++                        +- Project [col1#x, col2#x, col3#x]
++                           +- SubqueryAlias spark_catalog.default.t1
++                              +- Relation spark_catalog.default.t1[col1#x,col2#x,col3#x] parquet
++
++
++-- !query
++SELECT *
++FROM (
++         SELECT col1, col2 FROM t1
++         UNION
++         SELECT col3, col2 FROM v1
++         UNION
++         SELECT col2, col2 FROM t1
++     )
++-- !query analysis
++Project [col1#x, col2#x]
+++- SubqueryAlias __auto_generated_subquery_name
++   +- Distinct
++      +- Union false, false
++         :- Distinct
++         :  +- Union false, false
++         :     :- Project [col1#x, col2#x]
++         :     :  +- SubqueryAlias spark_catalog.default.t1
++         :     :     +- Relation spark_catalog.default.t1[col1#x,col2#x,col3#x] parquet
++         :     +- Project [col3#x, col2#x]
++         :        +- SubqueryAlias spark_catalog.default.v1
++         :           +- View (`spark_catalog`.`default`.`v1`, [col1#x, col2#x, col3#x])
++         :              +- Project [cast(col1#x as string) AS col1#x, cast(col2#x as string) AS col2#x, cast(col3#x as string) AS col3#x]
++         :                 +- Project [col1#x, col2#x, col3#x]
++         :                    +- SubqueryAlias spark_catalog.default.t1
++         :                       +- Relation spark_catalog.default.t1[col1#x,col2#x,col3#x] parquet
++         +- Project [col2#x, col2#x AS col2#x]
++            +- Project [col2#x, col2#x]
++               +- SubqueryAlias spark_catalog.default.t1
++                  +- Relation spark_catalog.default.t1[col1#x,col2#x,col3#x] parquet
++
++
++-- !query
++SELECT *
++FROM (
++         SELECT col1, col2 FROM v1
++         UNION
++         SELECT col3, col2 FROM t1
++         UNION
++         SELECT col2, col2 FROM t1
++     )
++-- !query analysis
++Project [col1#x, col2#x]
+++- SubqueryAlias __auto_generated_subquery_name
++   +- Distinct
++      +- Union false, false
++         :- Distinct
++         :  +- Union false, false
++         :     :- Project [col1#x, col2#x]
++         :     :  +- SubqueryAlias spark_catalog.default.v1
++         :     :     +- View (`spark_catalog`.`default`.`v1`, [col1#x, col2#x, col3#x])
++         :     :        +- Project [cast(col1#x as string) AS col1#x, cast(col2#x as string) AS col2#x, cast(col3#x as string) AS col3#x]
++         :     :           +- Project [col1#x, col2#x, col3#x]
++         :     :              +- SubqueryAlias spark_catalog.default.t1
++         :     :                 +- Relation spark_catalog.default.t1[col1#x,col2#x,col3#x] parquet
++         :     +- Project [col3#x, col2#x]
++         :        +- SubqueryAlias spark_catalog.default.t1
++         :           +- Relation spark_catalog.default.t1[col1#x,col2#x,col3#x] parquet
++         +- Project [col2#x, col2#x AS col2#x]
++            +- Project [col2#x, col2#x]
++               +- SubqueryAlias spark_catalog.default.t1
++                  +- Relation spark_catalog.default.t1[col1#x,col2#x,col3#x] parquet
++
++
++-- !query
++SELECT *
++FROM (
++         SELECT col1, col2 FROM v1
++         UNION
++         SELECT col3, col2 FROM v1
++         UNION
++         SELECT col2, col2 FROM t1
++     )
++-- !query analysis
++Project [col1#x, col2#x]
+++- SubqueryAlias __auto_generated_subquery_name
++   +- Distinct
++      +- Union false, false
++         :- Distinct
++         :  +- Union false, false
++         :     :- Project [col1#x, col2#x]
++         :     :  +- SubqueryAlias spark_catalog.default.v1
++         :     :     +- View (`spark_catalog`.`default`.`v1`, [col1#x, col2#x, col3#x])
++         :     :        +- Project [cast(col1#x as string) AS col1#x, cast(col2#x as string) AS col2#x, cast(col3#x as string) AS col3#x]
++         :     :           +- Project [col1#x, col2#x, col3#x]
++         :     :              +- SubqueryAlias spark_catalog.default.t1
++         :     :                 +- Relation spark_catalog.default.t1[col1#x,col2#x,col3#x] parquet
++         :     +- Project [col3#x, col2#x]
++         :        +- SubqueryAlias spark_catalog.default.v1
++         :           +- View (`spark_catalog`.`default`.`v1`, [col1#x, col2#x, col3#x])
++         :              +- Project [cast(col1#x as string) AS col1#x, cast(col2#x as string) AS col2#x, cast(col3#x as string) AS col3#x]
++         :                 +- Project [col1#x, col2#x, col3#x]
++         :                    +- SubqueryAlias spark_catalog.default.t1
++         :                       +- Relation spark_catalog.default.t1[col1#x,col2#x,col3#x] parquet
++         +- Project [col2#x, col2#x AS col2#x]
++            +- Project [col2#x, col2#x]
++               +- SubqueryAlias spark_catalog.default.t1
++                  +- Relation spark_catalog.default.t1[col1#x,col2#x,col3#x] parquet
++
++
++-- !query
++SELECT *
++FROM (
++         SELECT col1, col2 FROM v1
++         UNION
++         SELECT col3, col2 FROM t1
++         UNION
++         SELECT col2, col2 FROM v1
++     )
++-- !query analysis
++Project [col1#x, col2#x]
+++- SubqueryAlias __auto_generated_subquery_name
++   +- Distinct
++      +- Union false, false
++         :- Distinct
++         :  +- Union false, false
++         :     :- Project [col1#x, col2#x]
++         :     :  +- SubqueryAlias spark_catalog.default.v1
++         :     :     +- View (`spark_catalog`.`default`.`v1`, [col1#x, col2#x, col3#x])
++         :     :        +- Project [cast(col1#x as string) AS col1#x, cast(col2#x as string) AS col2#x, cast(col3#x as string) AS col3#x]
++         :     :           +- Project [col1#x, col2#x, col3#x]
++         :     :              +- SubqueryAlias spark_catalog.default.t1
++         :     :                 +- Relation spark_catalog.default.t1[col1#x,col2#x,col3#x] parquet
++         :     +- Project [col3#x, col2#x]
++         :        +- SubqueryAlias spark_catalog.default.t1
++         :           +- Relation spark_catalog.default.t1[col1#x,col2#x,col3#x] parquet
++         +- Project [col2#x, col2#x AS col2#x]
++            +- Project [col2#x, col2#x]
++               +- SubqueryAlias spark_catalog.default.v1
++                  +- View (`spark_catalog`.`default`.`v1`, [col1#x, col2#x, col3#x])
++                     +- Project [cast(col1#x as string) AS col1#x, cast(col2#x as string) AS col2#x, cast(col3#x as string) AS col3#x]
++                        +- Project [col1#x, col2#x, col3#x]
++                           +- SubqueryAlias spark_catalog.default.t1
++                              +- Relation spark_catalog.default.t1[col1#x,col2#x,col3#x] parquet
++
++
++-- !query
++SELECT *
++FROM (
++         SELECT col1, col2 FROM t1
++         UNION
++         SELECT col3, col2 FROM v1
++         UNION
++         SELECT col2, col2 FROM v1
++     )
++-- !query analysis
++Project [col1#x, col2#x]
+++- SubqueryAlias __auto_generated_subquery_name
++   +- Distinct
++      +- Union false, false
++         :- Distinct
++         :  +- Union false, false
++         :     :- Project [col1#x, col2#x]
++         :     :  +- SubqueryAlias spark_catalog.default.t1
++         :     :     +- Relation spark_catalog.default.t1[col1#x,col2#x,col3#x] parquet
++         :     +- Project [col3#x, col2#x]
++         :        +- SubqueryAlias spark_catalog.default.v1
++         :           +- View (`spark_catalog`.`default`.`v1`, [col1#x, col2#x, col3#x])
++         :              +- Project [cast(col1#x as string) AS col1#x, cast(col2#x as string) AS col2#x, cast(col3#x as string) AS col3#x]
++         :                 +- Project [col1#x, col2#x, col3#x]
++         :                    +- SubqueryAlias spark_catalog.default.t1
++         :                       +- Relation spark_catalog.default.t1[col1#x,col2#x,col3#x] parquet
++         +- Project [col2#x, col2#x AS col2#x]
++            +- Project [col2#x, col2#x]
++               +- SubqueryAlias spark_catalog.default.v1
++                  +- View (`spark_catalog`.`default`.`v1`, [col1#x, col2#x, col3#x])
++                     +- Project [cast(col1#x as string) AS col1#x, cast(col2#x as string) AS col2#x, cast(col3#x as string) AS col3#x]
++                        +- Project [col1#x, col2#x, col3#x]
++                           +- SubqueryAlias spark_catalog.default.t1
++                              +- Relation spark_catalog.default.t1[col1#x,col2#x,col3#x] parquet
++
++
++-- !query
++DROP VIEW v1
++-- !query analysis
++DropTableCommand `spark_catalog`.`default`.`v1`, false, true, false
++
++
++-- !query
++DROP TABLE t1
++-- !query analysis
++DropTable false, false
+++- ResolvedIdentifier V2SessionCatalog(spark_catalog), default.t1
+diff --git a/sql/core/src/test/resources/sql-tests/inputs/union-per-child-output-deduplication.sql b/sql/core/src/test/resources/sql-tests/inputs/union-per-child-output-deduplication.sql
+new file mode 100644
+index 00000000000..f07b7c0b4a5
+--- /dev/null
++++ b/sql/core/src/test/resources/sql-tests/inputs/union-per-child-output-deduplication.sql
+@@ -0,0 +1,81 @@
++DROP TABLE IF EXISTS t1;
++DROP VIEW  IF EXISTS v1;
++
++CREATE TABLE t1 (col1 STRING, col2 STRING, col3 STRING);
++
++CREATE VIEW v1 as SELECT * FROM t1;
++
++SELECT *
++FROM (
++         SELECT col1, col2 FROM t1
++         UNION
++         SELECT col3, col2 FROM t1
++         UNION
++         SELECT col2, col2 FROM t1
++     );
++
++SELECT *
++FROM (
++         SELECT col1, col2 FROM v1
++         UNION
++         SELECT col3, col2 FROM v1
++         UNION
++         SELECT col2, col2 FROM v1
++     );
++
++SELECT *
++FROM (
++         SELECT col1, col2 FROM t1
++         UNION
++         SELECT col3, col2 FROM t1
++         UNION
++         SELECT col2, col2 FROM v1
++     );
++
++SELECT *
++FROM (
++         SELECT col1, col2 FROM t1
++         UNION
++         SELECT col3, col2 FROM v1
++         UNION
++         SELECT col2, col2 FROM t1
++     );
++
++SELECT *
++FROM (
++         SELECT col1, col2 FROM v1
++         UNION
++         SELECT col3, col2 FROM t1
++         UNION
++         SELECT col2, col2 FROM t1
++     );
++
++SELECT *
++FROM (
++         SELECT col1, col2 FROM v1
++         UNION
++         SELECT col3, col2 FROM v1
++         UNION
++         SELECT col2, col2 FROM t1
++     );
++
++SELECT *
++FROM (
++         SELECT col1, col2 FROM v1
++         UNION
++         SELECT col3, col2 FROM t1
++         UNION
++         SELECT col2, col2 FROM v1
++     );
++
++SELECT *
++FROM (
++         SELECT col1, col2 FROM t1
++         UNION
++         SELECT col3, col2 FROM v1
++         UNION
++         SELECT col2, col2 FROM v1
++     );
++
++DROP VIEW v1;
++DROP TABLE t1;
+diff --git a/sql/core/src/test/resources/sql-tests/results/union-per-child-output-deduplication.sql.out b/sql/core/src/test/resources/sql-tests/results/union-per-child-output-deduplication.sql.out
+new file mode 100644
+index 00000000000..3471d57f5fb
+--- /dev/null
++++ b/sql/core/src/test/resources/sql-tests/results/union-per-child-output-deduplication.sql.out
+@@ -0,0 +1,167 @@
++-- Automatically generated by SQLQueryTestSuite
++-- !query
++DROP TABLE IF EXISTS t1
++-- !query schema
++struct<>
++-- !query output
++
++
++
++-- !query
++DROP VIEW  IF EXISTS v1
++-- !query schema
++struct<>
++-- !query output
++
++
++
++-- !query
++CREATE TABLE t1 (col1 STRING, col2 STRING, col3 STRING)
++-- !query schema
++struct<>
++-- !query output
++
++
++
++-- !query
++CREATE VIEW v1 as SELECT * FROM t1
++-- !query schema
++struct<>
++-- !query output
++
++
++
++-- !query
++SELECT *
++FROM (
++         SELECT col1, col2 FROM t1
++         UNION
++         SELECT col3, col2 FROM t1
++         UNION
++         SELECT col2, col2 FROM t1
++     )
++-- !query schema
++struct<col1:string,col2:string>
++-- !query output
++
++
++
++-- !query
++SELECT *
++FROM (
++         SELECT col1, col2 FROM v1
++         UNION
++         SELECT col3, col2 FROM v1
++         UNION
++         SELECT col2, col2 FROM v1
++     )
++-- !query schema
++struct<col1:string,col2:string>
++-- !query output
++
++
++
++-- !query
++SELECT *
++FROM (
++         SELECT col1, col2 FROM t1
++         UNION
++         SELECT col3, col2 FROM t1
++         UNION
++         SELECT col2, col2 FROM v1
++     )
++-- !query schema
++struct<col1:string,col2:string>
++-- !query output
++
++
++
++-- !query
++SELECT *
++FROM (
++         SELECT col1, col2 FROM t1
++         UNION
++         SELECT col3, col2 FROM v1
++         UNION
++         SELECT col2, col2 FROM t1
++     )
++-- !query schema
++struct<col1:string,col2:string>
++-- !query output
++
++
++
++-- !query
++SELECT *
++FROM (
++         SELECT col1, col2 FROM v1
++         UNION
++         SELECT col3, col2 FROM t1
++         UNION
++         SELECT col2, col2 FROM t1
++     )
++-- !query schema
++struct<col1:string,col2:string>
++-- !query output
++
++
++
++-- !query
++SELECT *
++FROM (
++         SELECT col1, col2 FROM v1
++         UNION
++         SELECT col3, col2 FROM v1
++         UNION
++         SELECT col2, col2 FROM t1
++     )
++-- !query schema
++struct<col1:string,col2:string>
++-- !query output
++
++
++
++-- !query
++SELECT *
++FROM (
++         SELECT col1, col2 FROM v1
++         UNION
++         SELECT col3, col2 FROM t1
++         UNION
++         SELECT col2, col2 FROM v1
++     )
++-- !query schema
++struct<col1:string,col2:string>
++-- !query output
++
++
++
++-- !query
++SELECT *
++FROM (
++         SELECT col1, col2 FROM t1
++         UNION
++         SELECT col3, col2 FROM v1
++         UNION
++         SELECT col2, col2 FROM v1
++     )
++-- !query schema
++struct<col1:string,col2:string>
++-- !query output
++
++
++
++-- !query
++DROP VIEW v1
++-- !query schema
++struct<>
++-- !query output
++
++
++
++-- !query
++DROP TABLE t1
++-- !query schema
++struct<>
++-- !query output
++

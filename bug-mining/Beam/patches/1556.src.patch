@@ -1,0 +1,732 @@
+diff --git a/sdks/python/apache_beam/runners/dataflow/dataflow_runner.py b/sdks/python/apache_beam/runners/dataflow/dataflow_runner.py
+index 02543664b14..678676043bf 100644
+--- a/sdks/python/apache_beam/runners/dataflow/dataflow_runner.py
++++ b/sdks/python/apache_beam/runners/dataflow/dataflow_runner.py
+@@ -1238,7 +1238,7 @@ class DataflowRunner(PipelineRunner):
+     # TestStream source doesn't do any decoding of elements,
+     # so we won't set test_stream_payload.coder_id.
+     output_coder = transform._infer_output_coder()  # pylint: disable=protected-access
+-    for event in transform.events:
++    for event in transform._events:
+       new_event = test_stream_payload.events.add()
+       if isinstance(event, ElementEvent):
+         for tv in event.timestamped_values:
+diff --git a/sdks/python/apache_beam/runners/direct/direct_runner.py b/sdks/python/apache_beam/runners/direct/direct_runner.py
+index 4a663414974..ef81a278625 100644
+--- a/sdks/python/apache_beam/runners/direct/direct_runner.py
++++ b/sdks/python/apache_beam/runners/direct/direct_runner.py
+@@ -75,12 +75,53 @@ class SwitchingDirectRunner(PipelineRunner):
+   def is_fnapi_compatible(self):
+     return BundleBasedDirectRunner.is_fnapi_compatible()
+ 
++  def apply_TestStream(self, transform, pbegin, options):
++    """Expands the TestStream into the DirectRunner implementation.
++
++    Takes the TestStream transform and creates a _TestStream -> multiplexer ->
++    _WatermarkController.
++    """
++
++    from apache_beam.runners.direct.test_stream_impl import _TestStream
++    from apache_beam.runners.direct.test_stream_impl import _WatermarkController
++    from apache_beam import pvalue
++    assert isinstance(pbegin, pvalue.PBegin)
++
++    # If there is only one tag there is no need to add the multiplexer.
++    if len(transform.output_tags) == 1:
++      return (pbegin
++              | _TestStream(transform.output_tags, events=transform._events)
++              | _WatermarkController())
++
++    # This multiplexing the  multiple output PCollections.
++    def mux(event):
++      if event.tag:
++        yield pvalue.TaggedOutput(event.tag, event)
++      else:
++        yield event
++    mux_output = (pbegin
++                  | _TestStream(transform.output_tags, events=transform._events)
++                  | 'TestStream Multiplexer' >> beam.ParDo(mux).with_outputs())
++
++    # Apply a way to control the watermark per output. It is necessary to
++    # have an individual _WatermarkController per PCollection because the
++    # calculation of the input watermark of a transform is based on the event
++    # timestamp of the elements flowing through it. Meaning, it is impossible
++    # to control the output watermarks of the individual PCollections solely
++    # on the event timestamps.
++    outputs = {}
++    for tag in transform.output_tags:
++      label = '_WatermarkController[{}]'.format(tag)
++      outputs[tag] = (mux_output[tag] | label >> _WatermarkController())
++
++    return outputs
++
+   def run_pipeline(self, pipeline, options):
+ 
+     from apache_beam.pipeline import PipelineVisitor
+     from apache_beam.runners.dataflow.native_io.iobase import NativeSource
+     from apache_beam.runners.dataflow.native_io.iobase import _NativeWrite
+-    from apache_beam.testing.test_stream import _TestStream
++    from apache_beam.runners.direct.test_stream_impl import _TestStream
+ 
+     class _FnApiRunnerSupportVisitor(PipelineVisitor):
+       """Visitor determining if a Pipeline can be run on the FnApiRunner."""
+@@ -360,7 +401,7 @@ class BundleBasedDirectRunner(PipelineRunner):
+     from apache_beam.runners.direct.executor import Executor
+     from apache_beam.runners.direct.transform_evaluator import \
+       TransformEvaluatorRegistry
+-    from apache_beam.testing.test_stream import _TestStream
++    from apache_beam.runners.direct.test_stream_impl import _TestStream
+ 
+     # Performing configured PTransform overrides.
+     pipeline.replace_all(_get_transform_overrides(options))
+diff --git a/sdks/python/apache_beam/runners/direct/test_stream_impl.py b/sdks/python/apache_beam/runners/direct/test_stream_impl.py
+new file mode 100644
+index 00000000000..aa1405d199b
+--- /dev/null
++++ b/sdks/python/apache_beam/runners/direct/test_stream_impl.py
+@@ -0,0 +1,173 @@
++#
++# Licensed to the Apache Software Foundation (ASF) under one or more
++# contributor license agreements.  See the NOTICE file distributed with
++# this work for additional information regarding copyright ownership.
++# The ASF licenses this file to You under the Apache License, Version 2.0
++# (the "License"); you may not use this file except in compliance with
++# the License.  You may obtain a copy of the License at
++#
++#    http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++#
++
++"""The TestStream implementation for the DirectRunner
++
++The DirectRunner implements TestStream as the _TestStream class which is used
++to store the events in memory, the _WatermarkController which is used to set the
++watermark and emit events, and the multiplexer which sends events to the correct
++tagged PCollection.
++"""
++
++from __future__ import absolute_import
++
++from apache_beam import coders
++from apache_beam import pvalue
++from apache_beam.testing.test_stream import WatermarkEvent
++from apache_beam.transforms import PTransform
++from apache_beam.transforms import core
++from apache_beam.transforms import window
++from apache_beam.utils import timestamp
++
++
++class _WatermarkController(PTransform):
++  """A runner-overridable PTransform Primitive to control the watermark.
++
++  Expected implementation behavior:
++   - If the instance recieves a WatermarkEvent, it sets its output watermark to
++     the specified value then drops the event.
++   - If the instance receives an ElementEvent, it emits all specified elements
++     to the Global Window with the event time set to the element's timestamp.
++  """
++  def get_windowing(self, _):
++    return core.Windowing(window.GlobalWindows())
++
++  def expand(self, pcoll):
++    return pvalue.PCollection.from_(pcoll)
++
++
++class _TestStream(PTransform):
++  """Test stream that generates events on an unbounded PCollection of elements.
++
++  Each event emits elements, advances the watermark or advances the processing
++  time.  After all of the specified elements are emitted, ceases to produce
++  output.
++
++  Expected implementation behavior:
++   - If the instance receives a WatermarkEvent with the WATERMARK_CONTROL_TAG
++     then the instance sets its own watermark hold at the specified value and
++     drops the event.
++   - If the instance receives any other WatermarkEvent or ElementEvent, it
++     passes it to the consumer.
++  """
++
++  # This tag is used on WatermarkEvents to control the watermark at the root
++  # TestStream.
++  WATERMARK_CONTROL_TAG = '_TestStream_Watermark'
++
++  def __init__(self, output_tags, coder=coders.FastPrimitivesCoder(),
++               events=None):
++    assert coder is not None
++    self.coder = coder
++    self._raw_events = events
++    self._events = self._add_watermark_advancements(output_tags, events)
++
++  def _watermark_starts(self, output_tags):
++    """Sentinel values to hold the watermark of outputs to -inf.
++
++    The output watermarks of the output PCollections (fake unbounded sources) in
++    a TestStream are controlled by watermark holds. This sets the hold of each
++    output PCollection so that the individual holds can be controlled by the
++    given events.
++    """
++    return [WatermarkEvent(timestamp.MIN_TIMESTAMP, tag) for tag in output_tags]
++
++  def _watermark_stops(self, output_tags):
++    """Sentinel values to close the watermark of outputs."""
++    return [WatermarkEvent(timestamp.MAX_TIMESTAMP, tag) for tag in output_tags]
++
++  def _test_stream_start(self):
++    """Sentinel value to move the watermark hold of the TestStream to +inf.
++
++    This sets a hold to +inf such that the individual holds of the output
++    PCollections are allowed to modify their individial output watermarks with
++    their holds. This is because the calculation of the output watermark is a
++    min over all input watermarks.
++    """
++    return [WatermarkEvent(timestamp.MAX_TIMESTAMP - timestamp.TIME_GRANULARITY,
++                           _TestStream.WATERMARK_CONTROL_TAG)]
++
++  def _test_stream_stop(self):
++    """Sentinel value to close the watermark of the TestStream."""
++    return [WatermarkEvent(timestamp.MAX_TIMESTAMP,
++                           _TestStream.WATERMARK_CONTROL_TAG)]
++
++  def _test_stream_init(self):
++    """Sentinel value to hold the watermark of the TestStream to -inf.
++
++    This sets a hold to ensure that the output watermarks of the output
++    PCollections do not advance to +inf before their watermark holds are set.
++    """
++    return [WatermarkEvent(timestamp.MIN_TIMESTAMP,
++                           _TestStream.WATERMARK_CONTROL_TAG)]
++
++  def _set_up(self, output_tags):
++    return (self._test_stream_init()
++            + self._watermark_starts(output_tags)
++            + self._test_stream_start())
++
++  def _tear_down(self, output_tags):
++    return self._watermark_stops(output_tags) + self._test_stream_stop()
++
++  def _add_watermark_advancements(self, output_tags, events):
++    """Adds watermark advancements to the given events.
++
++    The following watermark advancements can be done on the runner side.
++    However, it makes the logic on the runner side much more complicated than
++    it needs to be.
++
++    In order for watermarks to be properly advanced in a TestStream, a specific
++    sequence of watermark holds must be sent:
++
++    1. Hold the root watermark at -inf (this prevents the pipeline from
++       immediately returning).
++    2. Hold the watermarks at the WatermarkControllerss at -inf (this prevents
++       the pipeline from immediately returning).
++    3. Advance the root watermark to +inf - 1 (this allows the downstream
++       WatermarkControllers to control their watermarks via holds).
++    4. Advance watermarks as normal.
++    5. Advance WatermarkController watermarks to +inf
++    6. Advance root watermark to +inf.
++    """
++    if not events:
++      return []
++
++    return self._set_up(output_tags) + events + self._tear_down(output_tags)
++
++  def get_windowing(self, unused_inputs):
++    return core.Windowing(window.GlobalWindows())
++
++  def expand(self, pcoll):
++    return pvalue.PCollection(pcoll.pipeline, is_bounded=False)
++
++  def _infer_output_coder(self, input_type=None, input_coder=None):
++    return self.coder
++
++  def _events_from_script(self, index):
++    yield self._events[index]
++
++  def events(self, index):
++    return self._events_from_script(index)
++
++  def begin(self):
++    return 0
++
++  def end(self, index):
++    return index >= len(self._events)
++
++  def next(self, index):
++    return index + 1
+diff --git a/sdks/python/apache_beam/runners/direct/transform_evaluator.py b/sdks/python/apache_beam/runners/direct/transform_evaluator.py
+index 0d7ddaa9843..ff73aab674c 100644
+--- a/sdks/python/apache_beam/runners/direct/transform_evaluator.py
++++ b/sdks/python/apache_beam/runners/direct/transform_evaluator.py
+@@ -50,14 +50,14 @@ from apache_beam.runners.direct.direct_userstate import DirectUserStateContext
+ from apache_beam.runners.direct.sdf_direct_runner import ProcessElements
+ from apache_beam.runners.direct.sdf_direct_runner import ProcessFn
+ from apache_beam.runners.direct.sdf_direct_runner import SDFProcessElementInvoker
++from apache_beam.runners.direct.test_stream_impl import _TestStream
++from apache_beam.runners.direct.test_stream_impl import _WatermarkController
+ from apache_beam.runners.direct.util import KeyedWorkItem
+ from apache_beam.runners.direct.util import TransformResult
+ from apache_beam.runners.direct.watermark_manager import WatermarkManager
+ from apache_beam.testing.test_stream import ElementEvent
+ from apache_beam.testing.test_stream import ProcessingTimeEvent
+ from apache_beam.testing.test_stream import WatermarkEvent
+-from apache_beam.testing.test_stream import _TestStream
+-from apache_beam.testing.test_stream import _WatermarkController
+ from apache_beam.transforms import core
+ from apache_beam.transforms.trigger import InMemoryUnmergedState
+ from apache_beam.transforms.trigger import TimeDomain
+diff --git a/sdks/python/apache_beam/testing/test_stream.py b/sdks/python/apache_beam/testing/test_stream.py
+index 8429f20235c..ff54fe2d571 100644
+--- a/sdks/python/apache_beam/testing/test_stream.py
++++ b/sdks/python/apache_beam/testing/test_stream.py
+@@ -28,7 +28,6 @@ from functools import total_ordering
+ 
+ from future.utils import with_metaclass
+ 
+-import apache_beam as beam
+ from apache_beam import coders
+ from apache_beam import pvalue
+ from apache_beam.portability import common_urns
+@@ -171,47 +170,24 @@ class TestStream(PTransform):
+   output.
+   """
+ 
+-  def __init__(self, coder=coders.FastPrimitivesCoder(), events=()):
++  def __init__(self, coder=coders.FastPrimitivesCoder(), events=None):
+     super(TestStream, self).__init__()
+     assert coder is not None
+     self.coder = coder
+     self.watermarks = {None: timestamp.MIN_TIMESTAMP}
+-    self._events = list(events)
++    self._events = [] if events is None else list(events)
+     self.output_tags = set()
+ 
+   def get_windowing(self, unused_inputs):
+     return core.Windowing(window.GlobalWindows())
+ 
++  def _infer_output_coder(self, input_type=None, input_coder=None):
++    return self.coder
++
+   def expand(self, pbegin):
+     assert isinstance(pbegin, pvalue.PBegin)
+     self.pipeline = pbegin.pipeline
+-
+-    # This multiplexing the  multiple output PCollections.
+-    def mux(event):
+-      if event.tag:
+-        yield pvalue.TaggedOutput(event.tag, event)
+-      else:
+-        yield event
+-    mux_output = (pbegin
+-                  | _TestStream(self.output_tags, events=self._events)
+-                  | 'TestStream Multiplexer' >> beam.ParDo(mux).with_outputs())
+-
+-    # Apply a way to control the watermark per output. It is necessary to
+-    # have an individual _WatermarkController per PCollection because the
+-    # calculation of the input watermark of a transform is based on the event
+-    # timestamp of the elements flowing through it. Meaning, it is impossible
+-    # to control the output watermarks of the individual PCollections solely
+-    # on the event timestamps.
+-    outputs = {}
+-    for tag in self.output_tags:
+-      label = '_WatermarkController[{}]'.format(tag)
+-      outputs[tag] = (mux_output[tag] | label >> _WatermarkController())
+-
+-    # Downstream consumers expect a PCollection if there is only a single
+-    # output.
+-    if len(outputs) == 1:
+-      return list(outputs.values())[0]
+-    return outputs
++    return pvalue.PCollection(self.pipeline, is_bounded=False)
+ 
+   def _add(self, event):
+     if isinstance(event, ElementEvent):
+@@ -303,141 +279,3 @@ class TestStream(PTransform):
+     return TestStream(
+         coder=coder,
+         events=[Event.from_runner_api(e, coder) for e in payload.events])
+-
+-
+-class _WatermarkController(PTransform):
+-  """A runner-overridable PTransform Primitive to control the watermark.
+-
+-  Expected implementation behavior:
+-   - If the instance recieves a WatermarkEvent, it sets its output watermark to
+-     the specified value then drops the event.
+-   - If the instance receives an ElementEvent, it emits all specified elements
+-     to the Global Window with the event time set to the element's timestamp.
+-  """
+-  def get_windowing(self, _):
+-    return core.Windowing(window.GlobalWindows())
+-
+-  def expand(self, pcoll):
+-    return pvalue.PCollection.from_(pcoll)
+-
+-
+-class _TestStream(PTransform):
+-  """Test stream that generates events on an unbounded PCollection of elements.
+-
+-  Each event emits elements, advances the watermark or advances the processing
+-  time.  After all of the specified elements are emitted, ceases to produce
+-  output.
+-
+-  Expected implementation behavior:
+-   - If the instance receives a WatermarkEvent with the WATERMARK_CONTROL_TAG
+-     then the instance sets its own watermark hold at the specified value and
+-     drops the event.
+-   - If the instance receives any other WatermarkEvent or ElementEvent, it
+-     passes it to the consumer.
+-  """
+-
+-  # This tag is used on WatermarkEvents to control the watermark at the root
+-  # TestStream.
+-  WATERMARK_CONTROL_TAG = '_TestStream_Watermark'
+-
+-  def __init__(self, output_tags, coder=coders.FastPrimitivesCoder(),
+-               events=None):
+-    assert coder is not None
+-    self.coder = coder
+-    self._events = self._add_watermark_advancements(output_tags, events)
+-
+-  def _watermark_starts(self, output_tags):
+-    """Sentinel values to hold the watermark of outputs to -inf.
+-
+-    The output watermarks of the output PCollections (fake unbounded sources) in
+-    a TestStream are controlled by watermark holds. This sets the hold of each
+-    output PCollection so that the individual holds can be controlled by the
+-    given events.
+-    """
+-    return [WatermarkEvent(timestamp.MIN_TIMESTAMP, tag) for tag in output_tags]
+-
+-  def _watermark_stops(self, output_tags):
+-    """Sentinel values to close the watermark of outputs."""
+-    return [WatermarkEvent(timestamp.MAX_TIMESTAMP, tag) for tag in output_tags]
+-
+-  def _test_stream_start(self):
+-    """Sentinel value to move the watermark hold of the TestStream to +inf.
+-
+-    This sets a hold to +inf such that the individual holds of the output
+-    PCollections are allowed to modify their individial output watermarks with
+-    their holds. This is because the calculation of the output watermark is a
+-    min over all input watermarks.
+-    """
+-    return [WatermarkEvent(timestamp.MAX_TIMESTAMP - timestamp.TIME_GRANULARITY,
+-                           _TestStream.WATERMARK_CONTROL_TAG)]
+-
+-  def _test_stream_stop(self):
+-    """Sentinel value to close the watermark of the TestStream."""
+-    return [WatermarkEvent(timestamp.MAX_TIMESTAMP,
+-                           _TestStream.WATERMARK_CONTROL_TAG)]
+-
+-  def _test_stream_init(self):
+-    """Sentinel value to hold the watermark of the TestStream to -inf.
+-
+-    This sets a hold to ensure that the output watermarks of the output
+-    PCollections do not advance to +inf before their watermark holds are set.
+-    """
+-    return [WatermarkEvent(timestamp.MIN_TIMESTAMP,
+-                           _TestStream.WATERMARK_CONTROL_TAG)]
+-
+-  def _set_up(self, output_tags):
+-    return (self._test_stream_init()
+-            + self._watermark_starts(output_tags)
+-            + self._test_stream_start())
+-
+-  def _tear_down(self, output_tags):
+-    return self._watermark_stops(output_tags) + self._test_stream_stop()
+-
+-  def _add_watermark_advancements(self, output_tags, events):
+-    """Adds watermark advancements to the given events.
+-
+-    The following watermark advancements can be done on the runner side.
+-    However, it makes the logic on the runner side much more complicated than
+-    it needs to be.
+-
+-    In order for watermarks to be properly advanced in a TestStream, a specific
+-    sequence of watermark holds must be sent:
+-
+-    1. Hold the root watermark at -inf (this prevents the pipeline from
+-       immediately returning).
+-    2. Hold the watermarks at the WatermarkControllerss at -inf (this prevents
+-       the pipeline from immediately returning).
+-    3. Advance the root watermark to +inf - 1 (this allows the downstream
+-       WatermarkControllers to control their watermarks via holds).
+-    4. Advance watermarks as normal.
+-    5. Advance WatermarkController watermarks to +inf
+-    6. Advance root watermark to +inf.
+-    """
+-    if not events:
+-      return []
+-
+-    return self._set_up(output_tags) + events + self._tear_down(output_tags)
+-
+-  def get_windowing(self, unused_inputs):
+-    return core.Windowing(window.GlobalWindows())
+-
+-  def expand(self, pcoll):
+-    return pvalue.PCollection(pcoll.pipeline, is_bounded=False)
+-
+-  def _infer_output_coder(self, input_type=None, input_coder=None):
+-    return self.coder
+-
+-  def _events_from_script(self, index):
+-    yield self._events[index]
+-
+-  def events(self, index):
+-    return self._events_from_script(index)
+-
+-  def begin(self):
+-    return 0
+-
+-  def end(self, index):
+-    return index >= len(self._events)
+-
+-  def next(self, index):
+-    return index + 1
+diff --git a/sdks/python/apache_beam/testing/test_stream_it_test.py b/sdks/python/apache_beam/testing/test_stream_it_test.py
+new file mode 100644
+index 00000000000..8e724f654ff
+--- /dev/null
++++ b/sdks/python/apache_beam/testing/test_stream_it_test.py
+@@ -0,0 +1,237 @@
++#
++# Licensed to the Apache Software Foundation (ASF) under one or more
++# contributor license agreements.  See the NOTICE file distributed with
++# this work for additional information regarding copyright ownership.
++# The ASF licenses this file to You under the Apache License, Version 2.0
++# (the "License"); you may not use this file except in compliance with
++# the License.  You may obtain a copy of the License at
++#
++#    http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++#
++
++"""Integration tests for the test_stream module."""
++
++from __future__ import absolute_import
++
++import unittest
++from functools import wraps
++
++from nose.plugins.attrib import attr
++
++import apache_beam as beam
++from apache_beam.options.pipeline_options import StandardOptions
++from apache_beam.testing.test_pipeline import TestPipeline
++from apache_beam.testing.test_stream import TestStream
++from apache_beam.testing.util import assert_that
++from apache_beam.testing.util import equal_to
++from apache_beam.testing.util import equal_to_per_window
++from apache_beam.transforms import trigger
++from apache_beam.transforms import window
++from apache_beam.transforms.window import FixedWindows
++from apache_beam.transforms.window import TimestampedValue
++from apache_beam.utils import timestamp
++from apache_beam.utils.timestamp import Timestamp
++
++
++def supported(runners):
++  if not isinstance(runners, list):
++    runners = [runners]
++
++  def inner(fn):
++    @wraps(fn)
++    def wrapped(self):
++      if self.runner_name not in runners:
++        self.skipTest('The "{}", does not support the TestStream transform. Supported runners: {}'.format(
++            self.runner_name, runners))
++      else:
++        return fn(self)
++    return wrapped
++  return inner
++
++
++class TestStreamIntegrationTests(unittest.TestCase):
++
++  @classmethod
++  def setUpClass(cls):
++    cls.test_pipeline = TestPipeline(is_integration_test=True)
++    cls.args = cls.test_pipeline.get_full_options_as_args()
++    cls.runner_name = type(cls.test_pipeline.runner).__name__
++    cls.project = cls.test_pipeline.get_option('project')
++
++  @supported(['DirectRunner', 'SwitchingDirectRunner'])
++  @attr('IT')
++  def test_basic_execution(self):
++    test_stream = (TestStream()
++                   .advance_watermark_to(10)
++                   .add_elements(['a', 'b', 'c'])
++                   .advance_watermark_to(20)
++                   .add_elements(['d'])
++                   .add_elements(['e'])
++                   .advance_processing_time(10)
++                   .advance_watermark_to(300)
++                   .add_elements([TimestampedValue('late', 12)])
++                   .add_elements([TimestampedValue('last', 310)])
++                   .advance_watermark_to_infinity())
++
++    class RecordFn(beam.DoFn):
++
++      def process(self, element=beam.DoFn.ElementParam,
++                  timestamp=beam.DoFn.TimestampParam):
++        yield (element, timestamp)
++
++    with beam.Pipeline(argv=self.args) as p:
++      my_record_fn = RecordFn()
++      records = p | test_stream | beam.ParDo(my_record_fn)
++
++      assert_that(records, equal_to([
++          ('a', timestamp.Timestamp(10)),
++          ('b', timestamp.Timestamp(10)),
++          ('c', timestamp.Timestamp(10)),
++          ('d', timestamp.Timestamp(20)),
++          ('e', timestamp.Timestamp(20)),
++          ('late', timestamp.Timestamp(12)),
++          ('last', timestamp.Timestamp(310)),]))
++
++  @supported(['DirectRunner', 'SwitchingDirectRunner'])
++  @attr('IT')
++  def test_multiple_outputs(self):
++    """Tests that the TestStream supports emitting to multiple PCollections."""
++    letters_elements = [
++        TimestampedValue('a', 6),
++        TimestampedValue('b', 7),
++        TimestampedValue('c', 8),
++    ]
++    numbers_elements = [
++        TimestampedValue('1', 11),
++        TimestampedValue('2', 12),
++        TimestampedValue('3', 13),
++    ]
++    test_stream = (TestStream()
++                   .advance_watermark_to(5, tag='letters')
++                   .add_elements(letters_elements, tag='letters')
++                   .advance_watermark_to(10, tag='numbers')
++                   .add_elements(numbers_elements, tag='numbers'))
++
++    class RecordFn(beam.DoFn):
++      def process(self, element=beam.DoFn.ElementParam,
++                  timestamp=beam.DoFn.TimestampParam):
++        yield (element, timestamp)
++
++    options = StandardOptions(streaming=True)
++    p = TestPipeline(is_integration_test=True, options=options)
++
++    main = p | test_stream
++    letters = main['letters'] | 'record letters' >> beam.ParDo(RecordFn())
++    numbers = main['numbers'] | 'record numbers' >> beam.ParDo(RecordFn())
++
++    assert_that(letters, equal_to([
++        ('a', Timestamp(6)),
++        ('b', Timestamp(7)),
++        ('c', Timestamp(8))]), label='assert letters')
++
++    assert_that(numbers, equal_to([
++        ('1', Timestamp(11)),
++        ('2', Timestamp(12)),
++        ('3', Timestamp(13))]), label='assert numbers')
++
++    p.run()
++
++  @supported(['DirectRunner', 'SwitchingDirectRunner'])
++  @attr('IT')
++  def test_multiple_outputs_with_watermark_advancement(self):
++    """Tests that the TestStream can independently control output watermarks."""
++
++    # Purposely set the watermark of numbers to 20 then letters to 5 to test
++    # that the watermark advancement is per PCollection.
++    #
++    # This creates two PCollections, (a, b, c) and (1, 2, 3). These will be
++    # emitted at different times so that they will have different windows. The
++    # watermark advancement is checked by checking their windows. If the
++    # watermark does not advance, then the windows will be [-inf, -inf). If the
++    # windows do not advance separately, then the PCollections will both
++    # windowed in [15, 30).
++    letters_elements = [
++        TimestampedValue('a', 6),
++        TimestampedValue('b', 7),
++        TimestampedValue('c', 8),
++    ]
++    numbers_elements = [
++        TimestampedValue('1', 21),
++        TimestampedValue('2', 22),
++        TimestampedValue('3', 23),
++    ]
++    test_stream = (TestStream()
++                   .advance_watermark_to(0, tag='letters')
++                   .advance_watermark_to(0, tag='numbers')
++                   .advance_watermark_to(20, tag='numbers')
++                   .advance_watermark_to(5, tag='letters')
++                   .add_elements(letters_elements, tag='letters')
++                   .advance_watermark_to(10, tag='letters')
++                   .add_elements(numbers_elements, tag='numbers')
++                   .advance_watermark_to(30, tag='numbers'))
++
++    options = StandardOptions(streaming=True)
++    p = TestPipeline(is_integration_test=True, options=options)
++
++    main = p | test_stream
++
++    # Use an AfterWatermark trigger with an early firing to test that the
++    # watermark is advancing properly and that the element is being emitted in
++    # the correct window.
++    letters = (main['letters']
++               | 'letter windows' >> beam.WindowInto(
++                   FixedWindows(15),
++                   trigger=trigger.AfterWatermark(early=trigger.AfterCount(1)),
++                   accumulation_mode=trigger.AccumulationMode.DISCARDING)
++               | 'letter with key' >> beam.Map(lambda x: ('k', x))
++               | 'letter gbk' >> beam.GroupByKey())
++
++    numbers = (main['numbers']
++               | 'number windows' >> beam.WindowInto(
++                   FixedWindows(15),
++                   trigger=trigger.AfterWatermark(early=trigger.AfterCount(1)),
++                   accumulation_mode=trigger.AccumulationMode.DISCARDING)
++               | 'number with key' >> beam.Map(lambda x: ('k', x))
++               | 'number gbk' >> beam.GroupByKey())
++
++    # The letters were emitted when the watermark was at 5, thus we expect to
++    # see the elements in the [0, 15) window. We used an early trigger to make
++    # sure that the ON_TIME empty pane was also emitted with a TestStream.
++    # This pane has no data because of the early trigger causes the elements to
++    # fire before the end of the window and because the accumulation mode
++    # discards any data after the trigger fired.
++    expected_letters = {
++        window.IntervalWindow(0, 15): [
++            ('k', ['a', 'b', 'c']),
++            ('k', []),
++        ],
++    }
++
++    # Same here, except the numbers were emitted at watermark = 20, thus they
++    # are in the [15, 30) window.
++    expected_numbers = {
++        window.IntervalWindow(15, 30): [
++            ('k', ['1', '2', '3']),
++            ('k', []),
++        ],
++    }
++    assert_that(
++        letters,
++        equal_to_per_window(expected_letters),
++        label='letters assert per window')
++    assert_that(
++        numbers,
++        equal_to_per_window(expected_numbers),
++        label='numbers assert per window')
++
++    p.run()
++
++
++if __name__ == '__main__':
++  unittest.main()

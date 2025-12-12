@@ -6,6 +6,8 @@ import os
 import sys
 import requests  
 import requests.adapters 
+import json
+import time
 from urllib.parse import urlparse, urlunparse 
 
 # Read debug flag from environment variable
@@ -27,7 +29,7 @@ def get_http_session():
     return _session
 
 
-def download_report_data(uri, save_to):
+def download_report_data(uri, save_to, tracker_base_url=None):
     """
     从指定的 URI 下载报告数据并保存到本地文件。
     """
@@ -36,11 +38,18 @@ def download_report_data(uri, save_to):
     api_uri = uri
     
     try:
+        base_jira_url = None
+
+        if tracker_base_url and 'jira' in tracker_base_url.lower() and tracker_base_url in uri:
+            base_jira_url = tracker_base_url.rstrip('/') + '/'
+        elif 'issues.apache.org/jira/' in uri:
+            base_jira_url = 'https://issues.apache.org/jira/'
+
         # check and convert known issue tracker URLs to API/raw data URLs
-        if 'issues.apache.org/jira/' in uri:
+        if base_jira_url:
             issue_key = uri.split('/')[-1].split('?')[0] # 移除可能的查询参数
-            api_uri = f"https://issues.apache.org/jira/si/jira.issueviews:issue-xml/{issue_key}/{issue_key}.xml"
-            print(f"  -> [JIRA] Remapped to XML view", end="")
+            api_uri = f"{base_jira_url}si/jira.issueviews:issue-xml/{issue_key}/{issue_key}.xml"
+            print(f"  -> [JIRA] Remapped to XML view")
 
         elif 'github.com/' in uri and '/issues/' in uri and 'api.github.com' not in uri:
             parts = urlparse(uri).path.split('/')
@@ -49,44 +58,80 @@ def download_report_data(uri, save_to):
                 repo = parts[2]
                 issue_num = parts[4]
                 api_uri = f"https://api.github.com/repos/{org}/{repo}/issues/{issue_num}"
-                print(f"  -> [GitHub] Remapped to API view", end="")
-                if os.environ.get('GH_TOKEN'):
-                    headers['Authorization'] = f"token {os.environ['GH_TOKEN']}"
+                print(f"  -> [GitHub] Remapped to API view")
 
         elif 'bugzilla' in uri and 'show_bug.cgi?id=' in uri:
             parsed_url = urlparse(uri)
             api_uri = urlunparse(parsed_url._replace(query=f"ctype=xml&{parsed_url.query}"))
-            print(f"  -> [Bugzilla] Remapped to XML view", end="")
+            print(f"  -> [Bugzilla] Remapped to XML view")
 
         elif 'sourceforge.net/p/' in uri and '/bugs/' in uri:
             api_uri = uri.replace('/p/', '/rest/p/')
             if not api_uri.endswith('/'):
                 api_uri += '/'
-            print(f"  -> [SourceForge] Remapped to REST API", end="")
+            print(f"  -> [SourceForge] Remapped to REST API")
         
         elif 'storage.googleapis.com/google-code-archive' in uri and uri.endswith('.json'):
-            print(f"  -> [Google Code] Using direct JSON URL", end="")
+            print(f"  -> [Google Code] Using direct JSON URL")
         
-        else:
-            print(f"  -> [Unknown] Attempting direct download", end="")
+        elif 'timeline' in uri:
+            print(f"  -> [GitHub] Downloading timeline JSON")
 
-        
-        response = session.get(api_uri, headers=headers, timeout=20)
-        response.raise_for_status()
-        
+        else:
+            print(f"  -> [Unknown] Attempting direct download")
+
+        if 'api.github.com' in api_uri and os.environ.get('GH_TOKEN'):
+            headers['Authorization'] = f"token {os.environ.get('GH_TOKEN')}"
+            # print(f"  -> [GitHub] Using token for authentication")
+
+        max_app_retries = 4
+        retry_delay = 15
+        response_text = None
+
+        for attempt in range(max_app_retries):
+            try:
+                response = session.get(api_uri, headers=headers, timeout=30)
+                response.raise_for_status()
+                response_text = response.text
+                break
+            except requests.exceptions.RequestException as e:
+                if attempt == 0:
+                    print("FAIL", file=sys.stderr) 
+                
+                print(f"  -> (Attempt {attempt + 1}/{max_app_retries}) Error downloading {api_uri}: {e}", file=sys.stderr)
+                
+                if 'Network is unreachable' in str(e) or 'Name or service not known' in str(e) or 'Failed to establish a new connection' in str(e):
+                    print(f"  -> Transient network error detected. Retrying in {retry_delay}s...", file=sys.stderr)
+                elif hasattr(e, 'response') and e.response is not None and e.response.status_code in [502, 503, 504, 520, 524]:
+                     print(f"  -> Server error {e.response.status_code} (Gateway/Timeout). Retrying in {retry_delay}s...", file=sys.stderr)
+                
+                if attempt + 1 == max_app_retries:
+                    print(f"  -> CRITICAL: Giving up on {api_uri} after {max_app_retries} extra attempts.", file=sys.stderr)
+                    if os.path.exists(save_to):
+                        os.remove(save_to)
+                    return False
+                
+                time.sleep(retry_delay)
+                retry_delay *= 2 # 指数退避 (15s, 30s, 60s)
+
+        if response_text is None:
+            if os.path.exists(save_to):
+                os.remove(save_to)
+            return False
+
         with open(save_to, 'w', encoding='utf-8') as f:
-            f.write(response.text)
-        print("OK", file=sys.stderr)
+            f.write(response_text)
+        
+        if 'FAIL' not in locals().get('fail_printed', ''):
+             print("OK", file=sys.stderr)
+        else:
+             print("  -> RECOVERED", file=sys.stderr)
+
         return True
-    except requests.exceptions.RequestException as e:
-        print("FAIL", file=sys.stderr)
-        print(f"  -> Error downloading {api_uri}: {e}", file=sys.stderr)
-        if os.path.exists(save_to):
-            os.remove(save_to) 
-        return False
+    
     except Exception as e:
         print("FAIL", file=sys.stderr)
-        print(f"  -> An unexpected error occurred: {e}", file=sys.stderr)
+        print(f"  -> An unexpected error occurred (pre-download): {e}", file=sys.stderr)
         if os.path.exists(save_to):
             os.remove(save_to)
         return False
@@ -104,6 +149,11 @@ def exec_cmd(cmd_list, desc, output_file=None):
         print("FAIL", file=sys.stderr)
         print(f"Internal Error: exec_cmd now requires 'cmd' to be a list.", file=sys.stderr)
         return False, "exec_cmd requires list"
+
+    emd_env = os.environ.copy()
+
+    if cmd_list and 'git' in cmd_list[0]:
+        emd_env['GIT_TERMINAL_PROMPT'] = '0'  # disable git prompts
         
     try:
         stdout_handle = None
@@ -119,7 +169,10 @@ def exec_cmd(cmd_list, desc, output_file=None):
                     stderr=subprocess.PIPE, 
                     text=True,
                     encoding='utf-8',
-                    errors='ignore'
+                    errors='ignore',
+                    stdin=subprocess.DEVNULL,
+                    timeout=5400,
+                    env=emd_env
                 )
                 log = f"(stdout written to {output_file})\n" + (result.stderr or "")
             except IOError as e:
@@ -137,7 +190,10 @@ def exec_cmd(cmd_list, desc, output_file=None):
                 capture_output=True, 
                 text=True,
                 encoding='utf-8',
-                errors='ignore'
+                errors='ignore',
+                stdin=subprocess.DEVNULL,
+                timeout=5400,
+                env=emd_env
             )
             log = (result.stdout or "") + (result.stderr or "")
         

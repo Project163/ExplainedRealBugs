@@ -29,8 +29,8 @@ DEFAULT_LABELS = [
 LABELS_STRING = ", ".join(DEFAULT_LABELS)
 
 # Input and output files
-INPUT_FILE = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'bug_classification', 'parsed_data.jsonl'))
-OUTPUT_FILE = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'bug_classification', 'classified_data_llm.jsonl'))
+INPUT_FILE = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'bug-classification', 'parsed_data.jsonl'))
+OUTPUT_FILE = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'bug-classification', 'classified_data_llm.jsonl'))
 
 # Concurrency settings
 MAX_WORKERS = 10  # Adjust according to API limits

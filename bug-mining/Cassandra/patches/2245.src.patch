@@ -1,0 +1,159 @@
+diff --git a/CHANGES.txt b/CHANGES.txt
+index 7b529ba038..45da6232db 100644
+--- a/CHANGES.txt
++++ b/CHANGES.txt
+@@ -5,6 +5,7 @@
+  * Support range tombstones in thrift (CASSANDRA-5435)
+  * Normalize table-manipulating CQL3 statements' class names (CASSANDRA-5759)
+  * cqlsh: add missing table options to DESCRIBE output (CASSANDRA-5749)
++ * Fix assertion error during repair (CASSANDRA-5757)
+ 
+ 2.0.0-beta1
+  * Removed on-heap row cache (CASSANDRA-5348)
+diff --git a/src/java/org/apache/cassandra/db/DataRange.java b/src/java/org/apache/cassandra/db/DataRange.java
+index d764d60fc8..713027c143 100644
+--- a/src/java/org/apache/cassandra/db/DataRange.java
++++ b/src/java/org/apache/cassandra/db/DataRange.java
+@@ -47,8 +47,6 @@ public class DataRange
+ 
+     public DataRange(AbstractBounds<RowPosition> range, IDiskAtomFilter columnFilter)
+     {
+-        assert !(range instanceof Range) || !((Range)range).isWrapAround() || range.right.isMinimum() : range;
+-
+         this.keyRange = range;
+         this.columnFilter = columnFilter;
+         this.selectFullRow = columnFilter instanceof SliceQueryFilter
+@@ -89,6 +87,13 @@ public class DataRange
+         return keyRange.right;
+     }
+ 
++    // Whether the bounds of this DataRange actually wraps around.
++    public boolean isWrapAround()
++    {
++        // On range can ever wrap
++        return keyRange instanceof Range && ((Range)keyRange).isWrapAround();
++    }
++
+     public boolean contains(RowPosition pos)
+     {
+         return keyRange.contains(pos);
+@@ -127,6 +132,10 @@ public class DataRange
+         {
+             super(range, filter);
+ 
++            // When using a paging range, we don't allow wrapped ranges, as it's unclear how to handle them properly.
++            // This is ok for now since we only need this in range slice queries, and the range are "unwrapped" in that case.
++            assert !(range instanceof Range) || !((Range)range).isWrapAround() || range.right.isMinimum() : range;
++
+             this.sliceFilter = filter;
+             this.comparator = comparator;
+             this.columnStart = columnStart;
+diff --git a/src/java/org/apache/cassandra/io/sstable/SSTableReader.java b/src/java/org/apache/cassandra/io/sstable/SSTableReader.java
+index c4f32cb864..44a1b7789a 100644
+--- a/src/java/org/apache/cassandra/io/sstable/SSTableReader.java
++++ b/src/java/org/apache/cassandra/io/sstable/SSTableReader.java
+@@ -1028,11 +1028,10 @@ public class SSTableReader extends SSTable
+         if (range == null)
+             return getScanner(limiter);
+ 
+-        Iterator<Pair<Long, Long>> rangeIterator = getPositionsForRanges(Collections.singletonList(range)).iterator();
+-        if (rangeIterator.hasNext())
+-            return new SSTableScanner(this, DataRange.forKeyRange(range), limiter);
+-        else
+-            return new EmptyCompactionScanner(getFilename());
++        // We want to avoid allocating a SSTableScanner if the range don't overlap the sstable (#5249)
++        return range.intersects(new Bounds(first.token, last.token))
++             ? new SSTableScanner(this, DataRange.forKeyRange(range), limiter)
++             : new EmptyCompactionScanner(getFilename());
+     }
+ 
+     public FileDataInput getFileDataInput(long position)
+diff --git a/src/java/org/apache/cassandra/io/sstable/SSTableScanner.java b/src/java/org/apache/cassandra/io/sstable/SSTableScanner.java
+index 66e71890f7..d0daad8f73 100644
+--- a/src/java/org/apache/cassandra/io/sstable/SSTableScanner.java
++++ b/src/java/org/apache/cassandra/io/sstable/SSTableScanner.java
+@@ -45,7 +45,21 @@ public class SSTableScanner implements ICompactionScanner
+     protected final RandomAccessReader ifile;
+     public final SSTableReader sstable;
+     private final DataRange dataRange;
+-    private final long stopAt;
++
++    /*
++     * There is 2 cases:
++     *   - Either dataRange is not wrapping, and we just need to read
++     *     everything between startKey and endKey.
++     *   - Or dataRange is wrapping: we must the read everything between
++     *     the beginning of the file and the endKey, and then everything from
++     *     the startKey to the end of the file.
++     *
++     * In the first case, we seek to the start and read until stop. In the
++     * second one, we don't seek just yet, but read until stopAt and then
++     * seek to start (re-adjusting stopAt to be the end of the file in isDone())
++     */
++    private boolean hasSeeked;
++    private long stopAt;
+ 
+     protected Iterator<OnDiskAtomIterator> iterator;
+ 
+@@ -63,11 +77,16 @@ public class SSTableScanner implements ICompactionScanner
+         this.sstable = sstable;
+         this.dataRange = dataRange;
+         this.stopAt = computeStopAt();
+-        seekToStart();
++
++        // If we wrap (stopKey == minimum don't count), we'll seek to start *after* having read from beginning till stopAt
++        if (dataRange.stopKey().isMinimum(sstable.partitioner) || !dataRange.isWrapAround())
++            seekToStart();
+     }
+ 
+     private void seekToStart()
+     {
++        hasSeeked = true;
++
+         if (dataRange.startKey().isMinimum(sstable.partitioner))
+             return;
+ 
+@@ -109,10 +128,10 @@ public class SSTableScanner implements ICompactionScanner
+     private long computeStopAt()
+     {
+         AbstractBounds<RowPosition> keyRange = dataRange.keyRange();
+-        if (dataRange.stopKey().isMinimum(sstable.partitioner) || (keyRange instanceof Range && ((Range)keyRange).isWrapAround()))
++        if (dataRange.stopKey().isMinimum(sstable.partitioner))
+             return dfile.length();
+ 
+-        RowIndexEntry position = sstable.getPosition(keyRange.toRowBounds().right, SSTableReader.Operator.GT);
++        RowIndexEntry position = sstable.getPosition(dataRange.stopKey(), SSTableReader.Operator.GT);
+         return position == null ? dfile.length() : position.position;
+     }
+ 
+@@ -160,6 +179,21 @@ public class SSTableScanner implements ICompactionScanner
+         return new KeyScanningIterator();
+     }
+ 
++    private boolean isDone(long current)
++    {
++        if (current < stopAt)
++            return false;
++
++        if (!hasSeeked)
++        {
++            // We're wrapping, so seek to the start now (which sets hasSeeked)
++            seekToStart();
++            stopAt = dfile.length();
++        }
++        // Re-test now that we might have seeked
++        return current >= stopAt;
++    }
++
+     protected class KeyScanningIterator extends AbstractIterator<OnDiskAtomIterator>
+     {
+         private DecoratedKey nextKey;
+@@ -186,7 +220,7 @@ public class SSTableScanner implements ICompactionScanner
+                 }
+ 
+                 assert currentEntry.position <= stopAt;
+-                if (currentEntry.position == stopAt)
++                if (isDone(currentEntry.position))
+                     return endOfData();
+ 
+                 if (ifile.isEOF())

@@ -1,0 +1,122 @@
+diff --git a/CHANGES.txt b/CHANGES.txt
+index 3e4fd36beb..7aee45bd88 100644
+--- a/CHANGES.txt
++++ b/CHANGES.txt
+@@ -1,4 +1,5 @@
+ 2.1.8
++ * Avoids ballot clash in Paxos (CASSANDRA-9649)
+  * Fix IndexOutOfBoundsException when inserting tuple with too many
+    elements using the string literal notation (CASSANDRA-9559)
+  * Allow JMX over SSL directly from nodetool (CASSANDRA-9090)
+diff --git a/src/java/org/apache/cassandra/cql3/statements/ModificationStatement.java b/src/java/org/apache/cassandra/cql3/statements/ModificationStatement.java
+index 6b0901aa93..3838909b1c 100644
+--- a/src/java/org/apache/cassandra/cql3/statements/ModificationStatement.java
++++ b/src/java/org/apache/cassandra/cql3/statements/ModificationStatement.java
+@@ -655,9 +655,7 @@ public abstract class ModificationStatement implements CQLStatement
+     static ColumnFamily casInternal(CQL3CasRequest request, QueryState state)
+     throws InvalidRequestException
+     {
+-        long millis = state.getTimestamp() / 1000;
+-        long nanos = ((state.getTimestamp() - (millis * 1000)) + 1) * 10;
+-        UUID ballot = UUIDGen.getTimeUUID(millis, nanos);
++        UUID ballot = UUIDGen.getTimeUUIDFromMicros(state.getTimestamp());
+         CFMetaData metadata = Schema.instance.getCFMetaData(request.cfm.ksName, request.cfm.cfName);
+ 
+         ReadCommand readCommand = ReadCommand.create(request.cfm.ksName, request.key, request.cfm.cfName, request.now, request.readFilter());
+diff --git a/src/java/org/apache/cassandra/service/ClientState.java b/src/java/org/apache/cassandra/service/ClientState.java
+index 5ea3d0c11e..23eec73501 100644
+--- a/src/java/org/apache/cassandra/service/ClientState.java
++++ b/src/java/org/apache/cassandra/service/ClientState.java
+@@ -98,8 +98,9 @@ public class ClientState
+     // The remote address of the client - null for internal clients.
+     private final SocketAddress remoteAddress;
+ 
+-    // The biggest timestamp that was returned by getTimestamp/assigned to a query
+-    private final AtomicLong lastTimestampMicros = new AtomicLong(0);
++    // The biggest timestamp that was returned by getTimestamp/assigned to a query. This is global to the VM
++    // for the sake of paxos (see #9649).
++    private static final AtomicLong lastTimestampMicros = new AtomicLong(0);
+ 
+     /**
+      * Construct a new, empty ClientState for internal calls.
+@@ -151,18 +152,18 @@ public class ClientState
+     }
+ 
+     /**
+-     * Can be use when a timestamp has been assigned by a query, but that timestamp is
+-     * not directly one returned by getTimestamp() (see SP.beginAndRepairPaxos()).
+-     * This ensure following calls to getTimestamp() will return a timestamp strictly
+-     * greated than the one provided to this method.
++     * This is the same than {@link #getTimestamp()} but this guarantees that the returned timestamp
++     * will not be smaller than the provided {@code minTimestampToUse}.
+      */
+-    public void updateLastTimestamp(long tstampMicros)
++    public long getTimestamp(long minTimestampToUse)
+     {
+         while (true)
+         {
++            long current = Math.max(System.currentTimeMillis() * 1000, minTimestampToUse);
+             long last = lastTimestampMicros.get();
+-            if (tstampMicros <= last || lastTimestampMicros.compareAndSet(last, tstampMicros))
+-                return;
++            long tstamp = last >= current ? last + 1 : current;
++            if (lastTimestampMicros.compareAndSet(last, tstamp))
++                return tstamp;
+         }
+     }
+ 
+diff --git a/src/java/org/apache/cassandra/service/StorageProxy.java b/src/java/org/apache/cassandra/service/StorageProxy.java
+index b76c2311ae..0045006db6 100644
+--- a/src/java/org/apache/cassandra/service/StorageProxy.java
++++ b/src/java/org/apache/cassandra/service/StorageProxy.java
+@@ -356,14 +356,13 @@ public class StorageProxy implements StorageProxyMBean
+         int contentions = 0;
+         while (System.nanoTime() - start < timeout)
+         {
+-            // We don't want to use a timestamp that is older than the last one assigned by the ClientState or operations
+-            // may appear out-of-order (#7801). But note that state.getTimestamp() is in microseconds while the ballot
+-            // timestamp is only in milliseconds
+-            long currentTime = (state.getTimestamp() / 1000) + 1;
+-            long ballotMillis = summary == null
+-                              ? currentTime
+-                              : Math.max(currentTime, 1 + UUIDGen.unixTimestamp(summary.mostRecentInProgressCommit.ballot));
+-            UUID ballot = UUIDGen.getTimeUUID(ballotMillis);
++            // We want a timestamp that is guaranteed to be unique for that node (so that the ballot is globally unique), but if we've got a prepare rejected
++            // already we also want to make sure we pick a timestamp that has a chance to be promised, i.e. one that is greater that the most recently known
++            // in progress (#5667). Lastly, we don't want to use a timestamp that is older than the last one assigned by ClientState or operations may appear
++            // out-of-order (#7801).
++            long minTimestampMicrosToUse = summary == null ? Long.MIN_VALUE : 1 + UUIDGen.microsTimestamp(summary.mostRecentInProgressCommit.ballot);
++            long ballotMicros = state.getTimestamp(minTimestampMicrosToUse);
++            UUID ballot = UUIDGen.getTimeUUIDFromMicros(ballotMicros);
+ 
+             // prepare
+             Tracing.trace("Preparing {}", ballot);
+@@ -429,10 +428,6 @@ public class StorageProxy implements StorageProxyMBean
+                 continue;
+             }
+ 
+-            // We might commit this ballot and we want to ensure operations starting after this CAS succeed will be assigned
+-            // a timestamp greater that the one of this ballot, so operation order is preserved (#7801)
+-            state.updateLastTimestamp(ballotMillis * 1000);
+-
+             return Pair.create(ballot, contentions);
+         }
+ 
+diff --git a/src/java/org/apache/cassandra/utils/UUIDGen.java b/src/java/org/apache/cassandra/utils/UUIDGen.java
+index 54347ffaf6..706c8a6d74 100644
+--- a/src/java/org/apache/cassandra/utils/UUIDGen.java
++++ b/src/java/org/apache/cassandra/utils/UUIDGen.java
+@@ -82,6 +82,13 @@ public class UUIDGen
+         return new UUID(createTime(fromUnixTimestamp(when)), clockSeqAndNode);
+     }
+ 
++    public static UUID getTimeUUIDFromMicros(long whenInMicros)
++    {
++        long whenInMillis = whenInMicros / 1000;
++        long nanos = (whenInMicros - (whenInMillis * 1000)) * 10;
++        return getTimeUUID(whenInMillis, nanos);
++    }
++
+     public static UUID getTimeUUID(long when, long nanos)
+     {
+         return new UUID(createTime(fromUnixTimestamp(when, nanos)), clockSeqAndNode);

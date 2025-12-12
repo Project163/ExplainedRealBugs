@@ -1,0 +1,1029 @@
+diff --git a/oak-core/src/main/java/org/apache/jackrabbit/oak/security/user/CachedPrincipalMembershipReader.java b/oak-core/src/main/java/org/apache/jackrabbit/oak/security/user/CachedPrincipalMembershipReader.java
+new file mode 100644
+index 0000000000..9bf016ee5f
+--- /dev/null
++++ b/oak-core/src/main/java/org/apache/jackrabbit/oak/security/user/CachedPrincipalMembershipReader.java
+@@ -0,0 +1,246 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.jackrabbit.oak.security.user;
++
++import org.apache.jackrabbit.guava.common.base.Joiner;
++import org.apache.jackrabbit.guava.common.base.Strings;
++import org.apache.jackrabbit.guava.common.collect.Iterables;
++import org.apache.jackrabbit.oak.api.CommitFailedException;
++import org.apache.jackrabbit.oak.api.Root;
++import org.apache.jackrabbit.oak.api.Tree;
++import org.apache.jackrabbit.oak.commons.LongUtils;
++import org.apache.jackrabbit.oak.plugins.tree.TreeUtil;
++import org.apache.jackrabbit.oak.spi.security.user.AuthorizableType;
++import org.apache.jackrabbit.oak.spi.security.user.UserConfiguration;
++import org.apache.jackrabbit.oak.spi.security.user.util.UserUtil;
++import org.apache.jackrabbit.util.Text;
++import org.jetbrains.annotations.NotNull;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++import javax.jcr.AccessDeniedException;
++import java.security.Principal;
++import java.util.LinkedHashMap;
++import java.util.Map;
++import java.util.Set;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.function.BiConsumer;
++
++import static org.apache.jackrabbit.oak.security.user.CacheConstants.REP_GROUP_PRINCIPAL_NAMES;
++import static org.apache.jackrabbit.oak.security.user.UserPrincipalProvider.EXPIRATION_NO_CACHE;
++import static org.apache.jackrabbit.oak.security.user.UserPrincipalProvider.NO_STALE_CACHE;
++import static org.apache.jackrabbit.oak.security.user.UserPrincipalProvider.PARAM_CACHE_EXPIRATION;
++import static org.apache.jackrabbit.oak.security.user.UserPrincipalProvider.PARAM_CACHE_MAX_STALE;
++
++/**
++ * Extension of {@code PrincipalMembershipReader} that caches the membership of a given user principal. 
++ * The cache behavior has been extracted from {@code UserPrincipalProvider} and improved to address concurrency issues.
++ * It will read group principals from the cache if it already exists and is not yet expired. If the cache needs to be
++ * written or updated it will verify that no other thread is concurrently writing the cache. If writing the cache is
++ * not possible, it will either return a stale cache (which possibly outdated membership information) or read from the 
++ * membership provider without writing the cache. The handling of stale cache is determined by the new configuration 
++ * option {@link UserConfigurationImpl.Configuration#cacheMaxStale()} which defaults to {@link UserPrincipalProvider#NO_STALE_CACHE}.
++ *
++ * @see <a href="https://issues.apache.org/jira/browse/OAK-10451">OAK-10451</a>
++ */
++class CachedPrincipalMembershipReader extends PrincipalMembershipReader {
++
++    private static final Logger LOG = LoggerFactory.getLogger(CachedPrincipalMembershipReader.class);
++
++    private static final long MEMBERSHIP_THRESHOLD = 0;
++
++    /**
++     * Keep track of cache updates for 100 most recent authorizables.
++     */
++    private static final int MAX_CACHE_TRACKING_ENTRIES = 100;
++
++    private static final Map<UserConfiguration, Map<String, Long>> CACHE_UPDATES = new ConcurrentHashMap<>();
++
++    private final UserConfiguration config;
++
++    private final Root root;
++
++    private final long expiration;
++    private final long maxStale;
++
++    CachedPrincipalMembershipReader(@NotNull MembershipProvider membershipProvider,
++                                    @NotNull GroupPrincipalFactory groupPrincipalFactory,
++                                    @NotNull UserConfiguration config,
++                                    @NotNull Root root) {
++        super(membershipProvider, groupPrincipalFactory);
++        this.config = config;
++        this.root = root;
++        this.expiration = config.getParameters().getConfigValue(PARAM_CACHE_EXPIRATION, EXPIRATION_NO_CACHE);
++        this.maxStale = config.getParameters().getConfigValue(PARAM_CACHE_MAX_STALE, NO_STALE_CACHE);
++    }
++
++    @Override
++    void readMembership(@NotNull Tree authorizableTree,
++                        @NotNull Set<Principal> groupPrincipals) {
++        // membership cache only implemented on user
++        if (UserUtil.isType(authorizableTree, AuthorizableType.USER)) {
++            readGroupsFromCache(authorizableTree, groupPrincipals, super::readMembership);
++        } else {
++            super.readMembership(authorizableTree, groupPrincipals);
++        }
++    }
++
++    private void readGroupsFromCache(@NotNull Tree authorizableTree,
++                                     @NotNull Set<Principal> groups,
++                                     @NotNull BiConsumer<Tree, Set<Principal>> loader) {
++        String authorizablePath = authorizableTree.getPath();
++        Tree principalCache = authorizableTree.getChild(CacheConstants.REP_CACHE);
++        long expirationTime = readExpirationTime(principalCache);
++        long now = System.currentTimeMillis();
++        if (isValidCache(expirationTime, now)) {
++            LOG.debug("Reading membership from cache for '{}'", authorizablePath);
++            serveGroupsFromCache(principalCache, groups);
++            return;
++        }
++
++        // the cache is either expired or does not yet exist
++        // test if the cache can be updated by the current thread using the thread identifier as marker
++        // i.e. verify that no other thread is currently updating the cache for the same user
++        Map<String, Long> updates = getCacheUpdateMap();
++        long marker = Thread.currentThread().getId();
++        try {
++            boolean updateCache;
++            synchronized (updates) {
++                // test if this thread can update the cache by trying to place a record in the updates-map for the given
++                // user path. this will prevent other threads from updating the cache for the same user. 
++                updateCache = (updates.computeIfAbsent(authorizablePath, key -> marker) == marker);
++            }
++
++            if (updateCache) {
++                // read membership from membership-provider and persist the result in the cache
++                loader.accept(authorizableTree, groups);
++                cacheGroups(authorizableTree, groups);
++            } else {
++                // another thread is already updating the cache, which leaves two options
++                // 1. serve a stale cache if allowed
++                // 2. read membership from membership-provider without caching the result
++                if (canServeStaleCache(expirationTime, now)) {
++                    // the cache cannot be updated by the current thread but a stale cache can be returned and reading
++                    // membership again can be avoided
++                    LOG.debug("Another thread is updating the cache, returning a stale cache for '{}'.", authorizablePath);
++                    serveGroupsFromCache(principalCache, groups);
++                } else {
++                    // another thread is updating the cache and this thread is not allowed to serve a stale cache,
++                    // therefore read membership from membership-provider but do not cache the result.
++                    LOG.debug("Another thread is updating the cache and this thread is not allowed to serve a stale cache; reading from persistence without caching.");
++                    loader.accept(authorizableTree, groups);
++                }
++            }
++        } catch (AccessDeniedException | CommitFailedException e) {
++            LOG.debug("Failed to cache membership: {}", e.getMessage());
++        } finally {
++            // remove current entry from the cache updates map verifying that the current thread is the owner
++            // clearing the way for other threads to update the cache if it has expired or persisting the cache has failed.
++            synchronized (updates) {
++                updates.remove(authorizablePath, marker);
++            }
++        }
++    }
++
++    private static long readExpirationTime(@NotNull Tree principalCache) {
++        if (!principalCache.exists()) {
++            return EXPIRATION_NO_CACHE;
++        }
++        return TreeUtil.getLong(principalCache, CacheConstants.REP_EXPIRATION, EXPIRATION_NO_CACHE);
++    }
++
++    private static boolean isValidCache(long expirationTime, long now)  {
++        return expirationTime > EXPIRATION_NO_CACHE && now < expirationTime;
++    }
++
++    private boolean canServeStaleCache(long expirationTime, long now) {
++        return now - expirationTime < maxStale;
++    }
++
++    /**
++     * Populate the given set with the group principals read from the cache.
++     *
++     * @param principalCache The tree holding the cached group principal names.
++     * @param groups The set to populate with the group principals.
++     */
++    private void serveGroupsFromCache(@NotNull Tree principalCache,
++                                      @NotNull Set<Principal> groups) {
++        String str = TreeUtil.getString(principalCache, REP_GROUP_PRINCIPAL_NAMES);
++        if (Strings.isNullOrEmpty(str)) {
++            return;
++        }
++
++        for (String s : Text.explode(str, ',')) {
++            final String name = Text.unescape(s);
++            groups.add(getGroupPrincipalFactory().create(name));
++        }
++    }
++
++    /**
++     * Cache the group principal names for the given authorizable in the subtree of the user-node in a dedicated,
++     * system maintained rep:cache child node.
++     *
++     * @param authorizableTree The tree associated with the user.
++     * @param groupPrincipals The set of group principals to cache.
++     * @throws AccessDeniedException
++     * @throws CommitFailedException
++     */
++    private void cacheGroups(@NotNull Tree authorizableTree,
++                             @NotNull Set<Principal> groupPrincipals) throws AccessDeniedException, CommitFailedException {
++        try {
++            root.refresh();
++            Tree cache = authorizableTree.getChild(CacheConstants.REP_CACHE);
++            String authorizablePath = authorizableTree.getPath();
++            if (!cache.exists()) {
++                if (groupPrincipals.size() <= MEMBERSHIP_THRESHOLD) {
++                    LOG.debug("Omit cache creation for user without membership at {}", authorizablePath);
++                    return;
++                } else {
++                    LOG.debug("Attempting to create new membership cache at {}", authorizablePath);
++                    cache = TreeUtil.addChild(authorizableTree, CacheConstants.REP_CACHE, CacheConstants.NT_REP_CACHE);
++                }
++            }
++
++            cache.setProperty(CacheConstants.REP_EXPIRATION, LongUtils.calculateExpirationTime(expiration));
++            String value = (groupPrincipals.isEmpty()) ? "" : Joiner.on(",").join(Iterables.transform(groupPrincipals, input -> Text.escape(input.getName())));
++            cache.setProperty(REP_GROUP_PRINCIPAL_NAMES, value);
++
++            root.commit(CacheValidatorProvider.asCommitAttributes());
++            LOG.debug("Cached membership at {}", authorizablePath);
++        } finally {
++            root.refresh();
++        }
++    }
++
++    /**
++     * Given that every Oak repository instance can be expected to have one {@code UserConfiguration} tied to the 
++     * {@code SecurityProvider}, synchronize cache updates for each repository separately. Note however, that {@code CACHE_UPDATES}
++     * is intended to contain just one single entry for most usages of Apache Jackrabbit Oak.
++     *
++     * The cache updates map keeps track of the last 100 user path for which the cache is 
++     * being updated to prevent concurrent updates by multiple threads. The map entries are being removed upon completion
++     * of the cache update (even if persisting the changes fails).
++     */
++    private @NotNull Map<String, Long> getCacheUpdateMap() {
++        return CACHE_UPDATES.computeIfAbsent(config, cfg -> new LinkedHashMap<>() {
++            @Override
++            protected boolean removeEldestEntry(@NotNull Map.Entry<String, Long> eldest) {
++                return size() > MAX_CACHE_TRACKING_ENTRIES;
++            }
++        });
++    }
++}
+diff --git a/oak-core/src/main/java/org/apache/jackrabbit/oak/security/user/PrincipalMembershipReader.java b/oak-core/src/main/java/org/apache/jackrabbit/oak/security/user/PrincipalMembershipReader.java
+new file mode 100644
+index 0000000000..4a59421b72
+--- /dev/null
++++ b/oak-core/src/main/java/org/apache/jackrabbit/oak/security/user/PrincipalMembershipReader.java
+@@ -0,0 +1,72 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.jackrabbit.oak.security.user;
++
++import org.apache.jackrabbit.oak.api.Tree;
++import org.apache.jackrabbit.oak.spi.security.user.AuthorizableType;
++import org.apache.jackrabbit.oak.spi.security.user.util.UserUtil;
++import org.jetbrains.annotations.NotNull;
++import org.jetbrains.annotations.Nullable;
++
++import java.security.Principal;
++import java.util.Iterator;
++import java.util.Set;
++
++/**
++ * This class has been extracted from {@code UserPrincipalProvider} and calculates membership for a given 
++ * user principal.
++ * 
++ * @see <a href="https://issues.apache.org/jira/browse/OAK-10451">OAK-10451</a>
++ */
++class PrincipalMembershipReader {
++
++    private final MembershipProvider membershipProvider;
++
++    private final GroupPrincipalFactory groupPrincipalFactory;
++
++    PrincipalMembershipReader(@NotNull MembershipProvider membershipProvider,
++                              @NotNull GroupPrincipalFactory groupPrincipalFactory) {
++        this.membershipProvider = membershipProvider;
++        this.groupPrincipalFactory = groupPrincipalFactory;
++    }
++    
++    @NotNull GroupPrincipalFactory getGroupPrincipalFactory() {
++        return groupPrincipalFactory;
++    }
++
++    void readMembership(@NotNull Tree authorizableTree,
++                        @NotNull Set<Principal> groupPrincipals) {
++        Iterator<Tree> groupTrees = membershipProvider.getMembership(authorizableTree, true);
++        while (groupTrees.hasNext()) {
++            Tree groupTree = groupTrees.next();
++            if (UserUtil.isType(groupTree, AuthorizableType.GROUP)) {
++                Principal gr = groupPrincipalFactory.create(groupTree);
++                if (gr != null) {
++                    groupPrincipals.add(gr);
++                }
++            }
++        }
++    }
++
++    interface GroupPrincipalFactory {
++
++        @Nullable Principal create(@NotNull Tree authorizable);
++
++        @NotNull Principal create(@NotNull String principalName);
++    }
++
++}
+diff --git a/oak-core/src/main/java/org/apache/jackrabbit/oak/security/user/UserConfigurationImpl.java b/oak-core/src/main/java/org/apache/jackrabbit/oak/security/user/UserConfigurationImpl.java
+index 84e3826ff2..1c1f05f9ba 100644
+--- a/oak-core/src/main/java/org/apache/jackrabbit/oak/security/user/UserConfigurationImpl.java
++++ b/oak-core/src/main/java/org/apache/jackrabbit/oak/security/user/UserConfigurationImpl.java
+@@ -179,6 +179,15 @@ public class UserConfigurationImpl extends ConfigurationBase implements UserConf
+                         "with the internal system session such as used for login). If not set or equal/lower than zero " +
+                         "no caches are created/evaluated.")
+         long cacheExpiration() default UserPrincipalProvider.EXPIRATION_NO_CACHE;
++        
++        @AttributeDefinition(
++                name = "Principal Cache Stale Time",
++                description = "Optional configuration defining the number of milliseconds " +
++                        "for which a stale principal cache can be served if another thread is already writing the cache. If not set or " +
++                        "zero no stale cache is returned and group principals are read from the persistence without being cached. " +
++                        "This configuration option only takes effect if the principal cache is enabled with a " +
++                        "'Principal Cache Expiration' value greater than zero.")
++        long cacheMaxStale() default UserPrincipalProvider.NO_STALE_CACHE;
+ 
+         @AttributeDefinition(
+                 name = "RFC7613 Username Comparison Profile",
+diff --git a/oak-core/src/main/java/org/apache/jackrabbit/oak/security/user/UserPrincipalProvider.java b/oak-core/src/main/java/org/apache/jackrabbit/oak/security/user/UserPrincipalProvider.java
+index 1fa1f7768c..2d48d31192 100644
+--- a/oak-core/src/main/java/org/apache/jackrabbit/oak/security/user/UserPrincipalProvider.java
++++ b/oak-core/src/main/java/org/apache/jackrabbit/oak/security/user/UserPrincipalProvider.java
+@@ -17,24 +17,19 @@
+ package org.apache.jackrabbit.oak.security.user;
+ 
+ import org.apache.jackrabbit.guava.common.base.Function;
+-import org.apache.jackrabbit.guava.common.base.Joiner;
+ import org.apache.jackrabbit.guava.common.base.Predicates;
+-import org.apache.jackrabbit.guava.common.base.Strings;
+-import org.apache.jackrabbit.guava.common.collect.Iterables;
+ import org.apache.jackrabbit.guava.common.collect.Iterators;
+ import org.apache.jackrabbit.api.security.principal.ItemBasedPrincipal;
+ import org.apache.jackrabbit.api.security.user.Authorizable;
+ import org.apache.jackrabbit.api.security.user.UserManager;
+-import org.apache.jackrabbit.oak.api.CommitFailedException;
+ import org.apache.jackrabbit.oak.api.PropertyState;
+ import org.apache.jackrabbit.oak.api.Result;
+ import org.apache.jackrabbit.oak.api.ResultRow;
+ import org.apache.jackrabbit.oak.api.Root;
+ import org.apache.jackrabbit.oak.api.Tree;
+-import org.apache.jackrabbit.oak.commons.LongUtils;
+ import org.apache.jackrabbit.oak.namepath.NamePathMapper;
+-import org.apache.jackrabbit.oak.plugins.tree.TreeUtil;
+ import org.apache.jackrabbit.oak.security.principal.EveryoneFilter;
++import org.apache.jackrabbit.oak.security.user.PrincipalMembershipReader.GroupPrincipalFactory;
+ import org.apache.jackrabbit.oak.security.user.query.QueryUtil;
+ import org.apache.jackrabbit.oak.spi.security.principal.EveryonePrincipal;
+ import org.apache.jackrabbit.oak.spi.security.principal.PrincipalImpl;
+@@ -44,18 +39,15 @@ import org.apache.jackrabbit.oak.spi.security.user.AuthorizableType;
+ import org.apache.jackrabbit.oak.spi.security.user.UserConfiguration;
+ import org.apache.jackrabbit.oak.spi.security.user.UserConstants;
+ import org.apache.jackrabbit.oak.spi.security.user.util.UserUtil;
+-import org.apache.jackrabbit.util.Text;
+ import org.jetbrains.annotations.NotNull;
+ import org.jetbrains.annotations.Nullable;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
+-import javax.jcr.AccessDeniedException;
+ import javax.jcr.RepositoryException;
+ import java.security.Principal;
+ import java.text.ParseException;
+ import java.util.Collections;
+-import java.util.Date;
+ import java.util.HashSet;
+ import java.util.Iterator;
+ import java.util.Set;
+@@ -73,19 +65,16 @@ class UserPrincipalProvider implements PrincipalProvider {
+     private static final Logger log = LoggerFactory.getLogger(UserPrincipalProvider.class);
+ 
+     static final String PARAM_CACHE_EXPIRATION = "cacheExpiration";
++    static final String PARAM_CACHE_MAX_STALE = "cacheMaxStale";
+     static final long EXPIRATION_NO_CACHE = 0;
+-
+-    private static final long MEMBERSHIP_THRESHOLD = 0;
++    static final long NO_STALE_CACHE = 0;
+ 
+     private final Root root;
+     private final UserConfiguration config;
+     private final NamePathMapper namePathMapper;
+ 
+     private final UserProvider userProvider;
+-    private final MembershipProvider membershipProvider;
+-
+-    private final long expiration;
+-    private final boolean cacheEnabled;
++    private final PrincipalMembershipReader principalMembershipReader;
+ 
+     UserPrincipalProvider(@NotNull Root root,
+                           @NotNull UserConfiguration userConfiguration,
+@@ -93,12 +82,16 @@ class UserPrincipalProvider implements PrincipalProvider {
+         this.root = root;
+         this.config = userConfiguration;
+         this.namePathMapper = namePathMapper;
+-
+         this.userProvider = new UserProvider(root, config.getParameters());
+-        this.membershipProvider = new MembershipProvider(root, config.getParameters());
+ 
+-        expiration = config.getParameters().getConfigValue(PARAM_CACHE_EXPIRATION, EXPIRATION_NO_CACHE);
+-        cacheEnabled = (expiration > EXPIRATION_NO_CACHE && root.getContentSession().getAuthInfo().getPrincipals().contains(SystemPrincipal.INSTANCE));
++        MembershipProvider membershipProvider = new MembershipProvider(root, config.getParameters());
++        long expiration = config.getParameters().getConfigValue(PARAM_CACHE_EXPIRATION, EXPIRATION_NO_CACHE);
++        boolean cacheEnabled = (expiration > EXPIRATION_NO_CACHE && root.getContentSession().getAuthInfo().getPrincipals().contains(SystemPrincipal.INSTANCE));
++        if (cacheEnabled) {
++            principalMembershipReader = new CachedPrincipalMembershipReader(membershipProvider, createGroupPrincipalFactory(), config, root);
++        } else {
++            principalMembershipReader = new PrincipalMembershipReader(membershipProvider, createGroupPrincipalFactory());
++        }
+     }
+ 
+     //--------------------------------------------------< PrincipalProvider >---
+@@ -209,6 +202,21 @@ class UserPrincipalProvider implements PrincipalProvider {
+     }
+ 
+     //------------------------------------------------------------< private >---
++
++    private @NotNull GroupPrincipalFactory createGroupPrincipalFactory() {
++        return new GroupPrincipalFactory() {
++            @Override
++            public @Nullable Principal create(@NotNull Tree authorizable) {
++                return createGroupPrincipal(authorizable);
++            }
++
++            @Override
++            public @NotNull Principal create(@NotNull String principalName) {
++                return new CachedGroupPrincipal(principalName, namePathMapper, root, config);
++            }
++        };
++    }
++
+     @Nullable
+     private Tree getAuthorizableTree(@NotNull Principal principal) {
+         return userProvider.getAuthorizableByPrincipal(principal);
+@@ -266,30 +274,7 @@ class UserPrincipalProvider implements PrincipalProvider {
+     @NotNull
+     private Set<Principal> getGroupMembership(@NotNull Tree authorizableTree) {
+         Set<Principal> groupPrincipals = new HashSet<>();
+-        boolean doCache = cacheEnabled && UserUtil.isType(authorizableTree, AuthorizableType.USER);
+-        boolean doLoad = true;
+-        if (doCache) {
+-            doLoad = readGroupsFromCache(authorizableTree, groupPrincipals);
+-        }
+-
+-        // caching not configured or cache expired: use the membershipProvider to calculate
+-        if (doLoad) {
+-            Iterator<Tree> groupTrees = membershipProvider.getMembership(authorizableTree, true);
+-            while (groupTrees.hasNext()) {
+-                Tree groupTree = groupTrees.next();
+-                if (UserUtil.isType(groupTree, AuthorizableType.GROUP)) {
+-                    Principal gr = createGroupPrincipal(groupTree);
+-                    if (gr != null) {
+-                        groupPrincipals.add(gr);
+-                    }
+-                }
+-            }
+-
+-            // remember the regular groups in case caching is enabled
+-            if (doCache) {
+-                cacheGroups(authorizableTree, groupPrincipals);
+-            }
+-        }
++        principalMembershipReader.readMembership(authorizableTree, groupPrincipals);
+ 
+         // add the dynamic everyone principal group which is not included in
+         // the 'getMembership' call.
+@@ -297,65 +282,6 @@ class UserPrincipalProvider implements PrincipalProvider {
+         return groupPrincipals;
+     }
+ 
+-    private void cacheGroups(@NotNull Tree authorizableNode, @NotNull Set<Principal> groupPrincipals) {
+-        try {
+-            root.refresh();
+-            Tree cache = authorizableNode.getChild(CacheConstants.REP_CACHE);
+-            if (!cache.exists()) {
+-                if (groupPrincipals.size() <= MEMBERSHIP_THRESHOLD) {
+-                    log.debug("Omit cache creation for user without group membership at {}", authorizableNode.getPath());
+-                    return;
+-                } else {
+-                    log.debug("Create new group membership cache at {}", authorizableNode.getPath());
+-                    cache = TreeUtil.addChild(authorizableNode, CacheConstants.REP_CACHE, CacheConstants.NT_REP_CACHE);
+-                }
+-            }
+-
+-            cache.setProperty(CacheConstants.REP_EXPIRATION, LongUtils.calculateExpirationTime(expiration));
+-            String value = (groupPrincipals.isEmpty()) ? "" : Joiner.on(",").join(Iterables.transform(groupPrincipals, input -> Text.escape(input.getName())));
+-            cache.setProperty(CacheConstants.REP_GROUP_PRINCIPAL_NAMES, value);
+-
+-            root.commit(CacheValidatorProvider.asCommitAttributes());
+-            log.debug("Cached group membership at {}", authorizableNode.getPath());
+-
+-        } catch (AccessDeniedException | CommitFailedException e) {
+-            log.debug("Failed to cache group membership: {}", e.getMessage());
+-        } finally {
+-            root.refresh();
+-        }
+-    }
+-
+-    private boolean readGroupsFromCache(@NotNull Tree authorizableNode, @NotNull Set<Principal> groups) {
+-        Tree principalCache = authorizableNode.getChild(CacheConstants.REP_CACHE);
+-        if (!principalCache.exists()) {
+-            log.debug("No group cache at {}", authorizableNode.getPath());
+-            return true;
+-        }
+-
+-        if (isValidCache(principalCache)) {
+-            log.debug("Reading group membership at {}", authorizableNode.getPath());
+-
+-            String str = TreeUtil.getString(principalCache, CacheConstants.REP_GROUP_PRINCIPAL_NAMES);
+-            if (Strings.isNullOrEmpty(str)) {
+-                return false;
+-            }
+-
+-            for (String s : Text.explode(str, ',')) {
+-                final String name = Text.unescape(s);
+-                groups.add(new CachedGroupPrincipal(name, namePathMapper, root, config));
+-            }
+-            return false;
+-        } else {
+-            log.debug("Expired group cache for {}", authorizableNode.getPath());
+-            return true;
+-        }
+-    }
+-
+-    private static boolean isValidCache(Tree principalCache)  {
+-        long expirationTime = TreeUtil.getLong(principalCache, CacheConstants.REP_EXPIRATION, EXPIRATION_NO_CACHE);
+-        long now = new Date().getTime();
+-        return expirationTime > EXPIRATION_NO_CACHE && now < expirationTime;
+-    }
+ 
+     private static String buildSearchPatternContains(@NotNull String nameHint) {
+         StringBuilder sb = new StringBuilder();
+diff --git a/oak-core/src/test/java/org/apache/jackrabbit/oak/security/user/CachedPrincipalMembershipReaderTest.java b/oak-core/src/test/java/org/apache/jackrabbit/oak/security/user/CachedPrincipalMembershipReaderTest.java
+new file mode 100644
+index 0000000000..a6f66a96bd
+--- /dev/null
++++ b/oak-core/src/test/java/org/apache/jackrabbit/oak/security/user/CachedPrincipalMembershipReaderTest.java
+@@ -0,0 +1,339 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *   http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++
++package org.apache.jackrabbit.oak.security.user;
++
++import org.apache.jackrabbit.JcrConstants;
++import org.apache.jackrabbit.guava.common.collect.Lists;
++import org.apache.jackrabbit.oak.api.CommitFailedException;
++import org.apache.jackrabbit.oak.api.ContentSession;
++import org.apache.jackrabbit.oak.api.PropertyState;
++import org.apache.jackrabbit.oak.api.Root;
++import org.apache.jackrabbit.oak.api.Tree;
++import org.apache.jackrabbit.oak.api.Type;
++import org.apache.jackrabbit.oak.spi.security.ConfigurationParameters;
++import org.apache.jackrabbit.oak.spi.security.authentication.SystemSubject;
++import org.apache.jackrabbit.oak.spi.security.user.UserConfiguration;
++import org.apache.jackrabbit.oak.spi.security.user.UserConstants;
++import org.jetbrains.annotations.NotNull;
++import org.junit.Test;
++import org.junit.runner.RunWith;
++import org.junit.runners.Parameterized;
++import org.slf4j.Logger;
++
++import javax.security.auth.Subject;
++import java.lang.reflect.Field;
++import java.lang.reflect.Modifier;
++import java.security.Principal;
++import java.security.PrivilegedExceptionAction;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.Collection;
++import java.util.Collections;
++import java.util.HashSet;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertTrue;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.Mockito.clearInvocations;
++import static org.mockito.Mockito.doAnswer;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.spy;
++import static org.mockito.Mockito.times;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.verifyNoInteractions;
++import static org.mockito.Mockito.verifyNoMoreInteractions;
++import static org.mockito.Mockito.when;
++
++@RunWith(Parameterized.class)
++public class CachedPrincipalMembershipReaderTest extends PrincipalMembershipReaderTest {
++
++    @Parameterized.Parameters(name = "name={1}")
++    public static Collection<Object[]> parameters() {
++        return Lists.newArrayList(
++                new Object[] { 10000L, "Cache Max Stale = 10000" },
++                new Object[] { UserPrincipalProvider.NO_STALE_CACHE, "Cache Max Stale = 0" });
++    }
++
++    private static final int NUM_THREADS = 100;
++
++    private final long cacheMaxStale;
++
++    private final Logger mockedLogger = mock(Logger.class);
++
++    private ContentSession systemSession;
++    private String userPath;
++    private Root mockedRoot;
++    private Tree mockedUser;
++    private PrincipalMembershipReader.GroupPrincipalFactory mockedGroupPrincipalFactory;
++    private MembershipProvider mockedMembershipProvider;
++
++    public CachedPrincipalMembershipReaderTest(long cacheMaxStale, @NotNull String name) {
++        super();
++        this.cacheMaxStale = cacheMaxStale;
++    }
++    @Override
++    public void before() throws Exception {
++        super.before();
++        userPath = getTestUser().getPath();
++        setFinalStaticField(CachedPrincipalMembershipReader.class, "LOG", mockedLogger);
++    }
++
++    @Override
++    public void after() throws Exception {
++        try {
++            if (systemSession != null) {
++                systemSession.close();
++            }
++        } finally {
++            clearInvocations(mockedLogger);
++            super.after();
++        }
++    }
++
++    @Override
++    @NotNull CachedPrincipalMembershipReader createPrincipalMembershipReader(@NotNull Root root) throws Exception {
++        return createPrincipalMembershipReader(root, getUserConfiguration());
++    }
++
++    @NotNull CachedPrincipalMembershipReader createPrincipalMembershipReader(@NotNull Root root, @NotNull UserConfiguration userConfiguration) throws Exception {
++        return new CachedPrincipalMembershipReader(createMembershipProvider(root), createFactory(root), userConfiguration, root);
++    }
++
++    @Override
++    protected ConfigurationParameters getSecurityConfigParameters() {
++        return ConfigurationParameters.of(
++                UserConfiguration.NAME,
++                ConfigurationParameters.of(
++                        UserPrincipalProvider.PARAM_CACHE_EXPIRATION, 50000,
++                        UserPrincipalProvider.PARAM_CACHE_MAX_STALE, cacheMaxStale
++                )
++        );
++    }
++
++    private Root getSystemRoot() throws Exception {
++        if (systemSession == null) {
++            systemSession = Subject.doAs(SystemSubject.INSTANCE, (PrivilegedExceptionAction<ContentSession>) () -> login(null));
++        }
++        return systemSession.getLatestRoot();
++    }
++
++    private static void setFinalStaticField(@NotNull Class<?> clazz, @NotNull String fieldName, @NotNull Object value) throws Exception {
++        Field field = clazz.getDeclaredField(fieldName);
++        field.setAccessible(true);
++
++        Field modifiers = Field.class.getDeclaredField("modifiers");
++        modifiers.setAccessible(true);
++        modifiers.setInt(field, field.getModifiers() & ~Modifier.FINAL);
++
++        field.set(null, value);
++    }
++
++    @Test
++    public void testWritingCacheFailsWithException() throws Exception {
++        CachedPrincipalMembershipReader cachedGroupMembershipReader = createPrincipalMembershipReader(root);
++
++        Set<Principal> groupPrincipals = new HashSet<>();
++        cachedGroupMembershipReader.readMembership(root.getTree(userPath), groupPrincipals);
++
++        Set<Principal> expected = Collections.singleton(getUserManager(root).getAuthorizable(groupId).getPrincipal());
++        assertEquals(expected, groupPrincipals);
++
++        verify(mockedLogger, times(1)).debug("Attempting to create new membership cache at {}", userPath);
++        verify(mockedLogger, times(1)).debug("Failed to cache membership: {}", "OakConstraint0034: Attempt to create or change the system maintained cache.");
++        verifyNoMoreInteractions(mockedLogger);
++    }
++
++    /**
++     * This test checks that 'readMembership' works for objects that are not users but doesn't cache them
++     * @throws Exception
++     */
++    @Test
++    public void testReadMembershipForNonUser() throws Exception {
++        CachedPrincipalMembershipReader cachedGroupMembershipReader = spy(createPrincipalMembershipReader(root));
++
++        Set<Principal> groupPrincipals = new HashSet<>();
++        Tree groupTree = getTree(groupId2, root);
++        cachedGroupMembershipReader.readMembership(groupTree, groupPrincipals);
++
++        Set<Principal> expected = Collections.singleton(getUserManager(root).getAuthorizable(groupId).getPrincipal());
++        assertEquals(expected, groupPrincipals);
++
++        verifyNoInteractions(mockedLogger);
++        verify(cachedGroupMembershipReader).readMembership(groupTree, groupPrincipals);
++        verifyNoMoreInteractions(cachedGroupMembershipReader);
++    }
++
++    /**
++     * This test checks that cache is properly read and written
++     * @throws Exception
++     */
++    @Test
++    public void testReadMembershipWithCache() throws Exception {
++        Root systemRoot = getSystemRoot();
++        CachedPrincipalMembershipReader cachedGroupMembershipReader = createPrincipalMembershipReader(systemRoot);
++
++        Set<Principal> groupPrincipal = new HashSet<>();
++        cachedGroupMembershipReader.readMembership(systemRoot.getTree(userPath), groupPrincipal);
++
++        //Assert that the first time the cache was created
++        verify(mockedLogger, times(1)).debug("Attempting to create new membership cache at {}", userPath);
++        assertEquals(1, groupPrincipal.size());
++
++        cachedGroupMembershipReader.readMembership(systemRoot.getTree(userPath), groupPrincipal);
++        //Assert that the cache was used
++        verify(mockedLogger, times(1)).debug("Reading membership from cache for '{}'", userPath);
++        assertEquals(1, groupPrincipal.size());
++    }
++
++    /**
++     * This test checks the behavior for an expired cache when the commit is 3 second longs and NUM_THREADS threads execute readMembership:
++     * - if UserPrincipalProvider.PARAM_CACHE_MAX_STALE is 0, no stale cache should be provided during a long commit when 
++     * - if UserPrincipalProvider.PARAM_CACHE_MAX_STALE is >0, the stale cache must be returned during a long commit.
++     * @throws Exception
++     */
++    @Test
++    public void testCacheGroupMembershipGetMemberStaleCache() throws Exception {
++        initMocks();
++
++        // Test getMembership from multiple threads on expired cache and verify that:
++        // - only one thread updated the cache
++        // - the stale value was provided
++        Thread[] getMembershipThreads = new Thread[NUM_THREADS];
++        for (int i = 0; i < getMembershipThreads.length; i++) {
++            getMembershipThreads[i] = new Thread(() -> {
++                Set<Principal> groupPrincipals = new HashSet<>();
++                CachedPrincipalMembershipReader cachedGroupMembershipReader = new CachedPrincipalMembershipReader(mockedMembershipProvider, mockedGroupPrincipalFactory, getUserConfiguration(), mockedRoot);
++                cachedGroupMembershipReader.readMembership(mockedUser, groupPrincipals);
++                assertEquals(groupPrincipals.size(),1);
++            });
++            getMembershipThreads[i].start();
++        }
++        for (Thread getMembershipThread : getMembershipThreads) {
++            getMembershipThread.join();
++        }
++
++        verify(mockedRoot, times(1)).commit(CacheValidatorProvider.asCommitAttributes());
++        if (cacheMaxStale == UserPrincipalProvider.NO_STALE_CACHE) {
++            verify(mockedLogger, times(NUM_THREADS - 1)).debug("Another thread is updating the cache and this thread is not allowed to serve a stale cache; reading from persistence without caching.");
++        } else {
++            verify(mockedLogger, times(NUM_THREADS - 1)).debug("Another thread is updating the cache, returning a stale cache for '{}'.", mockedUser.getPath());
++        }
++    }
++
++    private void initMocks() throws CommitFailedException {
++        mockedRoot = mock(Root.class);
++        doAnswer(invocation -> {
++            Thread.sleep(3000);
++            return null;
++        }).when(mockedRoot).commit(CacheValidatorProvider.asCommitAttributes());
++
++        mockedMembershipProvider = mock(MembershipProvider.class);
++        mockedGroupPrincipalFactory = mock(PrincipalMembershipReader.GroupPrincipalFactory.class);
++
++        // Mock user Tree
++        mockedUser = mock(Tree.class);
++        PropertyState userState = mock(PropertyState.class);
++        when(userState.getValue(any())).thenReturn(UserConstants.NT_REP_USER);
++        when(mockedUser.getProperty(JcrConstants.JCR_PRIMARYTYPE)).thenReturn(userState);
++        when(mockedUser.getPath()).thenReturn(UserConstants.DEFAULT_USER_PATH+"/test");
++
++        // Mock Cache Tree
++        Tree mockedPrincipalCache = mock(Tree.class);
++        when(mockedPrincipalCache.exists()).thenReturn(true);
++
++        PropertyState propertyStateExpiration = mock(PropertyState.class);
++        when(propertyStateExpiration.getValue(Type.LONG)).thenReturn(System.currentTimeMillis());
++        when(mockedPrincipalCache.getProperty(CacheConstants.REP_EXPIRATION)).thenReturn(propertyStateExpiration);
++
++        PropertyState propertyStatePrincipalNames = mock(PropertyState.class);
++        when(propertyStatePrincipalNames.getValue(Type.STRING)).thenReturn("groupPrincipal");
++        when(mockedPrincipalCache.getProperty(CacheConstants.REP_GROUP_PRINCIPAL_NAMES)).thenReturn(propertyStatePrincipalNames);
++
++        when(mockedUser.getChild(CacheConstants.REP_CACHE)).thenReturn(mockedPrincipalCache);
++
++        // Mock Group Tree
++        Tree mockedGroupTree = mock(Tree.class);
++        PropertyState groupTreeState = mock(PropertyState.class);
++        when(groupTreeState.getValue(any())).thenReturn(UserConstants.NT_REP_GROUP);
++        when(mockedGroupTree.getProperty(JcrConstants.JCR_PRIMARYTYPE)).thenReturn(groupTreeState);
++        when(mockedGroupTree.getProperty(UserConstants.REP_PRINCIPAL_NAME)).thenReturn(groupTreeState);
++        when(mockedMembershipProvider.getMembership(mockedUser, true)).thenAnswer(I -> Arrays.asList(new Tree[]{mockedGroupTree}).iterator());
++        Principal groupPrincipal = mock(Principal.class);
++        when(groupPrincipal.getName()).thenReturn("groupPrincipal");
++        when(mockedGroupPrincipalFactory.create(mockedGroupTree)).thenReturn(groupPrincipal);
++    }
++
++    @Test
++    public void testMultipleUserConfigurations() throws Exception {
++        Root systemRoot = getSystemRoot();
++
++        List<UserConfiguration> userConfigurations = new ArrayList<>();
++        for (int i = 0; i < 5; i++) {
++            UserConfiguration uc = new UserConfigurationImpl(getSecurityProvider());
++            userConfigurations.add(uc);
++
++            CachedPrincipalMembershipReader cachedGroupMembershipReader = createPrincipalMembershipReader(systemRoot, uc);
++            cachedGroupMembershipReader.readMembership(systemRoot.getTree(userPath), new HashSet<>());
++        }
++
++        Field f = CachedPrincipalMembershipReader.class.getDeclaredField("CACHE_UPDATES");
++        f.setAccessible(true);
++
++        // verify that the size of the update-cache map is limited to the defined maxCacheTrackingEntries size
++        Map<UserConfiguration, Map<String, Long>> cacheUpdates = (Map) f.get(createPrincipalMembershipReader(systemRoot));
++        assertTrue(cacheUpdates.keySet().removeAll(userConfigurations));
++    }
++
++    @Test
++    public void testMaxCacheTrackingEntries() throws Exception {
++        UserConfiguration uc = new UserConfigurationImpl(securityProvider);
++        Map<UserConfiguration, Map<String, Long>> cacheUpdates = null;
++        try {
++            Root systemRoot = getSystemRoot();
++            CachedPrincipalMembershipReader membershipReader = createPrincipalMembershipReader(systemRoot, uc);
++            membershipReader.readMembership(systemRoot.getTree(userPath), new HashSet<>());
++
++            Field f = CachedPrincipalMembershipReader.class.getDeclaredField("CACHE_UPDATES");
++            f.setAccessible(true);
++
++            cacheUpdates = (Map) f.get(membershipReader);
++
++            Map<String, Long>  m = cacheUpdates.get(uc);
++            // since the cache entry is removed upon completion of readMembership -> expected size = 0
++            assertEquals(0, m.size());
++
++            for (int i = 0; i < 200; i++) {
++                m.computeIfAbsent("/user/path/" + i, key -> System.currentTimeMillis());
++            }
++
++            int maxCacheTrackingEntries = 100; // constant in CachedPrincipalMembershipReader
++            assertEquals(maxCacheTrackingEntries, m.size());
++
++        } finally {
++            if (cacheUpdates != null) {
++                cacheUpdates.remove(uc);
++            }
++        }
++    }
++
++}
+\ No newline at end of file
+diff --git a/oak-core/src/test/java/org/apache/jackrabbit/oak/security/user/PrincipalMembershipReaderTest.java b/oak-core/src/test/java/org/apache/jackrabbit/oak/security/user/PrincipalMembershipReaderTest.java
+new file mode 100644
+index 0000000000..0968d46281
+--- /dev/null
++++ b/oak-core/src/test/java/org/apache/jackrabbit/oak/security/user/PrincipalMembershipReaderTest.java
+@@ -0,0 +1,114 @@
++package org.apache.jackrabbit.oak.security.user;
++
++import org.apache.jackrabbit.JcrConstants;
++import org.apache.jackrabbit.api.security.user.Authorizable;
++import org.apache.jackrabbit.api.security.user.Group;
++import org.apache.jackrabbit.guava.common.collect.Iterators;
++import org.apache.jackrabbit.oak.AbstractSecurityTest;
++import org.apache.jackrabbit.oak.api.PropertyState;
++import org.apache.jackrabbit.oak.api.Root;
++import org.apache.jackrabbit.oak.api.Tree;
++import org.apache.jackrabbit.oak.api.Type;
++import org.apache.jackrabbit.oak.plugins.memory.PropertyStates;
++import org.apache.jackrabbit.oak.spi.security.principal.PrincipalProvider;
++import org.jetbrains.annotations.NotNull;
++import org.junit.Test;
++
++import java.lang.reflect.Method;
++import java.security.Principal;
++import java.util.HashSet;
++import java.util.Set;
++import java.util.UUID;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertTrue;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.ArgumentMatchers.anyBoolean;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.when;
++
++public class PrincipalMembershipReaderTest extends AbstractSecurityTest {
++
++    String groupId;
++    String groupId2;
++
++    @Override
++    public void before() throws Exception {
++        super.before();
++        
++        groupId = "testGroup" + UUID.randomUUID();
++        Group testGroup = getUserManager(root).createGroup(groupId);
++        testGroup.addMember(getTestUser());
++
++        groupId2 = "testGroup" + UUID.randomUUID() + "2";
++        Group testGroup2 = getUserManager(root).createGroup(groupId2);
++        testGroup.addMember(testGroup2);
++
++        root.commit();
++    }
++
++    public void after() throws Exception {
++        try {
++            root.refresh();
++            String[] rm = new String[] { groupId, groupId2};
++            for (String id : rm) {
++                Authorizable a = getUserManager(root).getAuthorizable(id);
++                if (a != null) {
++                    a.remove();
++                    root.commit();
++                }
++            }
++        } finally {
++            super.after();
++        }
++    }
++
++    @NotNull PrincipalMembershipReader.GroupPrincipalFactory createFactory(@NotNull Root root) throws Exception {
++        UserPrincipalProvider userPrincipalProvider = (UserPrincipalProvider) createPrincipalProvider(root);
++        Method m = UserPrincipalProvider.class.getDeclaredMethod("createGroupPrincipalFactory");
++        m.setAccessible(true);
++        return (PrincipalMembershipReader.GroupPrincipalFactory) m.invoke(userPrincipalProvider);
++    }
++    
++    @NotNull PrincipalProvider createPrincipalProvider(@NotNull Root root) {
++        return new UserPrincipalProvider(root, getUserConfiguration(), namePathMapper);
++    }
++    
++    @NotNull MembershipProvider createMembershipProvider(@NotNull Root root) {
++        return new MembershipProvider(root, getUserConfiguration().getParameters());
++    }
++    
++    @NotNull PrincipalMembershipReader createPrincipalMembershipReader(@NotNull Root root) throws Exception {
++        return new PrincipalMembershipReader(createMembershipProvider(root), createFactory(root));
++    }
++    
++    @NotNull Tree getTree(@NotNull String id, @NotNull Root root) throws Exception {
++        return root.getTree(getUserManager(root).getAuthorizable(id).getPath());
++    }
++    
++    @Test
++    public void testReadMembershipForUser() throws Exception {
++        Set<Principal> result = new HashSet<>();
++        createPrincipalMembershipReader(root).readMembership(getTree(getTestUser().getID(), root), result);
++        assertEquals(1, result.size());
++    }
++    
++    @Test
++    public void testReadMembershipForGroup() throws Exception {
++        Set<Principal> result = new HashSet<>();
++        createPrincipalMembershipReader(root).readMembership(getTree(groupId2, root), result);
++        assertEquals(1, result.size());
++    }
++    
++    @Test
++    public void testResolvingGroupsReturnsUnexpectedAuthorizableType() throws Exception {
++        PropertyState ps = PropertyStates.createProperty(JcrConstants.JCR_PRIMARYTYPE, JcrConstants.NT_UNSTRUCTURED, Type.NAME);
++        Tree mockTree = when(mock(Tree.class).getProperty(JcrConstants.JCR_PRIMARYTYPE)).thenReturn(ps).getMock();
++        MembershipProvider mp = when(mock(MembershipProvider.class).getMembership(any(Tree.class), anyBoolean())).thenReturn(Iterators.singletonIterator(mockTree)).getMock();
++        
++        PrincipalMembershipReader reader = new PrincipalMembershipReader(mp, createFactory(root));
++        Set<Principal> result = new HashSet<>();
++        reader.readMembership(root.getTree(getTestUser().getPath()), result);
++        assertTrue(result.isEmpty());
++    }
++}

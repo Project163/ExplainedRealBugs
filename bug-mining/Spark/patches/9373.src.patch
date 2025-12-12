@@ -1,0 +1,179 @@
+diff --git a/sql/catalyst/src/main/scala/org/apache/spark/sql/internal/SQLConf.scala b/sql/catalyst/src/main/scala/org/apache/spark/sql/internal/SQLConf.scala
+index ff6ab7b541a..c12c5a826ba 100644
+--- a/sql/catalyst/src/main/scala/org/apache/spark/sql/internal/SQLConf.scala
++++ b/sql/catalyst/src/main/scala/org/apache/spark/sql/internal/SQLConf.scala
+@@ -670,6 +670,15 @@ object SQLConf {
+     .booleanConf
+     .createWithDefault(false)
+ 
++  val ADAPTIVE_EXECUTION_APPLY_FINAL_STAGE_SHUFFLE_OPTIMIZATIONS =
++    buildConf("spark.sql.adaptive.applyFinalStageShuffleOptimizations")
++      .internal()
++      .doc("Configures whether adaptive query execution (if enabled) should apply shuffle " +
++        "coalescing and local shuffle read optimization for the final query stage.")
++      .version("3.4.2")
++      .booleanConf
++      .createWithDefault(true)
++
+   val ADAPTIVE_EXECUTION_LOG_LEVEL = buildConf("spark.sql.adaptive.logLevel")
+     .internal()
+     .doc("Configures the log level for adaptive execution logging of plan changes. The value " +
+diff --git a/sql/core/src/main/scala/org/apache/spark/sql/execution/CacheManager.scala b/sql/core/src/main/scala/org/apache/spark/sql/execution/CacheManager.scala
+index 6678ae2dc1b..093599af122 100644
+--- a/sql/core/src/main/scala/org/apache/spark/sql/execution/CacheManager.scala
++++ b/sql/core/src/main/scala/org/apache/spark/sql/execution/CacheManager.scala
+@@ -403,8 +403,9 @@ class CacheManager extends Logging with AdaptiveSparkPlanHelper {
+     if (session.conf.get(SQLConf.CAN_CHANGE_CACHED_PLAN_OUTPUT_PARTITIONING)) {
+       // Bucketed scan only has one time overhead but can have multi-times benefits in cache,
+       // so we always do bucketed scan in a cached plan.
+-      SparkSession.getOrCloneSessionWithConfigsOff(
+-        session, SQLConf.AUTO_BUCKETED_SCAN_ENABLED :: Nil)
++      SparkSession.getOrCloneSessionWithConfigsOff(session,
++        SQLConf.ADAPTIVE_EXECUTION_APPLY_FINAL_STAGE_SHUFFLE_OPTIMIZATIONS ::
++          SQLConf.AUTO_BUCKETED_SCAN_ENABLED :: Nil)
+     } else {
+       SparkSession.getOrCloneSessionWithConfigsOff(session, forceDisableConfigs)
+     }
+diff --git a/sql/core/src/main/scala/org/apache/spark/sql/execution/adaptive/AdaptiveSparkPlanExec.scala b/sql/core/src/main/scala/org/apache/spark/sql/execution/adaptive/AdaptiveSparkPlanExec.scala
+index 36c2160f522..87499b6afef 100644
+--- a/sql/core/src/main/scala/org/apache/spark/sql/execution/adaptive/AdaptiveSparkPlanExec.scala
++++ b/sql/core/src/main/scala/org/apache/spark/sql/execution/adaptive/AdaptiveSparkPlanExec.scala
+@@ -159,7 +159,13 @@ case class AdaptiveSparkPlanExec(
+   )
+ 
+   private def optimizeQueryStage(plan: SparkPlan, isFinalStage: Boolean): SparkPlan = {
+-    val optimized = queryStageOptimizerRules.foldLeft(plan) { case (latestPlan, rule) =>
++    val rules = if (isFinalStage &&
++        !conf.getConf(SQLConf.ADAPTIVE_EXECUTION_APPLY_FINAL_STAGE_SHUFFLE_OPTIMIZATIONS)) {
++      queryStageOptimizerRules.filterNot(_.isInstanceOf[AQEShuffleReadRule])
++    } else {
++      queryStageOptimizerRules
++    }
++    val optimized = rules.foldLeft(plan) { case (latestPlan, rule) =>
+       val applied = rule.apply(latestPlan)
+       val result = rule match {
+         case _: AQEShuffleReadRule if !applied.fastEquals(latestPlan) =>
+diff --git a/sql/core/src/test/scala/org/apache/spark/sql/CachedTableSuite.scala b/sql/core/src/test/scala/org/apache/spark/sql/CachedTableSuite.scala
+index 2db377457d2..eff7e9ad23a 100644
+--- a/sql/core/src/test/scala/org/apache/spark/sql/CachedTableSuite.scala
++++ b/sql/core/src/test/scala/org/apache/spark/sql/CachedTableSuite.scala
+@@ -29,7 +29,7 @@ import org.apache.commons.io.FileUtils
+ import org.apache.spark.CleanerListener
+ import org.apache.spark.executor.DataReadMethod._
+ import org.apache.spark.executor.DataReadMethod.DataReadMethod
+-import org.apache.spark.scheduler.{SparkListener, SparkListenerJobStart}
++import org.apache.spark.scheduler.{SparkListener, SparkListenerEvent, SparkListenerJobStart}
+ import org.apache.spark.sql.catalyst.TableIdentifier
+ import org.apache.spark.sql.catalyst.analysis.TempTableAlreadyExistsException
+ import org.apache.spark.sql.catalyst.expressions.SubqueryExpression
+@@ -39,6 +39,7 @@ import org.apache.spark.sql.execution.{ColumnarToRowExec, ExecSubqueryExpression
+ import org.apache.spark.sql.execution.adaptive.{AdaptiveSparkPlanHelper, AQEPropagateEmptyRelation}
+ import org.apache.spark.sql.execution.columnar._
+ import org.apache.spark.sql.execution.exchange.ShuffleExchangeExec
++import org.apache.spark.sql.execution.ui.SparkListenerSQLAdaptiveExecutionUpdate
+ import org.apache.spark.sql.functions._
+ import org.apache.spark.sql.internal.SQLConf
+ import org.apache.spark.sql.test.{SharedSparkSession, SQLTestUtils}
+@@ -1629,23 +1630,44 @@ class CachedTableSuite extends QueryTest with SQLTestUtils
+       SQLConf.COALESCE_PARTITIONS_MIN_PARTITION_NUM.key -> "1",
+       SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "true") {
+ 
+-      withTempView("t1", "t2", "t3") {
+-        withSQLConf(SQLConf.CAN_CHANGE_CACHED_PLAN_OUTPUT_PARTITIONING.key -> "false") {
+-          sql("CACHE TABLE t1 as SELECT /*+ REPARTITION */ * FROM values(1) as t(c)")
+-          assert(spark.table("t1").rdd.partitions.length == 2)
++      var finalPlan = ""
++      val listener = new SparkListener {
++        override def onOtherEvent(event: SparkListenerEvent): Unit = {
++          event match {
++            case SparkListenerSQLAdaptiveExecutionUpdate(_, physicalPlanDesc, sparkPlanInfo) =>
++              if (sparkPlanInfo.simpleString.startsWith(
++                  "AdaptiveSparkPlan isFinalPlan=true")) {
++                finalPlan = physicalPlanDesc
++              }
++            case _ => // ignore other events
++          }
+         }
++      }
+ 
+-        withSQLConf(SQLConf.CAN_CHANGE_CACHED_PLAN_OUTPUT_PARTITIONING.key -> "true") {
+-          assert(spark.table("t1").rdd.partitions.length == 2)
+-          sql("CACHE TABLE t2 as SELECT /*+ REPARTITION */ * FROM values(2) as t(c)")
+-          assert(spark.table("t2").rdd.partitions.length == 1)
+-        }
++      withTempView("t0", "t1", "t2") {
++        try {
++          spark.range(10).write.saveAsTable("t0")
++          spark.sparkContext.listenerBus.waitUntilEmpty()
++          spark.sparkContext.addSparkListener(listener)
+ 
+-        withSQLConf(SQLConf.CAN_CHANGE_CACHED_PLAN_OUTPUT_PARTITIONING.key -> "false") {
+-          assert(spark.table("t1").rdd.partitions.length == 2)
+-          assert(spark.table("t2").rdd.partitions.length == 1)
+-          sql("CACHE TABLE t3 as SELECT /*+ REPARTITION */ * FROM values(3) as t(c)")
+-          assert(spark.table("t3").rdd.partitions.length == 2)
++          withSQLConf(SQLConf.CAN_CHANGE_CACHED_PLAN_OUTPUT_PARTITIONING.key -> "false") {
++            sql("CACHE TABLE t1 as SELECT /*+ REPARTITION */ * FROM (" +
++              "SELECT distinct (id+1) FROM t0)")
++            assert(spark.table("t1").rdd.partitions.length == 2)
++            spark.sparkContext.listenerBus.waitUntilEmpty()
++            assert(finalPlan.nonEmpty && !finalPlan.contains("coalesced"))
++          }
++
++          finalPlan = "" // reset finalPlan
++          withSQLConf(SQLConf.CAN_CHANGE_CACHED_PLAN_OUTPUT_PARTITIONING.key -> "true") {
++            sql("CACHE TABLE t2 as SELECT /*+ REPARTITION */ * FROM (" +
++              "SELECT distinct (id-1) FROM t0)")
++            assert(spark.table("t2").rdd.partitions.length == 2)
++            spark.sparkContext.listenerBus.waitUntilEmpty()
++            assert(finalPlan.nonEmpty && finalPlan.contains("coalesced"))
++          }
++        } finally {
++          spark.sparkContext.removeSparkListener(listener)
+         }
+       }
+     }
+diff --git a/sql/core/src/test/scala/org/apache/spark/sql/DatasetSuite.scala b/sql/core/src/test/scala/org/apache/spark/sql/DatasetSuite.scala
+index 152fd0d7d8e..739d1f6827d 100644
+--- a/sql/core/src/test/scala/org/apache/spark/sql/DatasetSuite.scala
++++ b/sql/core/src/test/scala/org/apache/spark/sql/DatasetSuite.scala
+@@ -2663,16 +2663,29 @@ class DatasetSuite extends QueryTest
+   }
+ 
+   test("SPARK-45592: Coaleasced shuffle read is not compatible with hash partitioning") {
+-    val ee = spark.range(0, 1000000, 1, 5).map(l => (l, l)).toDF()
+-      .persist(org.apache.spark.storage.StorageLevel.MEMORY_AND_DISK)
+-    ee.count()
+-
+-    val minNbrs1 = ee
+-      .groupBy("_1").agg(min(col("_2")).as("min_number"))
+-      .persist(org.apache.spark.storage.StorageLevel.MEMORY_AND_DISK)
+-
+-    val join = ee.join(minNbrs1, "_1")
+-    assert(join.count() == 1000000)
++    withSQLConf(SQLConf.CAN_CHANGE_CACHED_PLAN_OUTPUT_PARTITIONING.key -> "true",
++      SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1",
++      SQLConf.SHUFFLE_PARTITIONS.key -> "20",
++      SQLConf.ADVISORY_PARTITION_SIZE_IN_BYTES.key -> "2000") {
++      val ee = spark.range(0, 1000, 1, 5).map(l => (l, l - 1)).toDF()
++        .persist(org.apache.spark.storage.StorageLevel.MEMORY_AND_DISK)
++      ee.count()
++
++      // `minNbrs1` will start with 20 partitions and without the fix would coalesce to ~10
++      // partitions.
++      val minNbrs1 = ee
++        .groupBy("_2").agg(min(col("_1")).as("min_number"))
++        .select(col("_2") as "_1", col("min_number"))
++        .persist(org.apache.spark.storage.StorageLevel.MEMORY_AND_DISK)
++      minNbrs1.count()
++
++      // shuffle on `ee` will start with 2 partitions, smaller than `minNbrs1`'s partition num,
++      // and `EnsureRequirements` will change its partition num to `minNbrs1`'s partition num.
++      withSQLConf(SQLConf.SHUFFLE_PARTITIONS.key -> "5") {
++        val join = ee.join(minNbrs1, "_1")
++        assert(join.count() == 999)
++      }
++    }
+   }
+ 
+   test("SPARK-45022: exact DatasetQueryContext call site") {

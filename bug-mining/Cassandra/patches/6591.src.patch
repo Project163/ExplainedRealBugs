@@ -1,0 +1,699 @@
+diff --git a/CHANGES.txt b/CHANGES.txt
+index f4f3d72b6f..ab3b662f6a 100644
+--- a/CHANGES.txt
++++ b/CHANGES.txt
+@@ -1,4 +1,5 @@
+ 5.1
++ * Periodically disconnect roles that are revoked or have LOGIN=FALSE set (CASSANDRA-19385)
+  * AST library for CQL-based fuzz tests (CASSANDRA-20198)
+  * Support audit logging for JMX operations (CASSANDRA-20128)
+  * Enable sorting of nodetool status output (CASSANDRA-20104)
+diff --git a/conf/cassandra.yaml b/conf/cassandra.yaml
+index 6ffe1fb9b6..55fc50f6c6 100644
+--- a/conf/cassandra.yaml
++++ b/conf/cassandra.yaml
+@@ -233,6 +233,13 @@ authorizer:
+ #   increase system_auth keyspace replication factor if you use this role manager.
+ role_manager:
+   class_name: CassandraRoleManager
++  parameters:
++    # Controls how often invalid roles are disconnected, such as when a role is altered with LOGIN=false
++    # Task is scheduled with period + random(0, max_jitter) delay between executions
++    # It's recommended to set these longer than the roles cache refresh period, since the invalidation check depends on
++    # cache contents. Disable by setting period=0h.
++    # invalid_role_disconnect_task_period: 4h
++    # invalid_role_disconnect_task_max_jitter: 1h
+ 
+ # Network authorization backend, implementing INetworkAuthorizer; used to restrict user
+ # access to certain DCs
+diff --git a/conf/cassandra_latest.yaml b/conf/cassandra_latest.yaml
+index 4f8879a43c..387565fe18 100644
+--- a/conf/cassandra_latest.yaml
++++ b/conf/cassandra_latest.yaml
+@@ -236,6 +236,13 @@ authorizer:
+ #   increase system_auth keyspace replication factor if you use this role manager.
+ role_manager:
+   class_name: CassandraRoleManager
++  parameters:
++    # Controls how often invalid roles are disconnected, such as when a role is altered with LOGIN=false
++    # Task is scheduled with period + random(0, max_jitter) delay between executions
++    # It's recommended to set these longer than the roles cache refresh period, since the invalidation check depends on
++    # cache contents. Disable by setting period=0h.
++    invalid_role_disconnect_task_period: 4h
++    invalid_role_disconnect_task_max_jitter: 1h
+ 
+ # Network authorization backend, implementing INetworkAuthorizer; used to restrict user
+ # access to certain DCs
+diff --git a/src/java/org/apache/cassandra/auth/CassandraRoleManager.java b/src/java/org/apache/cassandra/auth/CassandraRoleManager.java
+index 3c1b52f823..1e1a9ec310 100644
+--- a/src/java/org/apache/cassandra/auth/CassandraRoleManager.java
++++ b/src/java/org/apache/cassandra/auth/CassandraRoleManager.java
+@@ -28,8 +28,12 @@ import java.util.Map;
+ import java.util.Objects;
+ import java.util.Set;
+ import java.util.concurrent.Callable;
++import java.util.concurrent.ScheduledExecutorService;
++import java.util.concurrent.ScheduledFuture;
++import java.util.concurrent.ThreadLocalRandom;
+ import java.util.concurrent.TimeUnit;
+ import java.util.function.Function;
++import java.util.function.LongSupplier;
+ import java.util.function.Predicate;
+ import java.util.function.Supplier;
+ import java.util.stream.Collectors;
+@@ -42,8 +46,10 @@ import org.apache.commons.lang3.StringUtils;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
++import org.apache.cassandra.concurrent.ScheduledExecutorPlus;
+ import org.apache.cassandra.concurrent.ScheduledExecutors;
+ import org.apache.cassandra.config.DatabaseDescriptor;
++import org.apache.cassandra.config.DurationSpec;
+ import org.apache.cassandra.cql3.CQLStatement;
+ import org.apache.cassandra.cql3.QueryOptions;
+ import org.apache.cassandra.cql3.QueryProcessor;
+@@ -59,11 +65,13 @@ import org.apache.cassandra.exceptions.UnauthorizedException;
+ import org.apache.cassandra.schema.SchemaConstants;
+ import org.apache.cassandra.service.ClientState;
+ import org.apache.cassandra.service.StorageProxy;
++import org.apache.cassandra.service.StorageService;
+ import org.apache.cassandra.tcm.ClusterMetadata;
+ import org.apache.cassandra.transport.Dispatcher;
+ import org.apache.cassandra.transport.messages.ResultMessage;
+ import org.apache.cassandra.utils.ByteBufferUtil;
+ import org.apache.cassandra.utils.FBUtilities;
++import org.apache.cassandra.utils.MBeanWrapper;
+ import org.apache.cassandra.utils.NoSpamLogger;
+ import org.mindrot.jbcrypt.BCrypt;
+ 
+@@ -95,7 +103,7 @@ import static org.apache.cassandra.service.QueryState.forInternalCalls;
+  * of the password itself (such as storing it in an alternative location) would
+  * be added in overridden createRole and alterRole implementations.
+  */
+-public class CassandraRoleManager implements IRoleManager
++public class CassandraRoleManager implements IRoleManager, CassandraRoleManagerMBean
+ {
+     private static final Logger logger = LoggerFactory.getLogger(CassandraRoleManager.class);
+     private static final NoSpamLogger nospamLogger = NoSpamLogger.getLogger(logger, 1L, TimeUnit.MINUTES);
+@@ -103,6 +111,13 @@ public class CassandraRoleManager implements IRoleManager
+     public static final String DEFAULT_SUPERUSER_NAME = "cassandra";
+     public static final String DEFAULT_SUPERUSER_PASSWORD = "cassandra";
+ 
++    @VisibleForTesting
++    static final String PARAM_INVALID_ROLE_DISCONNECT_TASK_PERIOD = "invalid_role_disconnect_task_period";
++    @VisibleForTesting
++    static final String PARAM_INVALID_ROLE_DISCONNECT_TASK_MAX_JITTER = "invalid_role_disconnect_task_max_jitter";
++
++    public static final String MBEAN_NAME = "org.apache.cassandra.auth:type=CassandraRoleManager";
++
+     /**
+      * We need to treat the default superuser as a special case since during initial node startup, we may end up with
+      * duplicate creation or deletion + re-creation of this user on different nodes unless we check at quorum to see if
+@@ -149,7 +164,17 @@ public class CassandraRoleManager implements IRoleManager
+     private final Set<Option> supportedOptions;
+     private final Set<Option> alterableOptions;
+ 
++    private volatile ScheduledFuture<?> invalidRoleDisconnectTask;
++
++    private volatile long invalidClientDisconnectPeriodMillis;
++    private volatile long invalidClientDisconnectMaxJitterMillis;
++
+     public CassandraRoleManager()
++    {
++        this(Map.of());
++    }
++
++    public CassandraRoleManager(Map<String, String> parameters)
+     {
+         supportedOptions = DatabaseDescriptor.getAuthenticator() instanceof PasswordAuthenticator
+                            ? ImmutableSet.of(Option.LOGIN, Option.SUPERUSER, Option.PASSWORD, Option.HASHED_PASSWORD, Option.GENERATED_PASSWORD)
+@@ -157,6 +182,13 @@ public class CassandraRoleManager implements IRoleManager
+         alterableOptions = DatabaseDescriptor.getAuthenticator() instanceof PasswordAuthenticator
+                            ? ImmutableSet.of(Option.PASSWORD, Option.HASHED_PASSWORD, Option.GENERATED_PASSWORD)
+                            : ImmutableSet.<Option>of();
++
++        // Inherit parsing and validation from existing config parser
++        invalidClientDisconnectPeriodMillis = new DurationSpec.LongMillisecondsBound(parameters.getOrDefault(PARAM_INVALID_ROLE_DISCONNECT_TASK_PERIOD, "0h")).toMilliseconds();
++        invalidClientDisconnectMaxJitterMillis = new DurationSpec.LongMillisecondsBound(parameters.getOrDefault(PARAM_INVALID_ROLE_DISCONNECT_TASK_MAX_JITTER, "0h")).toMilliseconds();
++
++        if (!MBeanWrapper.instance.isRegistered(MBEAN_NAME))
++            MBeanWrapper.instance.registerMBean(this, MBEAN_NAME);
+     }
+ 
+     @Override
+@@ -164,6 +196,7 @@ public class CassandraRoleManager implements IRoleManager
+     {
+         loadRoleStatement();
+         loadIdentityStatement();
++        scheduleDisconnectInvalidRoleTask();
+         if (!asyncRoleSetup)
+         {
+             try
+@@ -732,4 +765,76 @@ public class CassandraRoleManager implements IRoleManager
+             return entries;
+         };
+     }
++
++    protected void disconnectInvalidRoles()
++    {
++        // This should always run with jitter, otherwise there's a risk that all nodes disconnect clients at the same time
++        StorageService.instance.disconnectInvalidRoles();
++    }
++
++    protected void invalidRoleDisconnectTask(LongSupplier delayMillis, ScheduledExecutorService executor)
++    {
++        try
++        {
++            disconnectInvalidRoles();
++        }
++        catch (Exception e)
++        {
++            logger.warn("Failed to disconnect invalid roles", e);
++        }
++
++        long nextDelayMillis = delayMillis.getAsLong();
++        logger.info("Scheduling next invalid role disconnection in {} millis", nextDelayMillis);
++        this.invalidRoleDisconnectTask = executor.schedule(() -> invalidRoleDisconnectTask(delayMillis, executor), nextDelayMillis, TimeUnit.MILLISECONDS);
++    }
++
++    protected void scheduleDisconnectInvalidRoleTask()
++    {
++        // Cancel any pending execution if it exists, since we may have changed period / jitter parameters
++        if (this.invalidRoleDisconnectTask != null)
++        {
++            logger.debug("Canceling previous invalidRoleDisconnectTask");
++            this.invalidRoleDisconnectTask.cancel(true);
++        }
++
++        long period = getInvalidClientDisconnectPeriodMillis();
++        long jitter = getInvalidClientDisconnectMaxJitterMillis();
++        if (period <= 0)
++        {
++            logger.info("Invalid role disconnection is disabled");
++            return;
++        }
++        LongSupplier delayMillis = () -> period + ThreadLocalRandom.current().nextLong(0, jitter);
++        long firstDelayMillis = delayMillis.getAsLong();
++        ScheduledExecutorPlus executor = ScheduledExecutors.optionalTasks;
++
++        logger.debug("Scheduling first invalid role disconnection in {} millis", firstDelayMillis);
++        this.invalidRoleDisconnectTask = executor.schedule(() -> invalidRoleDisconnectTask(delayMillis, executor), firstDelayMillis, TimeUnit.MILLISECONDS);
++    }
++
++    @Override
++    public long getInvalidClientDisconnectPeriodMillis()
++    {
++        return this.invalidClientDisconnectPeriodMillis;
++    }
++
++    @Override
++    public void setInvalidClientDisconnectPeriodMillis(long duration)
++    {
++        this.invalidClientDisconnectPeriodMillis = duration;
++        scheduleDisconnectInvalidRoleTask();
++    }
++
++    @Override
++    public long getInvalidClientDisconnectMaxJitterMillis()
++    {
++        return this.invalidClientDisconnectMaxJitterMillis;
++    }
++
++    @Override
++    public void setInvalidClientDisconnectMaxJitterMillis(long duration)
++    {
++        this.invalidClientDisconnectMaxJitterMillis = duration;
++        scheduleDisconnectInvalidRoleTask();
++    }
+ }
+diff --git a/src/java/org/apache/cassandra/auth/CassandraRoleManagerMBean.java b/src/java/org/apache/cassandra/auth/CassandraRoleManagerMBean.java
+new file mode 100644
+index 0000000000..f869ac70bc
+--- /dev/null
++++ b/src/java/org/apache/cassandra/auth/CassandraRoleManagerMBean.java
+@@ -0,0 +1,49 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.cassandra.auth;
++
++/**
++ * MBean utilities for dynamic access to CassandraRoleManager
++ */
++public interface CassandraRoleManagerMBean
++{
++    /**
++     * Get the period between invalid client disconnect attempts
++     * @return time between attempts in milliseconds
++     */
++    long getInvalidClientDisconnectPeriodMillis();
++
++    /**
++     * Set the period between invalid client disconnect attempts
++     * @param duration time between attempts in milliseconds
++     */
++    void setInvalidClientDisconnectPeriodMillis(long duration);
++
++    /**
++     * Get the maximum jitter between invalid client disconnect attempts
++     * @return maximum jitter in milliseconds
++     */
++    long getInvalidClientDisconnectMaxJitterMillis();
++
++    /**
++     * Set the maximum jitter between invalid client disconnect attempts
++     * @param duration maximum jitter in milliseconds
++     */
++    void setInvalidClientDisconnectMaxJitterMillis(long duration);
++}
+diff --git a/src/java/org/apache/cassandra/service/CassandraDaemon.java b/src/java/org/apache/cassandra/service/CassandraDaemon.java
+index df73f14b40..8c44c4286d 100644
+--- a/src/java/org/apache/cassandra/service/CassandraDaemon.java
++++ b/src/java/org/apache/cassandra/service/CassandraDaemon.java
+@@ -31,6 +31,7 @@ import java.util.List;
+ import java.util.Set;
+ import java.util.concurrent.ExecutionException;
+ import java.util.concurrent.TimeUnit;
++import java.util.function.Predicate;
+ import java.util.stream.Stream;
+ import javax.management.StandardMBean;
+ import javax.management.remote.JMXConnectorServer;
+@@ -45,6 +46,7 @@ import com.codahale.metrics.MetricRegistryListener;
+ import com.codahale.metrics.SharedMetricRegistries;
+ import org.apache.cassandra.audit.AuditLogManager;
+ import org.apache.cassandra.auth.AuthCacheService;
++import org.apache.cassandra.auth.AuthenticatedUser;
+ import org.apache.cassandra.concurrent.ScheduledExecutors;
+ import org.apache.cassandra.config.CassandraRelevantProperties;
+ import org.apache.cassandra.config.DatabaseDescriptor;
+@@ -887,6 +889,11 @@ public class CassandraDaemon
+         nativeTransportService.clearConnectionHistory();
+     }
+ 
++    public void disconnectUser(Predicate<AuthenticatedUser> userPredicate)
++    {
++        nativeTransportService.disconnect(userPredicate);
++    }
++
+     private void exitOrFail(int code, String message)
+     {
+         exitOrFail(code, message, null);
+diff --git a/src/java/org/apache/cassandra/service/NativeTransportService.java b/src/java/org/apache/cassandra/service/NativeTransportService.java
+index d608999001..5766be65c6 100644
+--- a/src/java/org/apache/cassandra/service/NativeTransportService.java
++++ b/src/java/org/apache/cassandra/service/NativeTransportService.java
+@@ -19,6 +19,7 @@ package org.apache.cassandra.service;
+ 
+ import java.net.InetAddress;
+ import java.util.concurrent.TimeUnit;
++import java.util.function.Predicate;
+ 
+ import com.google.common.annotations.VisibleForTesting;
+ 
+@@ -30,6 +31,7 @@ import io.netty.channel.epoll.Epoll;
+ import io.netty.channel.epoll.EpollEventLoopGroup;
+ import io.netty.channel.nio.NioEventLoopGroup;
+ import io.netty.util.Version;
++import org.apache.cassandra.auth.AuthenticatedUser;
+ import org.apache.cassandra.config.DatabaseDescriptor;
+ import org.apache.cassandra.config.EncryptionOptions;
+ import org.apache.cassandra.metrics.ClientMetrics;
+@@ -164,4 +166,9 @@ public class NativeTransportService
+     {
+         server.clearConnectionHistory();
+     }
++
++    public void disconnect(Predicate<AuthenticatedUser> userPredicate)
++    {
++        server.disconnect(userPredicate);
++    }
+ }
+diff --git a/src/java/org/apache/cassandra/service/StorageService.java b/src/java/org/apache/cassandra/service/StorageService.java
+index 12981f724a..3817077df0 100644
+--- a/src/java/org/apache/cassandra/service/StorageService.java
++++ b/src/java/org/apache/cassandra/service/StorageService.java
+@@ -4767,6 +4767,13 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
+         daemon.clearConnectionHistory();
+         logger.info("Cleared connection history");
+     }
++
++    public void disconnectInvalidRoles()
++    {
++        logger.info("Disconnecting invalid roles");
++        daemon.disconnectUser(user -> !user.canLogin());
++    }
++
+     public void disableAuditLog()
+     {
+         AuditLogManager.instance.disableAuditLog();
+@@ -5463,5 +5470,4 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
+     {
+         DatabaseDescriptor.setEnforceNativeDeadlineForHints(value);
+     }
+-
+ }
+diff --git a/src/java/org/apache/cassandra/transport/Server.java b/src/java/org/apache/cassandra/transport/Server.java
+index c6f42da376..e657dd1257 100644
+--- a/src/java/org/apache/cassandra/transport/Server.java
++++ b/src/java/org/apache/cassandra/transport/Server.java
+@@ -211,6 +211,11 @@ public class Server implements CassandraDaemon.Server
+         logger.info("Stop listening for CQL clients");
+     }
+ 
++    public void disconnect(Predicate<AuthenticatedUser> userPredicate)
++    {
++        connectionTracker.disconnectByUser(userPredicate);
++    }
++
+     public static class Builder
+     {
+         private EventLoopGroup workerGroup;
+@@ -383,6 +388,23 @@ public class Server implements CassandraDaemon.Server
+             return result;
+         }
+ 
++        void disconnectByUser(Predicate<AuthenticatedUser> userPredicate)
++        {
++            for (Channel c : allChannels)
++            {
++                Connection connection = c.attr(Connection.attributeKey).get();
++                if (connection instanceof ServerConnection)
++                {
++                    ServerConnection conn = (ServerConnection) connection;
++                    AuthenticatedUser user = conn.getClientState().getUser();
++                    if (user == null || userPredicate.test(user))
++                    {
++                        logger.info("Closing channel with remote address {} with user {}", conn.channel().remoteAddress(), user);
++                        connection.channel().close();
++                    }
++                }
++            }
++        }
+     }
+ 
+     private static class LatestEvent
+diff --git a/test/distributed/org/apache/cassandra/distributed/test/auth/RoleRevocationTest.java b/test/distributed/org/apache/cassandra/distributed/test/auth/RoleRevocationTest.java
+new file mode 100644
+index 0000000000..5b3ae35128
+--- /dev/null
++++ b/test/distributed/org/apache/cassandra/distributed/test/auth/RoleRevocationTest.java
+@@ -0,0 +1,142 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.cassandra.distributed.test.auth;
++
++import java.util.function.Consumer;
++
++import org.junit.Test;
++
++import com.datastax.driver.core.PlainTextAuthProvider;
++import com.datastax.driver.core.Session;
++import com.datastax.driver.core.policies.ConstantReconnectionPolicy;
++import com.datastax.driver.core.policies.ReconnectionPolicy;
++import org.apache.cassandra.auth.AuthenticatedUser;
++import org.apache.cassandra.auth.IRoleManager;
++import org.apache.cassandra.auth.RoleOptions;
++import org.apache.cassandra.auth.RoleResource;
++import org.apache.cassandra.auth.Roles;
++import org.apache.cassandra.config.DatabaseDescriptor;
++import org.apache.cassandra.distributed.Cluster;
++import org.apache.cassandra.distributed.api.Feature;
++import org.apache.cassandra.distributed.api.ICluster;
++import org.apache.cassandra.distributed.api.IInvokableInstance;
++import org.apache.cassandra.distributed.test.JavaDriverUtils;
++import org.apache.cassandra.distributed.test.TestBaseImpl;
++import org.apache.cassandra.service.StorageService;
++import org.assertj.core.api.Assertions;
++
++import static java.util.concurrent.TimeUnit.MILLISECONDS;
++import static java.util.concurrent.TimeUnit.SECONDS;
++import static org.awaitility.Awaitility.await;
++
++public class RoleRevocationTest extends TestBaseImpl
++{
++    // Ensure both the coordinator of the DDL and a replica both change connection state accordingly
++    private static final int CLUSTER_SIZE = 2;
++    private static final String USERNAME = "revoke_me";
++    private static final String PASSWORD = "i_deserve_disconnection";
++    private static final PlainTextAuthProvider CLIENT_AUTH_PROVIDER = new PlainTextAuthProvider(USERNAME, PASSWORD);
++    private static final ReconnectionPolicy RECONNECTION_POLICY = new ConstantReconnectionPolicy(100);
++
++    public static ICluster<IInvokableInstance> cluster() throws Exception
++    {
++        Cluster.Builder builder = Cluster.build(CLUSTER_SIZE);
++
++        builder.withConfig(c -> c.set("authenticator.class_name", "org.apache.cassandra.auth.PasswordAuthenticator")
++                                 .set("role_manager", "CassandraRoleManager")
++                                 .set("authorizer", "CassandraAuthorizer")
++                                 .with(Feature.NETWORK, Feature.NATIVE_PROTOCOL, Feature.GOSSIP));
++        ICluster<IInvokableInstance> cluster = builder.start();
++
++        cluster.get(1).runOnInstance(() -> {
++            RoleOptions opts = new RoleOptions();
++            opts.setOption(IRoleManager.Option.PASSWORD, PASSWORD);
++            opts.setOption(IRoleManager.Option.LOGIN, true);
++            DatabaseDescriptor.getRoleManager().createRole(AuthenticatedUser.SYSTEM_USER, RoleResource.role(USERNAME), opts);
++        });
++
++        return cluster;
++    }
++
++    @Test
++    public void alterRoleLoginFalse() throws Exception
++    {
++        test(instance -> {
++            instance.runOnInstance(() -> {
++                RoleOptions opts = new RoleOptions();
++                opts.setOption(IRoleManager.Option.LOGIN, false);
++                DatabaseDescriptor.getRoleManager().alterRole(AuthenticatedUser.SYSTEM_USER, RoleResource.role(USERNAME), opts);
++            });
++        });
++    }
++
++    @Test
++    public void dropRole() throws Exception
++    {
++        test(instance -> {
++            instance.runOnInstance(() -> {
++                DatabaseDescriptor.getRoleManager().dropRole(AuthenticatedUser.SYSTEM_USER, RoleResource.role(USERNAME));
++            });
++        });
++    }
++
++    private void test(Consumer<IInvokableInstance> action) throws Exception
++    {
++        ICluster<IInvokableInstance> CLUSTER = cluster();
++        com.datastax.driver.core.Cluster driver = JavaDriverUtils.create(CLUSTER, null, builder -> builder
++                                                                                                   .withAuthProvider(CLIENT_AUTH_PROVIDER)
++                                                                                                   .withReconnectionPolicy(RECONNECTION_POLICY));
++        Session session = driver.connect();
++
++        // One control, one data connection per host
++        Assertions.assertThat(driver.getMetrics().getOpenConnections().getValue()).isEqualTo(CLUSTER_SIZE + 1);
++        Assertions.assertThat(driver.getMetrics().getConnectedToHosts().getValue()).isEqualTo(CLUSTER_SIZE);
++        Assertions.assertThat(driver.getMetrics().getErrorMetrics().getAuthenticationErrors().getCount()).isEqualTo(0);
++
++        action.accept(CLUSTER.get(1));
++
++        CLUSTER.forEach(instance -> {
++            instance.runOnInstance(() -> {
++                Roles.cache.invalidate();
++                StorageService.instance.disconnectInvalidRoles();
++            });
++        });
++
++        await().pollDelay(100, MILLISECONDS)
++               .pollInterval(100, MILLISECONDS)
++               .atMost(10, SECONDS)
++               .untilAsserted(() -> {
++                   // Should disconnect from both the coordinator of the DDL and the replica that is notified
++                   Assertions.assertThat(driver.getMetrics().getOpenConnections().getValue()).isEqualTo(0);
++                   Assertions.assertThat(driver.getMetrics().getConnectedToHosts().getValue()).isEqualTo(0);
++               });
++
++        await().pollDelay(100, MILLISECONDS)
++               .pollInterval(100, MILLISECONDS)
++               .atMost(10, SECONDS)
++               .untilAsserted(() -> {
++                   long authErrors = session.getCluster().getMetrics().getErrorMetrics().getAuthenticationErrors().getCount();
++                   Assertions.assertThat(authErrors).isGreaterThan(0);
++               });
++
++        session.close();
++        driver.close();
++        CLUSTER.close();
++    }
++}
+\ No newline at end of file
+diff --git a/test/unit/org/apache/cassandra/auth/CassandraRoleManagerTest.java b/test/unit/org/apache/cassandra/auth/CassandraRoleManagerTest.java
+index 658d4b2bb8..0ee9587164 100644
+--- a/test/unit/org/apache/cassandra/auth/CassandraRoleManagerTest.java
++++ b/test/unit/org/apache/cassandra/auth/CassandraRoleManagerTest.java
+@@ -18,18 +18,24 @@
+ 
+ package org.apache.cassandra.auth;
+ 
++import java.util.HashMap;
+ import java.util.Map;
+ import java.util.Set;
++import java.util.concurrent.atomic.AtomicInteger;
+ 
+ import org.junit.Before;
+ import org.junit.BeforeClass;
+ import org.junit.Test;
+ 
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
+ import org.apache.cassandra.SchemaLoader;
+ import org.apache.cassandra.config.DatabaseDescriptor;
+ import org.apache.cassandra.db.ColumnFamilyStore;
+ import org.apache.cassandra.schema.SchemaConstants;
+ import org.apache.cassandra.service.StorageService;
++import org.assertj.core.api.Assertions;
+ 
+ import static org.apache.cassandra.auth.AuthTestUtils.*;
+ import static org.junit.Assert.assertEquals;
+@@ -37,6 +43,8 @@ import static org.junit.Assert.assertTrue;
+ 
+ public class CassandraRoleManagerTest
+ {
++    private static final Logger logger = LoggerFactory.getLogger(CassandraRoleManagerTest.class);
++
+     @BeforeClass
+     public static void setupClass()
+     {
+@@ -160,4 +168,76 @@ public class CassandraRoleManagerTest
+         for (RoleResource expectedRole : expected)
+             assertTrue(actual.stream().anyMatch(role -> role.resource.equals(expectedRole)));
+     }
++
++    @Test
++    public void disconnectsAttemptedOnPeriodWithJitter() throws InterruptedException
++    {
++        AtomicInteger numDisconnectAttempts = new AtomicInteger();
++
++        // min: 800ms, max: 900ms
++        Map<String, String> params = Map.of(
++            CassandraRoleManager.PARAM_INVALID_ROLE_DISCONNECT_TASK_PERIOD, "800ms",
++            CassandraRoleManager.PARAM_INVALID_ROLE_DISCONNECT_TASK_MAX_JITTER, "100ms"
++        );
++
++        CassandraRoleManager crm = new CassandraRoleManager(params) {
++            @Override
++            protected void disconnectInvalidRoles()
++            {
++                logger.info("Disconnecting invalid roles...");
++                numDisconnectAttempts.incrementAndGet();
++            }
++        };
++
++        crm.scheduleDisconnectInvalidRoleTask();
++        Thread.sleep(3_000);
++        Assertions.assertThat(numDisconnectAttempts.get()).isGreaterThanOrEqualTo(3);
++        Assertions.assertThat(numDisconnectAttempts.get()).isLessThan(4);
++        numDisconnectAttempts.set(0);
++
++        crm.setInvalidClientDisconnectPeriodMillis(100); // min: 100ms, max: 200ms
++        Thread.sleep(3_000);
++        Assertions.assertThat(numDisconnectAttempts.get()).isGreaterThanOrEqualTo(10); // 15 - padding
++        Assertions.assertThat(numDisconnectAttempts.get()).isLessThan(30);
++
++        crm.setInvalidClientDisconnectPeriodMillis(0);
++        int totalDisconnectAttempts = numDisconnectAttempts.get();
++        Thread.sleep(3_000);
++        Assertions.assertThat(numDisconnectAttempts.get()).isEqualTo(totalDisconnectAttempts);
++    }
++
++    @Test
++    public void ctorInvalidRoleDisconnectOptions()
++    {
++        CassandraRoleManager crm = new CassandraRoleManager(Map.of());
++        Assertions.assertThat(crm.getInvalidClientDisconnectPeriodMillis()).isEqualTo(0);
++        Assertions.assertThat(crm.getInvalidClientDisconnectMaxJitterMillis()).isEqualTo(0);
++
++        crm = new CassandraRoleManager(Map.of(
++            CassandraRoleManager.PARAM_INVALID_ROLE_DISCONNECT_TASK_PERIOD, "1s",
++            CassandraRoleManager.PARAM_INVALID_ROLE_DISCONNECT_TASK_MAX_JITTER, "2s"
++        ));
++        Assertions.assertThat(crm.getInvalidClientDisconnectPeriodMillis()).isEqualTo(1000);
++        Assertions.assertThat(crm.getInvalidClientDisconnectMaxJitterMillis()).isEqualTo(2000);
++
++        // Non-duration input
++        Map<String, String> params = new HashMap<>();
++        params.put(CassandraRoleManager.PARAM_INVALID_ROLE_DISCONNECT_TASK_PERIOD, "notduration");
++        Assertions.assertThatThrownBy(() -> new CassandraRoleManager(params)).isOfAnyClassIn(IllegalArgumentException.class).hasMessageContaining("Invalid duration: ");
++
++        // Both fields optional
++        crm = new CassandraRoleManager(Map.of(
++            CassandraRoleManager.PARAM_INVALID_ROLE_DISCONNECT_TASK_PERIOD, "1s"
++            // No jitter
++        ));
++        Assertions.assertThat(crm.getInvalidClientDisconnectPeriodMillis()).isEqualTo(1000);
++        Assertions.assertThat(crm.getInvalidClientDisconnectMaxJitterMillis()).isEqualTo(0);
++
++        crm = new CassandraRoleManager(Map.of(
++            // No period
++            CassandraRoleManager.PARAM_INVALID_ROLE_DISCONNECT_TASK_MAX_JITTER, "1s"
++        ));
++        Assertions.assertThat(crm.getInvalidClientDisconnectPeriodMillis()).isEqualTo(0);
++        Assertions.assertThat(crm.getInvalidClientDisconnectMaxJitterMillis()).isEqualTo(1000);
++    }
+ }
+diff --git a/test/unit/org/apache/cassandra/auth/RolesTest.java b/test/unit/org/apache/cassandra/auth/RolesTest.java
+index 0a64d1ffc7..90cf57f054 100644
+--- a/test/unit/org/apache/cassandra/auth/RolesTest.java
++++ b/test/unit/org/apache/cassandra/auth/RolesTest.java
+@@ -31,6 +31,7 @@ import org.junit.Test;
+ import org.apache.cassandra.SchemaLoader;
+ import org.apache.cassandra.config.DatabaseDescriptor;
+ import org.apache.cassandra.db.ConsistencyLevel;
++import org.assertj.core.api.Assertions;
+ 
+ import static org.apache.cassandra.auth.AuthTestUtils.ALL_ROLES;
+ import static org.apache.cassandra.auth.AuthTestUtils.ROLE_A;
+@@ -139,4 +140,13 @@ public class RolesTest
+                                  .map(RoleResource::getRoleName)
+                                  .collect(Collectors.toSet()));
+     }
++
++    @Test
++    public void testNonexistentRoleCantLogin()
++    {
++        // There can be a reference to a nonexistent role (that has been removed from the cache and the system table)
++        // via the native transport connection state, make sure there's no NPE on canLogin check
++        AuthenticatedUser nonexistent = new AuthenticatedUser("nonexistent");
++        Assertions.assertThat(nonexistent.canLogin()).isFalse();
++    }
+ }

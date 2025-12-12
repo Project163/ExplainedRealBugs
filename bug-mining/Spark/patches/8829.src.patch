@@ -1,0 +1,227 @@
+diff --git a/sql/core/src/main/scala/org/apache/spark/sql/execution/datasources/FileSourceStrategy.scala b/sql/core/src/main/scala/org/apache/spark/sql/execution/datasources/FileSourceStrategy.scala
+index dec498010b6..a4ffcb5729d 100644
+--- a/sql/core/src/main/scala/org/apache/spark/sql/execution/datasources/FileSourceStrategy.scala
++++ b/sql/core/src/main/scala/org/apache/spark/sql/execution/datasources/FileSourceStrategy.scala
+@@ -214,9 +214,20 @@ object FileSourceStrategy extends Strategy with PredicateHelper with Logging {
+         .filterNot(partitionColumns.contains)
+ 
+       // Metadata attributes are part of a column of type struct up to this point. Here we extract
+-      // this column from the schema.
++      // this column from the schema and specify a matcher for that.
++      object MetadataStructColumn {
++        def unapply(attributeReference: AttributeReference): Option[AttributeReference] = {
++          attributeReference match {
++            case attr @ FileSourceMetadataAttribute(
++                AttributeReference("_metadata", StructType(_), _, _)) =>
++              Some(attr)
++            case _ => None
++          }
++        }
++      }
++
+       val metadataStructOpt = l.output.collectFirst {
+-        case FileSourceMetadataAttribute(attr) => attr
++        case MetadataStructColumn(attr) => attr
+       }
+ 
+       val constantMetadataColumns: mutable.Buffer[Attribute] = mutable.Buffer.empty
+@@ -258,6 +269,35 @@ object FileSourceStrategy extends Strategy with PredicateHelper with Logging {
+       val outputAttributes = readDataColumns ++ generatedMetadataColumns ++
+         partitionColumns ++ constantMetadataColumns
+ 
++      // Rebind metadata attribute references in filters after the metadata attribute struct has
++      // been flattened. Only data filters can contain metadata references. After the rebinding
++      // all references will be bound to output attributes which are either
++      // [[FileSourceConstantMetadataAttribute]] or [[FileSourceGeneratedMetadataAttribute]] after
++      // the flattening from the metadata struct.
++      def rebindFileSourceMetadataAttributesInFilters(
++          filters: Seq[Expression]): Seq[Expression] = {
++        // The row index field attribute got renamed.
++        def newFieldName(name: String) = name match {
++          case FileFormat.ROW_INDEX => FileFormat.ROW_INDEX_TEMPORARY_COLUMN_NAME
++          case other => other
++        }
++
++        filters.map { filter =>
++          filter.transform {
++            // Replace references to the _metadata column. This will affect references to the column
++            // itself but also where fields from the metadata struct are used.
++            case MetadataStructColumn(AttributeReference(_, fields @ StructType(_), _, _)) =>
++              CreateStruct(fields.map(
++                field => metadataColumns.find(attr => attr.name == newFieldName(field.name)).get))
++          }.transform {
++            // Replace references to struct fields with the field values. This is to avoid creating
++            // temporaries to improve performance.
++            case GetStructField(createNamedStruct: CreateNamedStruct, ordinal, _) =>
++              createNamedStruct.valExprs(ordinal)
++          }
++        }
++      }
++
+       val scan =
+         FileSourceScanExec(
+           fsRelation,
+@@ -266,7 +306,7 @@ object FileSourceStrategy extends Strategy with PredicateHelper with Logging {
+           partitionKeyFilters.toSeq,
+           bucketSet,
+           None,
+-          dataFilters,
++          rebindFileSourceMetadataAttributesInFilters(dataFilters),
+           table.map(_.identifier))
+ 
+       // extra Project node: wrap flat metadata columns to a metadata struct
+diff --git a/sql/core/src/main/scala/org/apache/spark/sql/execution/datasources/PartitioningAwareFileIndex.scala b/sql/core/src/main/scala/org/apache/spark/sql/execution/datasources/PartitioningAwareFileIndex.scala
+index a9a41d902f1..137fd6fe1ac 100644
+--- a/sql/core/src/main/scala/org/apache/spark/sql/execution/datasources/PartitioningAwareFileIndex.scala
++++ b/sql/core/src/main/scala/org/apache/spark/sql/execution/datasources/PartitioningAwareFileIndex.scala
+@@ -76,28 +76,34 @@ abstract class PartitioningAwareFileIndex(
+     // be applied to files.
+     val fileMetadataFilterOpt = dataFilters.filter { f =>
+       f.references.nonEmpty && f.references.forall {
+-        case FileSourceMetadataAttribute(_) => true
++        case FileSourceConstantMetadataAttribute(_) => true
+         case _ => false
+       }
+     }.reduceOption(expressions.And)
+ 
+-    // - create a bound references for filters: put the metadata struct at 0 position for each file
+-    // - retrieve the final metadata struct (could be pruned) from filters
++    // - Retrieve all required metadata attributes and put them into a sequence
++    // - Bind all file constant metadata attribute references to their respective index
++    val requiredMetadataColumnNames: mutable.Buffer[String] = mutable.Buffer.empty
+     val boundedFilterMetadataStructOpt = fileMetadataFilterOpt.map { fileMetadataFilter =>
+-      val metadataStruct = fileMetadataFilter.references.head.dataType
+-      val boundedFilter = Predicate.createInterpreted(fileMetadataFilter.transform {
+-        case _: AttributeReference => BoundReference(0, metadataStruct, nullable = true)
++      Predicate.createInterpreted(fileMetadataFilter.transform {
++        case attr: AttributeReference =>
++          val existingMetadataColumnIndex = requiredMetadataColumnNames.indexOf(attr.name)
++          val metadataColumnIndex = if (existingMetadataColumnIndex >= 0) {
++            existingMetadataColumnIndex
++          } else {
++            requiredMetadataColumnNames += attr.name
++            requiredMetadataColumnNames.length - 1
++          }
++          BoundReference(metadataColumnIndex, attr.dataType, nullable = true)
+       })
+-      (boundedFilter, metadataStruct)
+     }
+ 
+     def matchFileMetadataPredicate(f: FileStatus): Boolean = {
+       // use option.forall, so if there is no filter no metadata struct, return true
+-      boundedFilterMetadataStructOpt.forall { case (boundedFilter, metadataStruct) =>
+-        val row = InternalRow.fromSeq(Seq(
+-          createMetadataInternalRow(metadataStruct.asInstanceOf[StructType].names,
++      boundedFilterMetadataStructOpt.forall { boundedFilter =>
++        val row =
++          createMetadataInternalRow(requiredMetadataColumnNames.toSeq,
+             f.getPath, f.getLen, f.getModificationTime)
+-        ))
+         boundedFilter.eval(row)
+       }
+     }
+diff --git a/sql/core/src/test/scala/org/apache/spark/sql/execution/datasources/FileMetadataStructSuite.scala b/sql/core/src/test/scala/org/apache/spark/sql/execution/datasources/FileMetadataStructSuite.scala
+index 08adcf7041b..208e401f153 100644
+--- a/sql/core/src/test/scala/org/apache/spark/sql/execution/datasources/FileMetadataStructSuite.scala
++++ b/sql/core/src/test/scala/org/apache/spark/sql/execution/datasources/FileMetadataStructSuite.scala
+@@ -677,4 +677,100 @@ class FileMetadataStructSuite extends QueryTest with SharedSparkSession {
+     assert(analyzedStruct.fields.forall(!_.nullable), analyzedStruct.fields.mkString(", "))
+     assert(executedStruct.fields.forall(!_.nullable), executedStruct.fields.mkString(", "))
+   }
++
++  test("SPARK-41896: Filter on row_index and a stored column at the same time") {
++    withTempPath { dir =>
++      val storedIdName = "stored_id"
++      val storedIdUpperLimitExclusive = 520
++      val rowIndexLowerLimitInclusive = 10
++
++      spark.range(start = 500, end = 600)
++        .toDF(storedIdName)
++        .write
++        .format("parquet")
++        .save(dir.getAbsolutePath)
++
++      // Select stored_id 510 to 519 via a stored_id and row_index filter.
++      val collectedRows = spark.read.load(dir.getAbsolutePath)
++        .select(storedIdName, METADATA_ROW_INDEX)
++        .where(col(storedIdName).lt(lit(storedIdUpperLimitExclusive)))
++        .where(col(METADATA_ROW_INDEX).geq(lit(rowIndexLowerLimitInclusive)))
++        .collect()
++
++      assert(collectedRows.length === 10)
++      assert(collectedRows.forall(_.getLong(0) < storedIdUpperLimitExclusive))
++      assert(collectedRows.forall(_.getLong(1) >= rowIndexLowerLimitInclusive))
++    }
++  }
++
++  test("SPARK-41896: Filter on constant and generated metadata attributes at the same time") {
++    withTempPath { dir =>
++      val idColumnName = "id"
++      val partitionColumnName = "partition"
++      val numFiles = 4
++      val totalNumRows = 40
++
++      spark.range(end = totalNumRows)
++        .toDF(idColumnName)
++        .withColumn(partitionColumnName, col(idColumnName).mod(lit(numFiles)))
++        .write
++        .partitionBy(partitionColumnName)
++        .format("parquet")
++        .save(dir.getAbsolutePath)
++
++      // Get one file path.
++      val randomTableFilePath = spark.read.load(dir.getAbsolutePath)
++        .select(METADATA_FILE_PATH).collect().head.getString(0)
++
++      // Select half the rows from one file.
++      val halfTheNumberOfRowsPerFile = totalNumRows / (numFiles * 2)
++      val collectedRows = spark.read.load(dir.getAbsolutePath)
++        .select(METADATA_FILE_PATH, METADATA_ROW_INDEX)
++        .where(col(METADATA_FILE_PATH).equalTo(lit(randomTableFilePath)))
++        .where(col(METADATA_ROW_INDEX).leq(lit(halfTheNumberOfRowsPerFile)))
++        .collect()
++
++      // Assert we only select rows from one file.
++      assert(collectedRows.map(_.getString(0)).distinct.length === 1)
++      // Assert we filtered by row index.
++      assert(collectedRows.forall(row => row.getLong(1) < halfTheNumberOfRowsPerFile))
++      assert(collectedRows.length === halfTheNumberOfRowsPerFile)
++    }
++  }
++
++  test("SPARK-41896: Filter by a function that takes the metadata struct as argument") {
++    withTempPath { dir =>
++      val idColumnName = "id"
++      val numFiles = 4
++      spark.range(end = numFiles)
++        .toDF(idColumnName)
++        .withColumn("partition", col(idColumnName))
++        .write
++        .format("parquet")
++        .partitionBy("partition")
++        .save(dir.getAbsolutePath)
++
++      // Select path and partition value for a random file.
++      val testFileData = spark.read.load(dir.getAbsolutePath)
++        .select(idColumnName, METADATA_FILE_PATH).collect().head
++      val testFilePartition = testFileData.getLong(0)
++      val testFilePath = testFileData.getString(1)
++
++      val filterFunctionName = "isTestFile"
++      withUserDefinedFunction(filterFunctionName -> true) {
++        // Create and use a filter using the file path.
++        spark.udf.register(filterFunctionName,
++          (metadata: Row) => {
++            metadata.getAs[String]("file_path") == testFilePath
++          })
++        val udfFilterResult = spark.read.load(dir.getAbsolutePath)
++          .select(idColumnName, METADATA_FILE_PATH)
++          .where(s"$filterFunctionName(_metadata)")
++          .collect().head
++
++        assert(testFilePartition === udfFilterResult.getLong(0))
++        assert(testFilePath === udfFilterResult.getString(1))
++      }
++    }
++  }
+ }

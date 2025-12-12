@@ -1,0 +1,201 @@
+diff --git a/CHANGES.txt b/CHANGES.txt
+index c4bde7339e..f3d40ad3c7 100644
+--- a/CHANGES.txt
++++ b/CHANGES.txt
+@@ -1,4 +1,5 @@
+ 5.1
++ * Retry if node leaves CMS while committing a transformation (CASSANDRA-19872)
+  * Add support for NOT operators in WHERE clauses. Fixed Three Valued Logic (CASSANDRA-18584)
+  * Allow getendpoints for system tables and make sure getNaturalReplicas work for MetaStrategy (CASSANDRA-19846)
+  * On upgrade, handle pre-existing tables with unexpected table ids (CASSANDRA-19845)
+diff --git a/src/java/org/apache/cassandra/tcm/AbstractLocalProcessor.java b/src/java/org/apache/cassandra/tcm/AbstractLocalProcessor.java
+index 247aa45670..da4e2e53ba 100644
+--- a/src/java/org/apache/cassandra/tcm/AbstractLocalProcessor.java
++++ b/src/java/org/apache/cassandra/tcm/AbstractLocalProcessor.java
+@@ -56,7 +56,15 @@ public abstract class AbstractLocalProcessor implements Processor
+         {
+             ClusterMetadata previous = log.waitForHighestConsecutive();
+             if (!previous.fullCMSMembers().contains(FBUtilities.getBroadcastAddressAndPort()))
+-                throw new IllegalStateException("Node is not a member of CMS anymore");
++            {
++                String msg = String.format("Node %s is not a CMS member in epoch %s; members=%s",
++                                           FBUtilities.getBroadcastAddressAndPort(),
++                                           previous.epoch.getEpoch(),
++                                           previous.fullCMSMembers());
++                logger.warn(msg);
++                throw new NotCMSException(msg);
++            }
++
+             Transformation.Result result;
+             if (!CassandraRelevantProperties.TCM_ALLOW_TRANSFORMATIONS_DURING_UPGRADES.getBoolean() &&
+                 !transform.allowDuringUpgrades() &&
+diff --git a/src/java/org/apache/cassandra/tcm/ClusterMetadata.java b/src/java/org/apache/cassandra/tcm/ClusterMetadata.java
+index fdf4942c13..9862e51ecb 100644
+--- a/src/java/org/apache/cassandra/tcm/ClusterMetadata.java
++++ b/src/java/org/apache/cassandra/tcm/ClusterMetadata.java
+@@ -74,6 +74,7 @@ import org.apache.cassandra.tcm.serialization.Version;
+ import org.apache.cassandra.utils.FBUtilities;
+ import org.apache.cassandra.utils.Pair;
+ 
++import static com.google.common.collect.ImmutableSet.toImmutableSet;
+ import static org.apache.cassandra.config.CassandraRelevantProperties.LINE_SEPARATOR;
+ import static org.apache.cassandra.db.TypeSizes.sizeof;
+ 
+@@ -95,9 +96,10 @@ public class ClusterMetadata
+     public final InProgressSequences inProgressSequences;
+     public final ImmutableMap<ExtensionKey<?,?>, ExtensionValue<?>> extensions;
+ 
+-    // These two fields are lazy but only for the test purposes, since their computation requires initialization of the log ks
++    // These fields are lazy but only for the test purposes, since their computation requires initialization of the log ks
+     private EndpointsForRange fullCMSReplicas;
+     private Set<InetAddressAndPort> fullCMSEndpoints;
++    private Set<NodeId> fullCMSIds;
+ 
+     public ClusterMetadata(IPartitioner partitioner)
+     {
+@@ -181,6 +183,13 @@ public class ClusterMetadata
+         return fullCMSEndpoints;
+     }
+ 
++    public Set<NodeId> fullCMSMemberIds()
++    {
++        if (fullCMSIds == null)
++            this.fullCMSIds = placements.get(ReplicationParams.meta(this)).reads.byEndpoint().keySet().stream().map(directory::peerId).collect(toImmutableSet());
++        return fullCMSIds;
++    }
++
+     public EndpointsForRange fullCMSMembersAsReplicas()
+     {
+         if (fullCMSReplicas == null)
+diff --git a/src/java/org/apache/cassandra/tcm/ClusterMetadataService.java b/src/java/org/apache/cassandra/tcm/ClusterMetadataService.java
+index 43fbe8c6e9..236e82392a 100644
+--- a/src/java/org/apache/cassandra/tcm/ClusterMetadataService.java
++++ b/src/java/org/apache/cassandra/tcm/ClusterMetadataService.java
+@@ -844,11 +844,23 @@ public class ClusterMetadataService
+         @Override
+         public Commit.Result commit(Entry.Id entryId, Transformation transform, Epoch lastKnown, Retry.Deadline retryPolicy)
+         {
+-            Pair<State, Processor> delegate = delegateInternal();
+-            Commit.Result result = delegate.right.commit(entryId, transform, lastKnown, retryPolicy);
+-            if (delegate.left == LOCAL || delegate.left == RESET)
+-                replicator.send(result, null);
+-            return result;
++            while (!retryPolicy.reachedMax())
++            {
++                try
++                {
++                    Pair<State, Processor> delegate = delegateInternal();
++                    Commit.Result result = delegate.right.commit(entryId, transform, lastKnown, retryPolicy);
++                    ClusterMetadataService.State state = delegate.left;
++                    if (state == LOCAL || state == RESET)
++                        replicator.send(result, null);
++                    return result;
++                }
++                catch (NotCMSException e)
++                {
++                    retryPolicy.maybeSleep();
++                }
++            }
++            return Commit.Result.failed(ExceptionCode.SERVER_ERROR, "Could not commit " + transform.kind() + " at epoch " + lastKnown);
+         }
+ 
+         @Override
+diff --git a/src/java/org/apache/cassandra/tcm/log/LocalLog.java b/src/java/org/apache/cassandra/tcm/log/LocalLog.java
+index a5b744fc17..90b489ed51 100644
+--- a/src/java/org/apache/cassandra/tcm/log/LocalLog.java
++++ b/src/java/org/apache/cassandra/tcm/log/LocalLog.java
+@@ -21,6 +21,7 @@ package org.apache.cassandra.tcm.log;
+ import java.util.ArrayList;
+ import java.util.Collection;
+ import java.util.Collections;
++import java.util.Comparator;
+ import java.util.HashSet;
+ import java.util.List;
+ import java.util.NoSuchElementException;
+@@ -60,15 +61,14 @@ import org.apache.cassandra.tcm.listeners.MetadataSnapshotListener;
+ import org.apache.cassandra.tcm.listeners.PlacementsChangeListener;
+ import org.apache.cassandra.tcm.listeners.SchemaListener;
+ import org.apache.cassandra.tcm.listeners.UpgradeMigrationListener;
++import org.apache.cassandra.tcm.membership.NodeId;
+ import org.apache.cassandra.tcm.transformations.ForceSnapshot;
+ import org.apache.cassandra.tcm.transformations.cms.PreInitialize;
+ import org.apache.cassandra.utils.Closeable;
+-import org.apache.cassandra.utils.FBUtilities;
+ import org.apache.cassandra.utils.JVMStabilityInspector;
+ import org.apache.cassandra.utils.concurrent.Condition;
+ import org.apache.cassandra.utils.concurrent.WaitQueue;
+ 
+-import static java.util.Comparator.comparing;
+ import static org.apache.cassandra.concurrent.InfiniteLoopExecutor.Daemon.NON_DAEMON;
+ import static org.apache.cassandra.concurrent.InfiniteLoopExecutor.Interrupts.UNSYNCHRONIZED;
+ import static org.apache.cassandra.concurrent.InfiniteLoopExecutor.SimulatorSafe.SAFE;
+@@ -338,7 +338,7 @@ public abstract class LocalLog implements Closeable
+ 
+     public LogState getCommittedEntries(Epoch since)
+     {
+-        return storage.getLogState(since);
++        return storage.getLogState(since, false);
+     }
+ 
+     public ClusterMetadata waitForHighestConsecutive()
+@@ -894,9 +894,9 @@ public abstract class LocalLog implements Closeable
+ 
+             if ((entry.epoch.getEpoch() % DatabaseDescriptor.getMetadataSnapshotFrequency()) == 0)
+             {
+-                List<InetAddressAndPort> list = new ArrayList<>(ClusterMetadata.current().fullCMSMembers());
+-                list.sort(comparing(i -> i.addressBytes[i.addressBytes.length - 1]));
+-                if (list.get(0).equals(FBUtilities.getBroadcastAddressAndPort()))
++                List<NodeId> list = new ArrayList<>(metadata.success().metadata.fullCMSMemberIds());
++                list.sort(Comparator.comparingInt(NodeId::id));
++                if (list.get(0).equals(metadata.success().metadata.myNodeId()))
+                     ScheduledExecutors.nonPeriodicTasks.submit(() -> ClusterMetadataService.instance().triggerSnapshot());
+             }
+         };
+diff --git a/src/java/org/apache/cassandra/tcm/log/LogReader.java b/src/java/org/apache/cassandra/tcm/log/LogReader.java
+index b63ec4ecd6..688f1c7653 100644
+--- a/src/java/org/apache/cassandra/tcm/log/LogReader.java
++++ b/src/java/org/apache/cassandra/tcm/log/LogReader.java
+@@ -60,6 +60,11 @@ public interface LogReader
+      * case we return all subsequent entries in the log.
+      */
+     default LogState getLogState(Epoch startEpoch)
++    {
++        return getLogState(startEpoch, true);
++    }
++
++    default LogState getLogState(Epoch startEpoch, boolean allowSnapshots)
+     {
+         try
+         {
+@@ -69,11 +74,13 @@ public interface LogReader
+ 
+             // If there is at most 1 snapshot with an epoch > startEpoch, we prefer to skip that snapshot and just build a
+             // list of consecutive entries
+-            if (snapshotEpochs.size() <= 1)
++            if (snapshotEpochs.size() <= 1 || !allowSnapshots)
+             {
+                 entries = getEntries(startEpoch);
+                 if (entries.isContinuous())
+                     return new LogState(null, entries.immutable());
++                else if (!allowSnapshots)
++                    throw new IllegalStateException("Can't construct a continuous log since " + startEpoch + " and inclusion of snapshots is disallowed");
+                 // Gaps in a persisted log are never expected, but we have not been able to construct a continuous
+                 // sequence of all entries between startEpoch and the current epoch, so fall back to the general case.
+             }
+diff --git a/src/java/org/apache/cassandra/tcm/log/LogStorage.java b/src/java/org/apache/cassandra/tcm/log/LogStorage.java
+index fbf60840c2..3d5e681b16 100644
+--- a/src/java/org/apache/cassandra/tcm/log/LogStorage.java
++++ b/src/java/org/apache/cassandra/tcm/log/LogStorage.java
+@@ -50,6 +50,12 @@ public interface LogStorage extends LogReader
+             return LogState.EMPTY;
+         }
+ 
++        @Override
++        public LogState getLogState(Epoch startEpoch, boolean allowSnapshots)
++        {
++            return LogState.EMPTY;
++        }
++
+         @Override
+         public LogState getPersistedLogState()
+         {

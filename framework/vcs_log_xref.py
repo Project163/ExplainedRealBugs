@@ -15,32 +15,38 @@ def get_git_parent(commit_hash, repo_dir):
     获取一个 commit 的父 commit。只支持单个父 commit。
     """
     try:
-        # (!!) 更改为列表
+        # changed to use a list for cmd to avoid shell=True issues
         cmd_list = [
             'git',
-            f'--git-dir={repo_dir}', # (!!) 移除不必要的引号
+            f'--git-dir={repo_dir}', 
             'rev-list',
             '--parents',
             '-n', '1',
             commit_hash
         ]
-        
-        # (!!) 更改为 shell=False
+
+        git_env = os.environ.copy()
+        git_env['GIT_TERMINAL_PROMPT'] = '0'  # disable git prompts
+
+        # shell=False for Windows compatibility
         result = subprocess.run(
             cmd_list, 
-            shell=False, # (!!) 关键: 关闭 shell
+            shell=False,
             capture_output=True, 
             text=True, 
             check=True, 
             encoding='utf-8', 
-            errors='ignore'
+            errors='ignore',
+            stdin=subprocess.DEVNULL,
+            timeout=1800,
+            env=git_env
         )
         parts = result.stdout.strip().split()
         
         if len(parts) > 1:
             if len(parts) > 2:
                 return None
-            return parts[1] # 返回第一个父 commit
+            return parts[1] # return the first parent
         else:
             return None # Root commit
             
@@ -48,7 +54,6 @@ def get_git_parent(commit_hash, repo_dir):
         print(f"Warning: Error getting parent for {commit_hash}: {e}", file=sys.stderr)
         return None
 
-# ... (construct_commit_url 和 construct_compare_url 无需更改) ...
 
 def construct_commit_url(repo_url, commit_hash):
     """
@@ -64,10 +69,7 @@ def construct_commit_url(repo_url, commit_hash):
         return f"{base_url}/-/tree/{commit_hash}"
     if 'bitbucket.org' in repo_url:
         return f"{base_url}/tree/{commit_hash}"
-    # 其他 (如 Apache gitbox)
     if 'gitbox.apache.org' in repo_url:
-        # 假设是 'https://gitbox.apache.org/repos/asf/project.git'
-        # 变为 'https://github.com/apache/project/commit/...'
         base_url = base_url.replace('gitbox.apache.org/repos/asf', 'github.com/apache')
         return f"{base_url}/tree/{commit_hash}"
     return "NA"
@@ -92,7 +94,6 @@ def construct_compare_url(repo_url, buggy_hash, fixed_hash):
     return "NA"
 
 def main():
-    # ... (argparse, 1. Load issues.txt, 2. compile regex, 3. read log, 4. append results ... 都无需更改) ...
     parser = argparse.ArgumentParser(description="Cross-reference VCS log with issue tracker data.")
     parser.add_argument('-e', dest='regexp', required=True, help="Perl-compatible regex to match issue IDs")
     parser.add_argument('-l', dest='log_file', required=True, help="Path to the commit log file (from git log)")

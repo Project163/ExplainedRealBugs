@@ -1,0 +1,925 @@
+diff --git a/solr/CHANGES.txt b/solr/CHANGES.txt
+index bafd4b44a32..0b598e5454b 100644
+--- a/solr/CHANGES.txt
++++ b/solr/CHANGES.txt
+@@ -695,6 +695,9 @@ Bug Fixes
+ 
+ * SOLR-15974: Remove Calcite's ENUMERABLE_AGGREGATE_RULE as Solr only supports push-down for LogicalAggregate (Timothy Potter, Kiran Chitturi)
+ 
++* SOLR-16009: Force Calcite's Rel simplify config flag to false to avoid erasing filters that are meaningful to Solr,
++  but look like nonsense to Calcite, such as AND'd filters on the same multi-valued field (Timothy Potter, Kiran Chitturi)
++
+ ==================  8.11.1 ==================
+ 
+ Bug Fixes
+diff --git a/solr/modules/sql/src/java/org/apache/solr/handler/sql/CalciteSolrDriver.java b/solr/modules/sql/src/java/org/apache/solr/handler/sql/CalciteSolrDriver.java
+index a3e9462de83..67609eb093a 100644
+--- a/solr/modules/sql/src/java/org/apache/solr/handler/sql/CalciteSolrDriver.java
++++ b/solr/modules/sql/src/java/org/apache/solr/handler/sql/CalciteSolrDriver.java
+@@ -23,9 +23,12 @@ import org.apache.calcite.jdbc.CalciteConnection;
+ import org.apache.calcite.jdbc.Driver;
+ import org.apache.calcite.runtime.Hook;
+ import org.apache.calcite.schema.SchemaPlus;
++import org.apache.calcite.sql.fun.SqlStdOperatorTable;
+ import org.apache.calcite.sql2rel.SqlToRelConverter;
+ import org.apache.calcite.util.Holder;
+ import org.apache.solr.client.solrj.io.SolrClientCache;
++import org.apache.solr.handler.sql.functions.ArrayContainsAll;
++import org.apache.solr.handler.sql.functions.ArrayContainsAny;
+ 
+ /**
+  * JDBC driver for Calcite Solr.
+@@ -51,6 +54,10 @@ public class CalciteSolrDriver extends Driver {
+     configHolder.accept(config -> config.withInSubQueryThreshold(Integer.MAX_VALUE));
+   }
+ 
++  static void relBuilderSimplify(Holder<Boolean> configHolder) {
++    configHolder.accept(config -> false);
++  }
++
+   @Override
+   protected String getConnectStringPrefix() {
+     return CONNECT_STRING_PREFIX;
+@@ -66,6 +73,11 @@ public class CalciteSolrDriver extends Driver {
+     // otherwise, Calcite will transform the query into a join with a static table of literals
+     Hook.SQL2REL_CONVERTER_CONFIG_BUILDER.addThread(CalciteSolrDriver::subQueryThreshold);
+ 
++    // disable Calcite's simplify (see SOLR-16009) as it erases some query
++    // constructs that are still meaningful to Solr (such as AND'd filters on the same field,
++    // which works for multi-valued fields in Solr but looks like nonsense to Calcite.
++    Hook.REL_BUILDER_SIMPLIFY.addThread(CalciteSolrDriver::relBuilderSimplify);
++
+     Connection connection = super.connect(url, info);
+     CalciteConnection calciteConnection = (CalciteConnection) connection;
+ 
+@@ -78,11 +90,19 @@ public class CalciteSolrDriver extends Driver {
+     final SolrSchema solrSchema = new SolrSchema(info, solrClientCache);
+     rootSchema.add(schemaName, solrSchema);
+ 
++    registerUDFs();
++
+     // Set the default schema
+     calciteConnection.setSchema(schemaName);
+     return calciteConnection;
+   }
+ 
++  private void registerUDFs() {
++    final SqlStdOperatorTable stdOpTab = SqlStdOperatorTable.instance();
++    stdOpTab.register(new ArrayContainsAll());
++    stdOpTab.register(new ArrayContainsAny());
++  }
++
+   public void setSolrClientCache(SolrClientCache solrClientCache) {
+     this.solrClientCache = solrClientCache;
+   }
+diff --git a/solr/modules/sql/src/java/org/apache/solr/handler/sql/SolrFilter.java b/solr/modules/sql/src/java/org/apache/solr/handler/sql/SolrFilter.java
+index 34454da3d43..216ed4913a3 100644
+--- a/solr/modules/sql/src/java/org/apache/solr/handler/sql/SolrFilter.java
++++ b/solr/modules/sql/src/java/org/apache/solr/handler/sql/SolrFilter.java
+@@ -17,6 +17,7 @@
+ package org.apache.solr.handler.sql;
+ 
+ import java.lang.invoke.MethodHandles;
++import java.math.BigDecimal;
+ import java.time.Instant;
+ import java.util.ArrayList;
+ import java.util.List;
+@@ -31,6 +32,8 @@ import org.apache.calcite.plan.RelTraitSet;
+ import org.apache.calcite.rel.RelNode;
+ import org.apache.calcite.rel.core.Filter;
+ import org.apache.calcite.rel.metadata.RelMetadataQuery;
++import org.apache.calcite.rel.type.RelDataType;
++import org.apache.calcite.rel.type.RelDataTypeField;
+ import org.apache.calcite.rex.RexBuilder;
+ import org.apache.calcite.rex.RexCall;
+ import org.apache.calcite.rex.RexInputRef;
+@@ -42,6 +45,9 @@ import org.apache.calcite.sql.type.SqlTypeName;
+ import org.apache.calcite.util.Pair;
+ import org.apache.solr.client.solrj.util.ClientUtils;
+ import org.apache.solr.common.SolrException;
++import org.apache.solr.common.StringUtils;
++import org.apache.solr.handler.sql.functions.ArrayContainsAll;
++import org.apache.solr.handler.sql.functions.ArrayContainsAny;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
+@@ -51,7 +57,23 @@ class SolrFilter extends Filter implements SolrRel {
+   private static final Logger log = LoggerFactory.getLogger(MethodHandles.lookup().lookupClass());
+ 
+   private static final Pattern CALCITE_TIMESTAMP_REGEX =
+-      Pattern.compile("^\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}$");
++      Pattern.compile("^\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}(\\.\\d{3})?$");
++  private static final Pattern CALCITE_DATE_ONLY_REGEX = Pattern.compile("^\\d{4}-\\d{2}-\\d{2}$");
++
++  private static final class AndClause {
++    boolean isBetween;
++    String query;
++
++    AndClause(String query, boolean isBetween) {
++      this.query = query;
++      this.isBetween = isBetween;
++    }
++
++    String toQuery() {
++      return "(" + query + ")";
++    }
++  }
++
+   private final RexBuilder builder;
+ 
+   SolrFilter(RelOptCluster cluster, RelTraitSet traitSet, RelNode child, RexNode condition) {
+@@ -74,12 +96,11 @@ class SolrFilter extends Filter implements SolrRel {
+     implementor.visitChild(0, getInput());
+     if (getInput() instanceof SolrAggregate) {
+       HavingTranslator translator =
+-          new HavingTranslator(
+-              SolrRules.solrFieldNames(getRowType()), implementor.reverseAggMappings, builder);
++          new HavingTranslator(getRowType(), implementor.reverseAggMappings, builder);
+       String havingPredicate = translator.translateMatch(condition);
+       implementor.setHavingPredicate(havingPredicate);
+     } else {
+-      Translator translator = new Translator(SolrRules.solrFieldNames(getRowType()), builder);
++      Translator translator = new Translator(getRowType(), builder);
+       String query = translator.translateMatch(condition);
+       implementor.addQuery(query);
+       implementor.setNegativeQuery(query.startsWith("-"));
+@@ -88,14 +109,21 @@ class SolrFilter extends Filter implements SolrRel {
+ 
+   private static class Translator {
+ 
++    protected final RelDataType rowType;
+     protected final List<String> fieldNames;
+     private final RexBuilder builder;
+ 
+-    Translator(List<String> fieldNames, RexBuilder builder) {
+-      this.fieldNames = fieldNames;
++    Translator(RelDataType rowType, RexBuilder builder) {
++      this.rowType = rowType;
++      this.fieldNames = SolrRules.solrFieldNames(rowType);
+       this.builder = builder;
+     }
+ 
++    protected RelDataType getFieldType(String field) {
++      RelDataTypeField f = rowType.getField(field, true, false);
++      return f != null ? f.getType() : null;
++    }
++
+     protected String translateMatch(RexNode condition) {
+       if (log.isDebugEnabled()) {
+         log.debug(
+@@ -103,64 +131,124 @@ class SolrFilter extends Filter implements SolrRel {
+       }
+ 
+       final SqlKind kind = condition.getKind();
+-
+       if (condition.isA(SqlKind.SEARCH)) {
+         return translateSearch(condition);
+       } else if (kind.belongsTo(SqlKind.COMPARISON) || kind == SqlKind.NOT) {
+         return translateComparison(condition);
+       } else if (condition.isA(SqlKind.AND)) {
+-        return translateAndOrBetween(condition);
++        return translateAndOrBetween(condition, false).toQuery();
+       } else if (condition.isA(SqlKind.OR)) {
+         return "(" + translateOr(condition) + ")";
+       } else if (kind == SqlKind.LIKE) {
+         return translateLike(condition);
+       } else if (kind == SqlKind.IS_NOT_NULL || kind == SqlKind.IS_NULL) {
+         return translateIsNullOrIsNotNull(condition);
++      } else if (kind == SqlKind.OTHER_FUNCTION) {
++        return translateCustomFunction(condition);
+       } else {
+         return null;
+       }
+     }
+ 
+-    protected String translateAndOrBetween(RexNode condition) {
++    protected String translateCustomFunction(RexNode condition) {
++      RexCall call = (RexCall) condition;
++      if (call.op instanceof ArrayContainsAll) {
++        return translateArrayContainsUDF(call, "AND");
++      } else if (call.op instanceof ArrayContainsAny) {
++        return translateArrayContainsUDF(call, "OR");
++      } else {
++        throw new RuntimeException("Custom function '" + call.op + "' not supported");
++      }
++    }
++
++    private String translateArrayContainsUDF(RexCall call, String booleanOperator) {
++      List<RexNode> operands = call.getOperands();
++      RexInputRef fieldOperand = (RexInputRef) operands.get(0);
++      String fieldName = fieldNames.get(fieldOperand.getIndex());
++      RexNode valuesNode = operands.get(1);
++      if (valuesNode instanceof RexLiteral) {
++        String literal = toSolrLiteral(fieldName, (RexLiteral) valuesNode);
++        if (!StringUtils.isEmpty(literal)) {
++          return fieldName + ":\"" + literal + "\"";
++        } else {
++          return null;
++        }
++      } else if (valuesNode instanceof RexCall) {
++        RexCall valuesRexCall = (RexCall) operands.get(1);
++        String valuesString =
++            valuesRexCall.getOperands().stream()
++                .map(op -> toSolrLiteral(fieldName, (RexLiteral) op))
++                .filter(value -> !StringUtils.isEmpty(value))
++                .map(value -> "\"" + value.trim() + "\"")
++                .collect(Collectors.joining(" " + booleanOperator + " "));
++        return fieldName + ":(" + valuesString + ")";
++      }
++      {
++        return null;
++      }
++    }
++
++    protected AndClause translateAndOrBetween(RexNode condition, boolean isNegated) {
+       // see if this is a translated range query of greater than or equals and less than or equal on
+-      // same field
+-      // if so, then collapse into a single range criteria, e.g. field:[gte TO lte] instead of two
+-      // ranges AND'd together
++      // same field if so, then collapse into a single range criteria, e.g. field:[gte TO lte]
++      // instead of two ranges AND'd together
+       RexCall call = (RexCall) condition;
+       List<RexNode> operands = call.getOperands();
+       String query = null;
++      boolean isBetween = false;
+       if (operands.size() == 2) {
+         RexNode lhs = operands.get(0);
+         RexNode rhs = operands.get(1);
+         if (lhs.getKind() == SqlKind.GREATER_THAN_OR_EQUAL
+             && rhs.getKind() == SqlKind.LESS_THAN_OR_EQUAL) {
+-          query = translateBetween(lhs, rhs);
++          query = translateBetween(lhs, rhs, isNegated);
++          isBetween = true;
+         } else if (lhs.getKind() == SqlKind.LESS_THAN_OR_EQUAL
+             && rhs.getKind() == SqlKind.GREATER_THAN_OR_EQUAL) {
+           // just swap the nodes
+-          query = translateBetween(rhs, lhs);
++          query = translateBetween(rhs, lhs, isNegated);
++          isBetween = true;
+         }
+       }
+-      query = (query != null ? query : translateAnd(condition));
++
++      if (query == null) {
++        query = translateAnd(condition);
++      }
++
+       if (log.isDebugEnabled()) {
+         log.debug("translated query match={}", query);
+       }
+-      return "(" + query + ")";
++
++      return new AndClause(query, isBetween);
+     }
+ 
+-    protected String translateBetween(RexNode gteNode, RexNode lteNode) {
++    protected String translateBetween(RexNode gteNode, RexNode lteNode, boolean isNegated) {
+       Pair<String, RexLiteral> gte = getFieldValuePair(gteNode);
+       Pair<String, RexLiteral> lte = getFieldValuePair(lteNode);
+       String fieldName = gte.getKey();
+       String query = null;
+       if (fieldName.equals(lte.getKey()) && compareRexLiteral(gte.right, lte.right) < 0) {
+-        query =
+-            fieldName
+-                + ":["
+-                + toSolrLiteral(gte.getValue())
+-                + " TO "
+-                + toSolrLiteral(lte.getValue())
+-                + "]";
++        if (isNegated) {
++          // we want the values outside the bounds of the range, so use an OR with non-inclusive
++          // bounds
++          query =
++              fieldName
++                  + ":[* TO "
++                  + toSolrLiteral(fieldName, gte.getValue())
++                  + "} OR "
++                  + fieldName
++                  + ":{"
++                  + toSolrLiteral(fieldName, lte.getValue())
++                  + " TO *]";
++        } else {
++          query =
++              fieldName
++                  + ":["
++                  + toSolrLiteral(fieldName, gte.getValue())
++                  + " TO "
++                  + toSolrLiteral(fieldName, lte.getValue())
++                  + "]";
++        }
+       }
+ 
+       return query;
+@@ -219,16 +307,41 @@ class SolrFilter extends Filter implements SolrRel {
+         andStrings.add(andQuery);
+       }
+ 
+-      String andString = String.join(" AND ", andStrings);
+-
+       if (!nots.isEmpty()) {
+         for (RexNode node : nots) {
+-          notStrings.add(translateMatch(node));
++          if (node.isA(SqlKind.AND)) {
++            AndClause andClause = translateAndOrBetween(node, true);
++            // if the NOT BETWEEN was converted to an OR'd range with exclusive bounds,
++            // just AND it as the negation has already been applied
++            if (andClause.isBetween) {
++              andStrings.add(andClause.toQuery());
++            } else {
++              notStrings.add(andClause.toQuery());
++            }
++          } else {
++            notStrings.add(translateMatch(node));
++          }
++        }
++
++        String query = "";
++        if (!andStrings.isEmpty()) {
++          String andString = String.join(" AND ", andStrings);
++          query += "(" + andString + ")";
+         }
+-        String notString = String.join(" NOT ", notStrings);
+-        return "(" + andString + ") NOT (" + notString + ")";
++        if (!notStrings.isEmpty()) {
++          if (!query.isEmpty()) {
++            query += " AND ";
++          }
++          for (int i = 0; i < notStrings.size(); i++) {
++            if (i > 0) {
++              query += " AND ";
++            }
++            query += " (*:* -" + notStrings.get(i) + ")";
++          }
++        }
++        return query.trim();
+       } else {
+-        return andString;
++        return String.join(" AND ", andStrings);
+       }
+     }
+ 
+@@ -254,10 +367,17 @@ class SolrFilter extends Filter implements SolrRel {
+       final SqlKind kind = node.getKind();
+       if (kind == SqlKind.NOT) {
+         RexNode negated = ((RexCall) node).getOperands().get(0);
+-        return "-"
+-            + (negated.getKind() == SqlKind.LIKE
+-                ? translateLike(negated)
+-                : translateMatch(negated));
++        if (negated.isA(SqlKind.AND)) {
++          AndClause andClause = translateAndOrBetween(negated, true);
++          // if the resulting andClause is a "between" then don't negate it as it's already
++          // been converted to an OR'd exclusive range
++          return andClause.isBetween ? andClause.toQuery() : "-" + andClause.toQuery();
++        } else {
++          return "-"
++              + (negated.getKind() == SqlKind.LIKE
++                  ? translateLike(negated)
++                  : translateMatch(negated));
++        }
+       }
+ 
+       Pair<String, RexLiteral> binaryTranslated = getFieldValuePair(node);
+@@ -265,17 +385,17 @@ class SolrFilter extends Filter implements SolrRel {
+       RexLiteral value = binaryTranslated.getValue();
+       switch (kind) {
+         case EQUALS:
+-          return toEqualsClause(key, value, node);
++          return toEqualsClause(key, value);
+         case NOT_EQUALS:
+-          return "-" + toEqualsClause(key, value, node);
++          return "-" + toEqualsClause(key, value);
+         case LESS_THAN:
+-          return "(" + key + ": [ * TO " + toSolrLiteral(value) + " })";
++          return "(" + key + ": [ * TO " + toSolrLiteral(key, value) + " })";
+         case LESS_THAN_OR_EQUAL:
+-          return "(" + key + ": [ * TO " + toSolrLiteral(value) + " ])";
++          return "(" + key + ": [ * TO " + toSolrLiteral(key, value) + " ])";
+         case GREATER_THAN:
+-          return "(" + key + ": { " + toSolrLiteral(value) + " TO * ])";
++          return "(" + key + ": { " + toSolrLiteral(key, value) + " TO * ])";
+         case GREATER_THAN_OR_EQUAL:
+-          return "(" + key + ": [ " + toSolrLiteral(value) + " TO * ])";
++          return "(" + key + ": [ " + toSolrLiteral(key, value) + " TO * ])";
+         case LIKE:
+           return translateLike(node);
+         case IS_NOT_NULL:
+@@ -286,9 +406,13 @@ class SolrFilter extends Filter implements SolrRel {
+       }
+     }
+ 
+-    private String toEqualsClause(String key, RexLiteral value, RexNode node) {
+-      SqlTypeName fieldTypeName = ((RexCall) node).getOperands().get(0).getType().getSqlTypeName();
+-      String terms = toSolrLiteralForEquals(value, fieldTypeName).trim();
++    private String toEqualsClause(String key, RexLiteral value) {
++      if ("".equals(key)) {
++        // special handling for 1 = 0 kind of clause
++        return "-*:*";
++      }
++
++      String terms = toSolrLiteral(key, value).trim();
+ 
+       boolean wrappedQuotes = false;
+       if (!terms.startsWith("(") && !terms.startsWith("[") && !terms.startsWith("{")) {
+@@ -306,40 +430,54 @@ class SolrFilter extends Filter implements SolrRel {
+ 
+     // translate to a literal string value for Solr queries, such as translating a
+     // Calcite timestamp value into an ISO-8601 formatted timestamp that Solr likes
+-    private String toSolrLiteral(RexLiteral literal) {
+-      Object value2 = literal.getValue2();
++    private String toSolrLiteral(String solrField, RexLiteral literal) {
++      Object value2 = literal != null ? literal.getValue2() : null;
++      if (value2 == null) {
++        return "";
++      }
++
+       SqlTypeName typeName = literal.getTypeName();
+-      final String solrLiteral;
++      String solrLiteral = null;
+       if (value2 instanceof Long
+           && (typeName == SqlTypeName.TIMESTAMP
+               || typeName == SqlTypeName.TIMESTAMP_WITH_LOCAL_TIME_ZONE)) {
+         // return as an ISO-8601 timestamp
+         solrLiteral = Instant.ofEpochMilli((Long) value2).toString();
+-      } else {
+-        solrLiteral = value2.toString();
++      } else if (typeName == SqlTypeName.TIMESTAMP
++          && value2 instanceof String
++          && CALCITE_TIMESTAMP_REGEX.matcher((String) value2).matches()) {
++        solrLiteral = toSolrTimestamp((String) value2);
++      } else if (typeName == SqlTypeName.CHAR
++          && value2 instanceof String
++          && (CALCITE_TIMESTAMP_REGEX.matcher((String) value2).matches()
++              || CALCITE_DATE_ONLY_REGEX.matcher((String) value2).matches())) {
++        // looks like a Calcite timestamp, what type of field in Solr?
++        RelDataType fieldType = getFieldType(solrField);
++        if (fieldType != null && fieldType.getSqlTypeName() == SqlTypeName.TIMESTAMP) {
++          solrLiteral = toSolrTimestamp((String) value2);
++        }
++      } else if (typeName == SqlTypeName.DECIMAL) {
++        BigDecimal bigDecimal = literal.getValueAs(BigDecimal.class);
++        if (bigDecimal != null) {
++          solrLiteral = bigDecimal.toString();
++        } else {
++          solrLiteral = "";
++        }
+       }
+-      return solrLiteral;
++      return solrLiteral != null ? solrLiteral : value2.toString();
+     }
+ 
+-    // special case handling for expressions like: WHERE timestamp = '2021-06-04 04:00:00'
+-    // Calcite passes the right hand side as a string instead of as a Long
+-    private String toSolrLiteralForEquals(RexLiteral literal, SqlTypeName fieldTypeName) {
+-      Object value2 = literal.getValue2();
+-      final String solrLiteral;
+-      // oddly, for = criteria with a timestamp field, Calcite passes us a String instead of a Long
+-      // as it does with other operators like >
+-      if (value2 instanceof String
+-          && fieldTypeName == SqlTypeName.TIMESTAMP
+-          && CALCITE_TIMESTAMP_REGEX.matcher((String) value2).matches()) {
+-        String timestamp = ((String) value2).replace(' ', 'T').replace("'", "");
+-        if (Character.isDigit(timestamp.charAt(timestamp.length() - 1))) {
+-          timestamp += "Z";
+-        }
+-        solrLiteral = timestamp;
+-      } else {
+-        solrLiteral = toSolrLiteral(literal);
++    private String toSolrTimestamp(final String ts) {
++      String timestamp = ts;
++      if (ts.indexOf(' ') != -1) {
++        timestamp = ts.replace(' ', 'T').replace("'", "");
++      } else if (ts.length() == 10) {
++        timestamp = ts + "T00:00:00Z";
++      }
++      if (Character.isDigit(timestamp.charAt(timestamp.length() - 1))) {
++        timestamp += "Z";
+       }
+-      return solrLiteral;
++      return timestamp;
+     }
+ 
+     protected Pair<String, RexLiteral> getFieldValuePair(RexNode node) {
+@@ -391,6 +529,17 @@ class SolrFilter extends Filter implements SolrRel {
+         }
+       }
+ 
++      // special case for queries like WHERE 1=0 (which should match no docs)
++      // this is now required since we're forcing Calcite's simplify to false
++      if (left.getKind() == SqlKind.LITERAL && right.getKind() == SqlKind.LITERAL) {
++        String leftLit = toSolrLiteral("", (RexLiteral) left);
++        String rightLit = toSolrLiteral("", (RexLiteral) right);
++        if (!leftLit.equals(rightLit)) {
++          // they are equal lits ~ match no docs
++          return new Pair<>("", (RexLiteral) right);
++        }
++      }
++
+       throw new AssertionError("cannot translate call " + call);
+     }
+ 
+@@ -435,14 +584,14 @@ class SolrFilter extends Filter implements SolrRel {
+         if (peekAt0 instanceof RexCall) {
+           RexCall op0 = (RexCall) peekAt0;
+           if (op0.op.kind == SqlKind.NOT_EQUALS) {
+-            return "*:* -" + fieldName + ":" + toOrSetOnSameField(expanded);
++            return "*:* -" + fieldName + ":" + toOrSetOnSameField(fieldName, expanded);
+           }
+         }
+       } else if (expanded.op.kind == SqlKind.OR) {
+         if (peekAt0 instanceof RexCall) {
+           RexCall op0 = (RexCall) peekAt0;
+           if (op0.op.kind == SqlKind.EQUALS) {
+-            return fieldName + ":" + toOrSetOnSameField(expanded);
++            return fieldName + ":" + toOrSetOnSameField(fieldName, expanded);
+           }
+         }
+       }
+@@ -457,14 +606,14 @@ class SolrFilter extends Filter implements SolrRel {
+           SolrException.ErrorCode.SERVER_ERROR, "Unsupported search filter: " + condition);
+     }
+ 
+-    protected String toOrSetOnSameField(RexCall search) {
++    protected String toOrSetOnSameField(String solrField, RexCall search) {
+       String orClause =
+           search.operands.stream()
+               .map(
+                   n -> {
+                     RexCall next = (RexCall) n;
+                     RexLiteral lit = (RexLiteral) next.getOperands().get(1);
+-                    return "\"" + toSolrLiteral(lit) + "\"";
++                    return "\"" + toSolrLiteral(solrField, lit) + "\"";
+                   })
+               .collect(Collectors.joining(" OR "));
+       return "(" + orClause + ")";
+@@ -487,8 +636,8 @@ class SolrFilter extends Filter implements SolrRel {
+     private final Map<String, String> reverseAggMappings;
+ 
+     HavingTranslator(
+-        List<String> fieldNames, Map<String, String> reverseAggMappings, RexBuilder builder) {
+-      super(fieldNames, builder);
++        RelDataType rowType, Map<String, String> reverseAggMappings, RexBuilder builder) {
++      super(rowType, builder);
+       this.reverseAggMappings = reverseAggMappings;
+     }
+ 
+diff --git a/solr/modules/sql/src/java/org/apache/solr/handler/sql/functions/ArrayContains.java b/solr/modules/sql/src/java/org/apache/solr/handler/sql/functions/ArrayContains.java
+new file mode 100644
+index 00000000000..d9606556e3d
+--- /dev/null
++++ b/solr/modules/sql/src/java/org/apache/solr/handler/sql/functions/ArrayContains.java
+@@ -0,0 +1,79 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.solr.handler.sql.functions;
++
++import java.util.Arrays;
++import java.util.List;
++import org.apache.calcite.rel.type.RelDataType;
++import org.apache.calcite.sql.*;
++import org.apache.calcite.sql.type.ReturnTypes;
++import org.apache.calcite.sql.type.SqlOperandCountRanges;
++import org.apache.calcite.sql.validate.SqlValidator;
++import org.apache.calcite.sql.validate.SqlValidatorScope;
++
++public abstract class ArrayContains extends SqlFunction {
++
++  public ArrayContains(String name) {
++    super(
++        name,
++        SqlKind.OTHER_FUNCTION,
++        ReturnTypes.BOOLEAN,
++        null,
++        null,
++        SqlFunctionCategory.USER_DEFINED_FUNCTION);
++  }
++
++  @Override
++  public SqlOperandCountRange getOperandCountRange() {
++    return SqlOperandCountRanges.of(2);
++  }
++
++  @Override
++  public boolean checkOperandTypes(SqlCallBinding callBinding, boolean throwOnFailure) {
++    List<SqlNode> operands = callBinding.getCall().getOperandList();
++    SqlNode operand1 = operands.get(0);
++    SqlNode operand2 = operands.get(1);
++    if (operand1.getKind() == SqlKind.IDENTIFIER) {
++      if (operand2.getKind() == SqlKind.LITERAL) {
++        return true;
++      } else if (operand2.getKind() == SqlKind.ROW) {
++        SqlBasicCall valuesCall = (SqlBasicCall) operand2;
++        boolean literalMatch =
++            Arrays.stream(valuesCall.getOperands()).allMatch(op -> op.getKind() == SqlKind.LITERAL);
++        if (literalMatch) {
++          return true;
++        }
++      }
++    }
++    if (throwOnFailure) {
++      throw callBinding.newValidationSignatureError();
++    } else {
++      return false;
++    }
++  }
++
++  @Override
++  public RelDataType deriveType(SqlValidator validator, SqlValidatorScope scope, SqlCall call) {
++    // To prevent operator rewriting by SqlFunction#deriveType.
++    for (SqlNode operand : call.getOperandList()) {
++      RelDataType nodeType = validator.deriveType(scope, operand);
++      validator.setValidatedNodeType(operand, nodeType);
++    }
++    return validateOperands(validator, scope, call);
++  }
++}
+diff --git a/solr/modules/sql/src/java/org/apache/solr/handler/sql/functions/ArrayContainsAll.java b/solr/modules/sql/src/java/org/apache/solr/handler/sql/functions/ArrayContainsAll.java
+new file mode 100644
+index 00000000000..c50e4840c26
+--- /dev/null
++++ b/solr/modules/sql/src/java/org/apache/solr/handler/sql/functions/ArrayContainsAll.java
+@@ -0,0 +1,36 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.solr.handler.sql.functions;
++
++/**
++ * Operator for filtering on Solr multi-valued fields with 'AND" clause. Example:
++ * ARRAY_CONTAINS_ALL(field, ('val1', 'val2')) will be transformed to filter query field:("val1" AND
++ * "val2")
++ */
++public class ArrayContainsAll extends ArrayContains {
++  private static final String UDF_NAME = "ARRAY_CONTAINS_ALL";
++
++  public ArrayContainsAll() {
++    super(UDF_NAME);
++  }
++
++  @Override
++  public String getAllowedSignatures(String opNameToUse) {
++    return "ARRAY_CONTAINS_ALL(IDENTIFIER, ('val1', 'val2'))";
++  }
++}
+diff --git a/solr/modules/sql/src/java/org/apache/solr/handler/sql/functions/ArrayContainsAny.java b/solr/modules/sql/src/java/org/apache/solr/handler/sql/functions/ArrayContainsAny.java
+new file mode 100644
+index 00000000000..7248d89da4c
+--- /dev/null
++++ b/solr/modules/sql/src/java/org/apache/solr/handler/sql/functions/ArrayContainsAny.java
+@@ -0,0 +1,36 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.solr.handler.sql.functions;
++
++/**
++ * Operator for filtering on Solr multi-valued fields with 'OR" clause. Example:
++ * ARRAY_CONTAINS_ALL(field, ('val1', 'val2')) will be transformed to filter query field:("val1" OR
++ * "val2")
++ */
++public class ArrayContainsAny extends ArrayContains {
++  private static final String UDF_NAME = "ARRAY_CONTAINS_ANY";
++
++  public ArrayContainsAny() {
++    super(UDF_NAME);
++  }
++
++  @Override
++  public String getAllowedSignatures(String opNameToUse) {
++    return "ARRAY_CONTAINS_ANY(IDENTIFIER, ('val1', 'val2'))";
++  }
++}
+diff --git a/solr/modules/sql/src/java/org/apache/solr/handler/sql/functions/package-info.java b/solr/modules/sql/src/java/org/apache/solr/handler/sql/functions/package-info.java
+new file mode 100644
+index 00000000000..e8455de56da
+--- /dev/null
++++ b/solr/modules/sql/src/java/org/apache/solr/handler/sql/functions/package-info.java
+@@ -0,0 +1,22 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++/**
++ * Solr SQL user defined functions (UDFs) needed to support filters on multi-valued fields and other
++ * query behavior that doesn't align well with SQL.
++ */
++package org.apache.solr.handler.sql.functions;
+diff --git a/solr/modules/sql/src/test/org/apache/solr/handler/sql/TestSQLHandler.java b/solr/modules/sql/src/test/org/apache/solr/handler/sql/TestSQLHandler.java
+index a3f35b555f2..fde59889b31 100644
+--- a/solr/modules/sql/src/test/org/apache/solr/handler/sql/TestSQLHandler.java
++++ b/solr/modules/sql/src/test/org/apache/solr/handler/sql/TestSQLHandler.java
+@@ -2483,11 +2483,7 @@ public class TestSQLHandler extends SolrCloudTestCase {
+     expectResults("SELECT id FROM $ALIAS WHERE b_is >= 2 AND b_is <= 4", 3);
+     expectResults("SELECT id FROM $ALIAS WHERE b_is <= 4 AND b_is >= 2", 3);
+     expectResults("SELECT id FROM $ALIAS WHERE b_is <= 2 OR b_is >= 8", 4);
+-    // tricky ~ with Solr, this should return 2 docs, but Calcite short-circuits this query and
+-    // returns 0
+-    // Calcite sees the predicate as disjoint from a single-valued field perspective ...
+-    expectResults("SELECT id FROM $ALIAS WHERE b_is >= 5 AND b_is <= 2", 0);
+-    // hacky work-around the aforementioned problem ^^
++    expectResults("SELECT id FROM $ALIAS WHERE b_is >= 5 AND b_is <= 2", 2);
+     expectResults("SELECT id FROM $ALIAS WHERE b_is = '(+[5 TO *] +[* TO 2])'", 2);
+   }
+ 
+@@ -2509,15 +2505,18 @@ public class TestSQLHandler extends SolrCloudTestCase {
+         .add("id", "6", "a_s", "world-6", "b_s", "bar", "a_i", "4", "d_s", "c")
+         .add("id", "7", "a_s", "hello-7", "b_s", "foo", "c_s", "baz blah", "d_s", "x")
+         .add("id", "8", "a_s", "world-8", "b_s", "bar", "a_i", "5", "d_s", "c")
++        .add("id", "9", "a_s", "world-9", "b_s", "bar", "a_i", "1", "d_s", "x")
+         .commit(cluster.getSolrClient(), COLLECTIONORALIAS);
+ 
+     List<Tuple> tuples =
+         expectResults(
+             "SELECT a_s FROM $ALIAS WHERE a_s LIKE 'world%' AND b_s IS NOT NULL AND c_s IS NULL AND a_i BETWEEN 2 AND 4 AND d_s IN ('a','b','c') ORDER BY id ASC LIMIT 10",
+             3);
++
+     assertEquals("world-2", tuples.get(0).getString("a_s"));
+     assertEquals("world-4", tuples.get(1).getString("a_s"));
+     assertEquals("world-6", tuples.get(2).getString("a_s"));
++
+     tuples =
+         expectResults(
+             "SELECT a_s FROM $ALIAS WHERE a_s NOT LIKE 'hello%' AND b_s IS NOT NULL AND c_s IS NULL AND a_i NOT BETWEEN 2 AND 4 AND d_s IN ('a','b','c') ORDER BY id ASC LIMIT 10",
+@@ -2950,6 +2949,14 @@ public class TestSQLHandler extends SolrCloudTestCase {
+     update.add("id", String.valueOf(maxDocs)); // all multi-valued fields are null
+     update.commit(cluster.getSolrClient(), COLLECTIONORALIAS);
+ 
++    expectResults("SELECT longs, stringsx, booleans FROM $ALIAS WHERE longs = 2 AND longs = 4", 5);
++    expectResults(
++        "SELECT longs, pdoublexmv, booleans FROM $ALIAS WHERE pdoublexmv = 4.0 AND pdoublexmv = 5.0",
++        5);
++    expectResults("SELECT longs, pdoublexmv, booleans FROM $ALIAS WHERE pdoublexmv > 4.0", 5);
++    expectResults(
++        "SELECT stringxmv, stringsx, booleans FROM $ALIAS WHERE stringxmv = 'a' AND stringxmv = 'b' AND stringxmv = 'c'",
++        10);
+     expectResults("SELECT stringxmv, stringsx, booleans FROM $ALIAS WHERE stringxmv > 'a'", 10);
+     expectResults(
+         "SELECT stringxmv, stringsx, booleans FROM $ALIAS WHERE stringxmv NOT IN ('a')", 1);
+@@ -3058,6 +3065,9 @@ public class TestSQLHandler extends SolrCloudTestCase {
+ 
+     update.commit(cluster.getSolrClient(), COLLECTIONORALIAS);
+ 
++    expectResults(
++        "SELECT id FROM $ALIAS WHERE stringxmv IN ('a') AND stringxmv IN ('b') ORDER BY id ASC", 1);
++
+     int numIn = 200;
+     List<String> bigInList = new ArrayList<>(bigList);
+     Collections.shuffle(bigInList, random());
+@@ -3183,4 +3193,101 @@ public class TestSQLHandler extends SolrCloudTestCase {
+         "SELECT COUNT(*) as QUERY_COUNT FROM $ALIAS WHERE (d_s='x') AND (id='1') AND (b_s='foo') HAVING COUNT(*) > 0",
+         1);
+   }
++
++  @Test
++  public void testCustomUDFArrayContains() throws Exception {
++    new UpdateRequest()
++        .add(
++            "id",
++            "1",
++            "name_s",
++            "hello-1",
++            "a_i",
++            "1",
++            "stringxmv",
++            "a",
++            "stringxmv",
++            "b",
++            "stringxmv",
++            "c",
++            "pdoublexmv",
++            "1.5",
++            "pdoublexmv",
++            "2.5",
++            "longs",
++            "1",
++            "longs",
++            "2")
++        .add(
++            "id",
++            "2",
++            "name_s",
++            "hello-2",
++            "a_i",
++            "2",
++            "stringxmv",
++            "c",
++            "stringxmv",
++            "d",
++            "stringxmv",
++            "e",
++            "pdoublexmv",
++            "1.5",
++            "pdoublexmv",
++            "3.5",
++            "longs",
++            "1",
++            "longs",
++            "3")
++        .add(
++            "id",
++            "3",
++            "name_s",
++            "hello-3",
++            "a_i",
++            "3",
++            "stringxmv",
++            "e",
++            "stringxmv",
++            "f",
++            "stringxmv",
++            "a",
++            "pdoublexmv",
++            "2.5",
++            "pdoublexmv",
++            "3.5",
++            "longs",
++            "2",
++            "longs",
++            "3")
++        .commit(cluster.getSolrClient(), COLLECTIONORALIAS);
++
++    expectResults("select id, pdoublexmv from $ALIAS", 3);
++    expectResults(
++        "select id, stringxmv from $ALIAS WHERE array_contains_all(pdoublexmv, (1.5, 2.5))", 1);
++    expectResults("select id, stringxmv from $ALIAS WHERE array_contains_all(longs, (1, 3))", 1);
++    expectResults("select id, stringxmv from $ALIAS WHERE array_contains_all(stringxmv, 'c')", 2);
++    expectResults("select id, stringxmv from $ALIAS WHERE array_contains_all(stringxmv, ('c'))", 2);
++    expectResults(
++        "select id, stringxmv from $ALIAS WHERE array_contains_all(stringxmv, ('a', 'b', 'c'))", 1);
++    expectResults(
++        "select id, stringxmv from $ALIAS WHERE array_contains_all(stringxmv, ('b', 'c'))", 1);
++    expectResults(
++        "select id, stringxmv from $ALIAS WHERE array_contains_all(stringxmv, ('c', 'e'))", 1);
++    expectResults(
++        "select id, stringxmv from $ALIAS WHERE array_contains_all(stringxmv, ('c', 'd', 'e'))", 1);
++
++    expectResults(
++        "select id, stringxmv from $ALIAS WHERE array_contains_any(pdoublexmv, (1.5, 2.5))", 3);
++    expectResults("select id, stringxmv from $ALIAS WHERE array_contains_any(longs, (1, 3))", 3);
++    expectResults("select id, stringxmv from $ALIAS WHERE array_contains_any(stringxmv, ('a'))", 2);
++    expectResults(
++        "select id, stringxmv from $ALIAS WHERE array_contains_any(stringxmv, ('a', 'b', 'c'))", 3);
++    expectResults(
++        "select id, stringxmv from $ALIAS WHERE array_contains_any(stringxmv, ('a', 'c'))", 3);
++    expectResults(
++        "select id, stringxmv from $ALIAS WHERE array_contains_any(stringxmv, ('a', 'e'))", 3);
++    expectResults(
++        "select id, stringxmv from $ALIAS WHERE array_contains_any(stringxmv, ('a', 'e', 'f'))", 3);
++  }
+ }

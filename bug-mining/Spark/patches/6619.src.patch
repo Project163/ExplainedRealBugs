@@ -1,0 +1,326 @@
+diff --git a/core/src/main/scala/org/apache/spark/BarrierTaskContext.scala b/core/src/main/scala/org/apache/spark/BarrierTaskContext.scala
+index c393df8f022..a841508578a 100644
+--- a/core/src/main/scala/org/apache/spark/BarrierTaskContext.scala
++++ b/core/src/main/scala/org/apache/spark/BarrierTaskContext.scala
+@@ -19,6 +19,7 @@ package org.apache.spark
+ 
+ import java.util.{Properties, Timer, TimerTask}
+ 
++import scala.concurrent.TimeoutException
+ import scala.concurrent.duration._
+ 
+ import org.apache.spark.annotation.{Experimental, Since}
+@@ -117,12 +118,30 @@ class BarrierTaskContext private[spark] (
+     timer.schedule(timerTask, 60000, 60000)
+ 
+     try {
+-      barrierCoordinator.askSync[Unit](
++      val abortableRpcFuture = barrierCoordinator.askAbortable[Unit](
+         message = RequestToSync(numTasks, stageId, stageAttemptNumber, taskAttemptId,
+           barrierEpoch),
+         // Set a fixed timeout for RPC here, so users shall get a SparkException thrown by
+         // BarrierCoordinator on timeout, instead of RPCTimeoutException from the RPC framework.
+         timeout = new RpcTimeout(365.days, "barrierTimeout"))
++
++      // Wait the RPC future to be completed, but every 1 second it will jump out waiting
++      // and check whether current spark task is killed. If killed, then throw
++      // a `TaskKilledException`, otherwise continue wait RPC until it completes.
++      while(!abortableRpcFuture.toFuture.isCompleted) {
++        if (taskContext.isInterrupted()) {
++          val reason = taskContext.getKillReason().get
++          abortableRpcFuture.abort(reason)
++          throw new TaskKilledException(reason)
++        }
++        // wait RPC future for at most 1 second
++        try {
++          ThreadUtils.awaitResult(abortableRpcFuture.toFuture, 1.second)
++        } catch {
++          case _: TimeoutException => Unit // await future time reach 1 second.
++        }
++      }
++
+       barrierEpoch += 1
+       logInfo(s"Task $taskAttemptId from Stage $stageId(Attempt $stageAttemptNumber) finished " +
+         "global sync successfully, waited for " +
+diff --git a/core/src/main/scala/org/apache/spark/rpc/RpcEndpointRef.scala b/core/src/main/scala/org/apache/spark/rpc/RpcEndpointRef.scala
+index 6c4c0383b3c..49d58929a97 100644
+--- a/core/src/main/scala/org/apache/spark/rpc/RpcEndpointRef.scala
++++ b/core/src/main/scala/org/apache/spark/rpc/RpcEndpointRef.scala
+@@ -46,6 +46,17 @@ private[spark] abstract class RpcEndpointRef(conf: SparkConf)
+    */
+   def send(message: Any): Unit
+ 
++  /**
++   * Send a message to the corresponding [[RpcEndpoint.receiveAndReply)]] and return a
++   * [[AbortableRpcFuture]] to receive the reply within the specified timeout.
++   * The [[AbortableRpcFuture]] instance wraps [[Future]] with additional `abort` method.
++   *
++   * This method only sends the message once and never retries.
++   */
++  def askAbortable[T: ClassTag](message: Any, timeout: RpcTimeout): AbortableRpcFuture[T] = {
++    throw new UnsupportedOperationException()
++  }
++
+   /**
+    * Send a message to the corresponding [[RpcEndpoint.receiveAndReply)]] and return a [[Future]] to
+    * receive the reply within the specified timeout.
+@@ -93,3 +104,21 @@ private[spark] abstract class RpcEndpointRef(conf: SparkConf)
+   }
+ 
+ }
++
++/**
++ * An exception thrown if the RPC is aborted.
++ */
++class RpcAbortException(message: String) extends Exception(message)
++
++/**
++ * A wrapper for [[Future]] but add abort method.
++ * This is used in long run RPC and provide an approach to abort the RPC.
++ */
++private[spark] class AbortableRpcFuture[T: ClassTag](
++    future: Future[T],
++    onAbort: String => Unit) {
++
++  def abort(reason: String): Unit = onAbort(reason)
++
++  def toFuture: Future[T] = future
++}
+diff --git a/core/src/main/scala/org/apache/spark/rpc/netty/NettyRpcEnv.scala b/core/src/main/scala/org/apache/spark/rpc/netty/NettyRpcEnv.scala
+index 5dce43b7523..265e158d7c5 100644
+--- a/core/src/main/scala/org/apache/spark/rpc/netty/NettyRpcEnv.scala
++++ b/core/src/main/scala/org/apache/spark/rpc/netty/NettyRpcEnv.scala
+@@ -204,7 +204,8 @@ private[netty] class NettyRpcEnv(
+     clientFactory.createClient(address.host, address.port)
+   }
+ 
+-  private[netty] def ask[T: ClassTag](message: RequestMessage, timeout: RpcTimeout): Future[T] = {
++  private[netty] def askAbortable[T: ClassTag](
++      message: RequestMessage, timeout: RpcTimeout): AbortableRpcFuture[T] = {
+     val promise = Promise[Any]()
+     val remoteAddr = message.receiver.address
+ 
+@@ -225,6 +226,10 @@ private[netty] class NettyRpcEnv(
+         }
+     }
+ 
++    def onAbort(reason: String): Unit = {
++      onFailure(new RpcAbortException(reason))
++    }
++
+     try {
+       if (remoteAddr == address) {
+         val p = Promise[Any]()
+@@ -240,6 +245,7 @@ private[netty] class NettyRpcEnv(
+         postToOutbox(message.receiver, rpcMessage)
+         promise.future.failed.foreach {
+           case _: TimeoutException => rpcMessage.onTimeout()
++          case _: RpcAbortException => rpcMessage.onAbort()
+           case _ =>
+         }(ThreadUtils.sameThread)
+       }
+@@ -257,7 +263,14 @@ private[netty] class NettyRpcEnv(
+       case NonFatal(e) =>
+         onFailure(e)
+     }
+-    promise.future.mapTo[T].recover(timeout.addMessageIfTimeout)(ThreadUtils.sameThread)
++
++    new AbortableRpcFuture[T](
++      promise.future.mapTo[T].recover(timeout.addMessageIfTimeout)(ThreadUtils.sameThread),
++      onAbort)
++  }
++
++  private[netty] def ask[T: ClassTag](message: RequestMessage, timeout: RpcTimeout): Future[T] = {
++    askAbortable(message, timeout).toFuture
+   }
+ 
+   private[netty] def serialize(content: Any): ByteBuffer = {
+@@ -528,8 +541,13 @@ private[netty] class NettyRpcEndpointRef(
+ 
+   override def name: String = endpointAddress.name
+ 
++  override def askAbortable[T: ClassTag](
++      message: Any, timeout: RpcTimeout): AbortableRpcFuture[T] = {
++    nettyEnv.askAbortable(new RequestMessage(nettyEnv.address, this, message), timeout)
++  }
++
+   override def ask[T: ClassTag](message: Any, timeout: RpcTimeout): Future[T] = {
+-    nettyEnv.ask(new RequestMessage(nettyEnv.address, this, message), timeout)
++    askAbortable(message, timeout).toFuture
+   }
+ 
+   override def send(message: Any): Unit = {
+diff --git a/core/src/main/scala/org/apache/spark/rpc/netty/Outbox.scala b/core/src/main/scala/org/apache/spark/rpc/netty/Outbox.scala
+index 3db63934813..205e6e96686 100644
+--- a/core/src/main/scala/org/apache/spark/rpc/netty/Outbox.scala
++++ b/core/src/main/scala/org/apache/spark/rpc/netty/Outbox.scala
+@@ -66,14 +66,22 @@ private[netty] case class RpcOutboxMessage(
+     this.requestId = client.sendRpc(content, this)
+   }
+ 
+-  def onTimeout(): Unit = {
++  private[netty] def removeRpcRequest(): Unit = {
+     if (client != null) {
+       client.removeRpcRequest(requestId)
+     } else {
+-      logError("Ask timeout before connecting successfully")
++      logError("Ask terminated before connecting successfully")
+     }
+   }
+ 
++  def onTimeout(): Unit = {
++    removeRpcRequest()
++  }
++
++  def onAbort(): Unit = {
++    removeRpcRequest()
++  }
++
+   override def onFailure(e: Throwable): Unit = {
+     _onFailure(e)
+   }
+diff --git a/core/src/main/scala/org/apache/spark/util/ThreadUtils.scala b/core/src/main/scala/org/apache/spark/util/ThreadUtils.scala
+index 04b0b4c37df..8df331251c7 100644
+--- a/core/src/main/scala/org/apache/spark/util/ThreadUtils.scala
++++ b/core/src/main/scala/org/apache/spark/util/ThreadUtils.scala
+@@ -29,6 +29,7 @@ import scala.concurrent.duration.{Duration, FiniteDuration}
+ import scala.util.control.NonFatal
+ 
+ import org.apache.spark.SparkException
++import org.apache.spark.rpc.RpcAbortException
+ 
+ private[spark] object ThreadUtils {
+ 
+@@ -220,8 +221,10 @@ private[spark] object ThreadUtils {
+     } catch {
+       case e: SparkFatalException =>
+         throw e.throwable
+-      // TimeoutException is thrown in the current thread, so not need to warp the exception.
+-      case NonFatal(t) if !t.isInstanceOf[TimeoutException] =>
++      // TimeoutException and RpcAbortException is thrown in the current thread, so not need to warp
++      // the exception.
++      case NonFatal(t)
++          if !t.isInstanceOf[TimeoutException] && !t.isInstanceOf[RpcAbortException] =>
+         throw new SparkException("Exception thrown in awaitResult: ", t)
+     }
+   }
+diff --git a/core/src/test/scala/org/apache/spark/rpc/RpcEnvSuite.scala b/core/src/test/scala/org/apache/spark/rpc/RpcEnvSuite.scala
+index 99b4e8fe828..5bdf71be35b 100644
+--- a/core/src/test/scala/org/apache/spark/rpc/RpcEnvSuite.scala
++++ b/core/src/test/scala/org/apache/spark/rpc/RpcEnvSuite.scala
+@@ -191,6 +191,48 @@ abstract class RpcEnvSuite extends SparkFunSuite with BeforeAndAfterAll {
+     }
+   }
+ 
++  test("ask a message abort") {
++    env.setupEndpoint("ask-abort", new RpcEndpoint {
++      override val rpcEnv = env
++
++      override def receiveAndReply(context: RpcCallContext): PartialFunction[Any, Unit] = {
++        case msg: String =>
++          Thread.sleep(10000)
++          context.reply(msg)
++      }
++    })
++
++    val conf = new SparkConf()
++    val shortProp = "spark.rpc.short.timeout"
++    conf.set(Network.RPC_RETRY_WAIT, 0L)
++    conf.set(Network.RPC_NUM_RETRIES, 1)
++    val anotherEnv = createRpcEnv(conf, "remote", 0, clientMode = true)
++    // Use anotherEnv to find out the RpcEndpointRef
++    val rpcEndpointRef = anotherEnv.setupEndpointRef(env.address, "ask-abort")
++    try {
++      val e = intercept[RpcAbortException] {
++        val timeout = new RpcTimeout(10.seconds, shortProp)
++        val abortableRpcFuture = rpcEndpointRef.askAbortable[String](
++          "hello", timeout)
++
++        new Thread {
++          override def run: Unit = {
++            Thread.sleep(100)
++            abortableRpcFuture.abort("TestAbort")
++          }
++        }.start()
++
++        timeout.awaitResult(abortableRpcFuture.toFuture)
++      }
++      // The SparkException cause should be a RpcAbortException with "TestAbort" message
++      assert(e.isInstanceOf[RpcAbortException])
++      assert(e.getMessage.contains("TestAbort"))
++    } finally {
++      anotherEnv.shutdown()
++      anotherEnv.awaitTermination()
++    }
++  }
++
+   test("onStart and onStop") {
+     val stopLatch = new CountDownLatch(1)
+     val calledMethods = mutable.ArrayBuffer[String]()
+diff --git a/core/src/test/scala/org/apache/spark/scheduler/BarrierTaskContextSuite.scala b/core/src/test/scala/org/apache/spark/scheduler/BarrierTaskContextSuite.scala
+index 112fd31a060..101d8331485 100644
+--- a/core/src/test/scala/org/apache/spark/scheduler/BarrierTaskContextSuite.scala
++++ b/core/src/test/scala/org/apache/spark/scheduler/BarrierTaskContextSuite.scala
+@@ -17,6 +17,8 @@
+ 
+ package org.apache.spark.scheduler
+ 
++import java.io.File
++
+ import scala.util.Random
+ 
+ import org.apache.spark._
+@@ -153,4 +155,53 @@ class BarrierTaskContextSuite extends SparkFunSuite with LocalSparkContext {
+     assert(error.contains("The coordinator didn't get all barrier sync requests"))
+     assert(error.contains("within 1 second(s)"))
+   }
++
++  test("barrier task killed") {
++    val conf = new SparkConf()
++      .set("spark.barrier.sync.timeout", "1")
++      .set(TEST_NO_STAGE_RETRY, true)
++      .setMaster("local-cluster[4, 1, 1024]")
++      .setAppName("test-cluster")
++    sc = new SparkContext(conf)
++
++    withTempDir { dir =>
++      val killedFlagFile = "barrier.task.killed"
++      val rdd = sc.makeRDD(Seq(0, 1), 2)
++      val rdd2 = rdd.barrier().mapPartitions { it =>
++        val context = BarrierTaskContext.get()
++        if (context.partitionId() == 0) {
++          try {
++            context.barrier()
++          } catch {
++            case _: TaskKilledException =>
++              new File(dir, killedFlagFile).createNewFile()
++          }
++        } else {
++          Thread.sleep(5000)
++          context.barrier()
++        }
++        it
++      }
++
++      val listener = new SparkListener {
++        override def onTaskStart(taskStart: SparkListenerTaskStart): Unit = {
++          new Thread {
++            override def run: Unit = {
++              Thread.sleep(1000)
++              sc.killTaskAttempt(taskStart.taskInfo.taskId, interruptThread = false)
++            }
++          }.start()
++        }
++      }
++      sc.addSparkListener(listener)
++
++      intercept[SparkException] {
++        rdd2.collect()
++      }
++
++      sc.removeSparkListener(listener)
++
++      assert(new File(dir, killedFlagFile).exists(), "Expect barrier task being killed.")
++    }
++  }
+ }

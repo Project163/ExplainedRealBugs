@@ -1,0 +1,559 @@
+diff --git a/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/expressions/AliasHelper.scala b/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/expressions/AliasHelper.scala
+index 6ea79f73632..c54b8162c6e 100644
+--- a/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/expressions/AliasHelper.scala
++++ b/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/expressions/AliasHelper.scala
+@@ -44,7 +44,7 @@ trait AliasHelper {
+     AttributeMap(aliasMap)
+   }
+ 
+-  protected def getAliasMap(exprs: Seq[NamedExpression]): AttributeMap[Alias] = {
++  protected def getAliasMap(exprs: Iterable[NamedExpression]): AttributeMap[Alias] = {
+     // Create a map of Aliases to their values from the child projection.
+     // e.g., 'SELECT a + b AS c, d ...' produces Map(c -> Alias(a + b, c)).
+     AttributeMap(exprs.collect { case a: Alias => (a.toAttribute, a) })
+diff --git a/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/expressions/PythonUDF.scala b/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/expressions/PythonUDF.scala
+index e4d0f964277..99619d9de96 100644
+--- a/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/expressions/PythonUDF.scala
++++ b/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/expressions/PythonUDF.scala
+@@ -51,6 +51,27 @@ object PythonUDF {
+     // support new types in the future, e.g, N -> N transform.
+     e.isInstanceOf[PythonUDAF]
+   }
++
++  def correctEvalType(udf: PythonUDF, pythonUDFArrowFallbackOnUDT: Boolean): Int = {
++    if (udf.evalType == PythonEvalType.SQL_ARROW_BATCHED_UDF) {
++      if (pythonUDFArrowFallbackOnUDT &&
++        (containsUDT(udf.dataType) || udf.children.exists(expr => containsUDT(expr.dataType)))) {
++        PythonEvalType.SQL_BATCHED_UDF
++      } else {
++        PythonEvalType.SQL_ARROW_BATCHED_UDF
++      }
++    } else {
++      udf.evalType
++    }
++  }
++
++  private def containsUDT(dataType: DataType): Boolean = dataType match {
++    case _: UserDefinedType[_] => true
++    case ArrayType(elementType, _) => containsUDT(elementType)
++    case StructType(fields) => fields.exists(field => containsUDT(field.dataType))
++    case MapType(keyType, valueType, _) => containsUDT(keyType) || containsUDT(valueType)
++    case _ => false
++  }
+ }
+ 
+ 
+diff --git a/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/optimizer/Optimizer.scala b/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/optimizer/Optimizer.scala
+index ef505a01441..7f65db78af8 100644
+--- a/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/optimizer/Optimizer.scala
++++ b/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/optimizer/Optimizer.scala
+@@ -18,12 +18,14 @@
+ package org.apache.spark.sql.catalyst.optimizer
+ 
+ import scala.collection.mutable
++import scala.collection.mutable.ListBuffer
+ 
+ import org.apache.spark.SparkException
+ import org.apache.spark.internal.{LogKeys}
+ import org.apache.spark.sql.catalyst.SQLConfHelper
+ import org.apache.spark.sql.catalyst.analysis._
+ import org.apache.spark.sql.catalyst.expressions._
++import org.apache.spark.sql.catalyst.expressions.PythonUDF.{correctEvalType, isScalarPythonUDF}
+ import org.apache.spark.sql.catalyst.expressions.SubqueryExpression.hasCorrelatedSubquery
+ import org.apache.spark.sql.catalyst.expressions.aggregate._
+ import org.apache.spark.sql.catalyst.planning.PhysicalOperation
+@@ -1168,13 +1170,60 @@ object CollapseProject extends Rule[LogicalPlan] with AliasHelper {
+   }
+ 
+   def apply(plan: LogicalPlan, alwaysInline: Boolean): LogicalPlan = {
+-    plan.transformUpWithPruning(_.containsPattern(PROJECT), ruleId) {
+-      case p1 @ Project(_, p2: Project)
+-          if canCollapseExpressions(p1.projectList, p2.projectList, alwaysInline) =>
+-        p2.copy(projectList = buildCleanedProjectList(p1.projectList, p2.projectList))
++    traverse(plan, alwaysInline, Set.empty, conf.pythonUDFArrowFallbackOnUDT)
++  }
++
++  private def traverse(
++      plan: LogicalPlan,
++      alwaysInline: Boolean,
++      pythonUDFEvalTypesInUpperProjects: Set[Int],
++      pythonUDFArrowFallbackOnUDT: Boolean): LogicalPlan = {
++    if (!plan.containsPattern(PROJECT)) {
++      return plan
++    }
++
++    // Collapsing projects is a classic bottom-up transformation, but while we recurse down the plan
++    // we can collect the Python UDF eval types that appear in the current project group (i.e.
++    // multiple adjacent project nodes).
++    // We use this set of eval types during the bottom-up traversal as when we encounter a Python
++    // UDF in a lower project node and either the upper or any parent in the group contains another
++    // UDF with the same eval type, then it makes sense to force collapsing the nodes.
++    val newPythonUDFEvalTypesInUpperProjects = plan match {
++      // Extend the set of types with the new types found in the current project node
++      case p: Project =>
++        pythonUDFEvalTypesInUpperProjects ++ p.projectList.flatMap(_.collect {
++          case udf: PythonUDF if isScalarPythonUDF(udf) =>
++            correctEvalType(udf, pythonUDFArrowFallbackOnUDT)
++        }).toSet
++
++      // Project group end so reset the set of types
++      case _ => Set.empty[Int]
++    }
++
++    plan.mapChildren(traverse(
++      _,
++      alwaysInline,
++      newPythonUDFEvalTypesInUpperProjects,
++      pythonUDFArrowFallbackOnUDT)) match {
++      case p1 @ Project(_, p2: Project) =>
++        mergeProjectExpressions(
++          p1.projectList,
++          p2.projectList,
++          alwaysInline,
++          newPythonUDFEvalTypesInUpperProjects,
++          pythonUDFArrowFallbackOnUDT) match {
++            case (Seq(), merged) => p2.copy(projectList = merged)
++            case (newUpper, newLower) =>
++              p1.copy(projectList = newUpper, child = p2.copy(projectList = newLower))
++        }
+       case p @ Project(_, agg: Aggregate)
+-          if canCollapseExpressions(p.projectList, agg.aggregateExpressions, alwaysInline) &&
+-             canCollapseAggregate(p, agg) =>
++          if canCollapseExpressions(
++            p.projectList,
++            getAliasMap(agg.aggregateExpressions),
++            alwaysInline,
++            newPythonUDFEvalTypesInUpperProjects,
++            pythonUDFArrowFallbackOnUDT)
++            && canCollapseAggregate(p, agg) =>
+         agg.copy(aggregateExpressions = buildCleanedProjectList(
+           p.projectList, agg.aggregateExpressions))
+       case Project(l1, g @ GlobalLimit(_, limit @ LocalLimit(_, p2 @ Project(l2, _))))
+@@ -1188,6 +1237,118 @@ object CollapseProject extends Rule[LogicalPlan] with AliasHelper {
+         r.copy(child = p.copy(projectList = buildCleanedProjectList(l1, p.projectList)))
+       case Project(l1, s @ Sample(_, _, _, _, p2 @ Project(l2, _))) if isRenaming(l1, l2) =>
+         s.copy(child = p2.copy(projectList = buildCleanedProjectList(l1, p2.projectList)))
++      case o => o
++    }
++  }
++
++  private def cheapToInlineProducer(
++      producer: NamedExpression,
++      relatedConsumers: Iterable[Expression]) = trimAliases(producer) match {
++    // These collection creation functions are not cheap as a producer, but we have
++    // optimizer rules that can optimize them out if they are only consumed by
++    // ExtractValue (See SimplifyExtractValueOps), so we need to allow to inline them to
++    // avoid perf regression. As an example:
++    //   Project(s.a, s.b, Project(create_struct(a, b, c) as s, child))
++    // We should collapse these two projects and eventually get Project(a, b, child)
++    case e @ (_: CreateNamedStruct | _: UpdateFields | _: CreateMap | _: CreateArray) =>
++      // We can inline the collection creation producer if at most one of its access
++      // is non-cheap. Cheap access here means the access can be optimized by
++      // `SimplifyExtractValueOps` and become a cheap expression. For example,
++      // `create_struct(a, b, c).a` is a cheap access as it can be optimized to `a`.
++      // For a query:
++      //   Project(s.a, s, Project(create_struct(a, b, c) as s, child))
++      // We should collapse these two projects and eventually get
++      //   Project(a, create_struct(a, b, c) as s, child)
++      var nonCheapAccessSeen = false
++      def nonCheapAccessVisitor(): Boolean = {
++        // Returns true for all calls after the first.
++        try {
++          nonCheapAccessSeen
++        } finally {
++          nonCheapAccessSeen = true
++        }
++      }
++
++      !relatedConsumers
++        .exists(findNonCheapAccesses(_, producer.toAttribute, e, nonCheapAccessVisitor))
++
++    case other => isCheap(other)
++  }
++
++  private def mergeProjectExpressions(
++      consumers: Seq[NamedExpression],
++      producers: Seq[NamedExpression],
++      alwaysInline: Boolean,
++      pythonUDFEvalTypesInUpperProjects: Set[Int],
++      pythonUDFArrowFallbackOnUDT: Boolean): (Seq[NamedExpression], Seq[NamedExpression]) = {
++    lazy val producerAttributes = AttributeSet(producers.collect { case a: Alias => a.toAttribute })
++
++    // A map from producer attributes to tuples of:
++    // - how many times the producer is referenced from consumers and
++    // - the set of consumers that reference the producer.
++    lazy val producerReferences = AttributeMap(consumers
++      .flatMap(e => collectReferences(e).filter(producerAttributes.contains).map(_ -> e))
++      .groupMap(_._1)(_._2)
++      .view.mapValues(v => v.size -> ExpressionSet(v)))
++
++    // Split the producers from the lower node to 4 categories:
++    // - `neverInlines` contains producer expressions that shouldn't be inlined.
++    //    These include non-deterministic expressions or expensive ones that are referenced multiple
++    //    times.
++    // - `mustInlines` contains expressions with Python UDFs that must be inlined into the upper
++    //    node to avoid performance issues.
++    // - `maybeInlines` contains expressions that might make sense to inline, such as expressions
++    //    that are used only once, or are cheap to inline.
++    //    But we need to take into account the side effect of adding new pass-through attributes to
++    //    the lower node, which can make the node much wider than it was originally.
++    // - `others` contains pass-through attributes needed for the upper node.
++    val neverInlines = ListBuffer.empty[NamedExpression]
++    val mustInlines = ListBuffer.empty[NamedExpression]
++    val maybeInlines = ListBuffer.empty[NamedExpression]
++    val others = ListBuffer.empty[Attribute]
++    producers.foreach {
++      case a: Alias =>
++        producerReferences.get(a.toAttribute).foreach { case (count, relatedConsumers) =>
++          lazy val containsUDF = a.child.exists {
++            case udf: PythonUDF =>
++              isScalarPythonUDF(udf) &&
++                pythonUDFEvalTypesInUpperProjects.contains(
++                  correctEvalType(udf, pythonUDFArrowFallbackOnUDT))
++            case _ => false
++          }
++
++          if (!a.child.deterministic) {
++            neverInlines += a
++          } else if (alwaysInline || containsUDF) {
++            mustInlines += a
++          } else if (count == 1 || cheapToInlineProducer(a, relatedConsumers)) {
++            maybeInlines += a
++          } else {
++            neverInlines += a
++          }
++        }
++
++      case o => others += o.toAttribute
++    }
++
++    if (neverInlines.isEmpty) {
++      // If `neverInlines` is empty then we can collapse the nodes into one.
++      (Seq.empty, buildCleanedProjectList(consumers, producers))
++    } else if (mustInlines.isEmpty) {
++      // Otherwise we can't collapse the nodes into one, but if `mustInlines` is empty then we can
++      // keep `maybeInlines` in the lower node for now, so there is no change to the nodes.
++      (consumers, producers)
++    } else {
++      // If both `neverInlines` and `mustInlines` are not empty, then inline `mustInlines` and add
++      // new pass-through attributes to the lower node.
++      val newConsumers = buildCleanedProjectList(consumers, mustInlines)
++      val passthroughAttributes = AttributeSet(others)
++      val newPassthroughAttributes =
++        mustInlines.flatMap(_.references).filterNot(passthroughAttributes.contains)
++      val newOthers = others ++ newPassthroughAttributes
++      // Let's keep `maybeInlines` in the lower node for now.
++      val newProducers = neverInlines ++ maybeInlines ++ newOthers
++      (newConsumers, newProducers.toSeq)
+     }
+   }
+ 
+@@ -1206,8 +1367,18 @@ object CollapseProject extends Rule[LogicalPlan] with AliasHelper {
+    */
+   def canCollapseExpressions(
+       consumers: Seq[Expression],
+-      producerMap: Map[Attribute, Expression],
+-      alwaysInline: Boolean = false): Boolean = {
++      producerMap: Map[Attribute, NamedExpression],
++      alwaysInline: Boolean = false,
++      pythonUDFEvalTypesInUpperProjects: Set[Int] = Set.empty,
++      pythonUDFArrowFallbackOnUDT: Boolean = conf.pythonUDFArrowFallbackOnUDT): Boolean = {
++    val inline = alwaysInline || producerMap.values.exists(_.exists {
++      case udf: PythonUDF =>
++        isScalarPythonUDF(udf) &&
++          pythonUDFEvalTypesInUpperProjects.contains(
++            correctEvalType(udf, pythonUDFArrowFallbackOnUDT))
++      case _ => false
++    })
++
+     // We can only collapse expressions if all input expressions meet the following criteria:
+     // - The input is deterministic.
+     // - The input is only consumed once OR the underlying input expression is cheap.
+@@ -1215,44 +1386,14 @@ object CollapseProject extends Rule[LogicalPlan] with AliasHelper {
+       .filter(_.references.exists(producerMap.contains))
+       .flatMap(collectReferences)
+       .groupBy(identity)
+-      .transform((_, v) => v.size)
++      .view.mapValues(v => v.size)
+       .forall {
+         case (reference, count) =>
+           val producer = producerMap.getOrElse(reference, reference)
+           val relatedConsumers = consumers.filter(_.references.contains(reference))
+ 
+-          def cheapToInlineProducer: Boolean = trimAliases(producer) match {
+-            // These collection creation functions are not cheap as a producer, but we have
+-            // optimizer rules that can optimize them out if they are only consumed by
+-            // ExtractValue (See SimplifyExtractValueOps), so we need to allow to inline them to
+-            // avoid perf regression. As an example:
+-            //   Project(s.a, s.b, Project(create_struct(a, b, c) as s, child))
+-            // We should collapse these two projects and eventually get Project(a, b, child)
+-            case e @ (_: CreateNamedStruct | _: UpdateFields | _: CreateMap | _: CreateArray) =>
+-              // We can inline the collection creation producer if at most one of its access
+-              // is non-cheap. Cheap access here means the access can be optimized by
+-              // `SimplifyExtractValueOps` and become a cheap expression. For example,
+-              // `create_struct(a, b, c).a` is a cheap access as it can be optimized to `a`.
+-              // For a query:
+-              //   Project(s.a, s, Project(create_struct(a, b, c) as s, child))
+-              // We should collapse these two projects and eventually get
+-              //   Project(a, create_struct(a, b, c) as s, child)
+-              var nonCheapAccessSeen = false
+-              def nonCheapAccessVisitor(): Boolean = {
+-                // Returns true for all calls after the first.
+-                try {
+-                  nonCheapAccessSeen
+-                } finally {
+-                  nonCheapAccessSeen = true
+-                }
+-              }
+-
+-              !relatedConsumers.exists(findNonCheapAccesses(_, reference, e, nonCheapAccessVisitor))
+-
+-            case other => isCheap(other)
+-          }
+-
+-          producer.deterministic && (count == 1 || alwaysInline || cheapToInlineProducer)
++          producer.deterministic &&
++            (count == 1 || inline || cheapToInlineProducer(producer, relatedConsumers))
+       }
+   }
+ 
+@@ -1319,7 +1460,7 @@ object CollapseProject extends Rule[LogicalPlan] with AliasHelper {
+ 
+   def buildCleanedProjectList(
+       upper: Seq[NamedExpression],
+-      lower: Seq[NamedExpression]): Seq[NamedExpression] = {
++      lower: Iterable[NamedExpression]): Seq[NamedExpression] = {
+     val explicitlyPreserveAliasMetadata =
+       conf.getConf(SQLConf.PRESERVE_ALIAS_METADATA_WHEN_COLLAPSING_PROJECTS)
+     val aliases = getAliasMap(lower)
+diff --git a/sql/catalyst/src/test/scala/org/apache/spark/sql/catalyst/optimizer/CollapseProjectSuite.scala b/sql/catalyst/src/test/scala/org/apache/spark/sql/catalyst/optimizer/CollapseProjectSuite.scala
+index e83f231c188..25c310ab730 100644
+--- a/sql/catalyst/src/test/scala/org/apache/spark/sql/catalyst/optimizer/CollapseProjectSuite.scala
++++ b/sql/catalyst/src/test/scala/org/apache/spark/sql/catalyst/optimizer/CollapseProjectSuite.scala
+@@ -17,6 +17,7 @@
+ 
+ package org.apache.spark.sql.catalyst.optimizer
+ 
++import org.apache.spark.api.python.PythonEvalType
+ import org.apache.spark.sql.catalyst.analysis.EliminateSubqueryAliases
+ import org.apache.spark.sql.catalyst.dsl.expressions._
+ import org.apache.spark.sql.catalyst.dsl.plans._
+@@ -298,4 +299,69 @@ class CollapseProjectSuite extends PlanTest {
+       comparePlans(optimized, expected)
+     }
+   }
++
++  test("SPARK-53399: Merge Python UDFs with same evalType") {
++    val pythonUdf = (e: Expression) => {
++      PythonUDF("udf", null, IntegerType, Seq(e), PythonEvalType.SQL_BATCHED_UDF, true)
++    }
++
++    val query = testRelation
++      .select(
++        pythonUdf($"a") as "udf_a", // Always inline
++        $"b",
++        $"b" + 1 as "b_plus_1", // Never inline
++        $"b" + 2 as "b_plus_2") // Maybe inline
++      .select(
++        $"udf_a",
++        pythonUdf($"b") as "udf_b",
++        $"b_plus_1" + $"b_plus_1" as "2b_plus_2",
++        $"b_plus_2")
++      .analyze
++
++    val optimized = Optimize.execute(query)
++
++    val expected = testRelation
++      .select(
++        $"a", // New passthrough attribute is added due to always inline
++        $"b",
++        $"b" + 1 as "b_plus_1", // Never inline is kept in lower
++        $"b" + 2 as "b_plus_2") // Maybe inline is kept in lower for now
++      .select(
++        pythonUdf($"a") as "udf_a", // Always inline is moved to upper
++        pythonUdf($"b") as "udf_b",
++        $"b_plus_1" + $"b_plus_1" as "2b_plus_2",
++        $"b_plus_2")
++      .analyze
++
++    comparePlans(optimized, expected)
++  }
++
++  test("SPARK-53399: Don't merge Python UDFs with different evalType") {
++    val pythonUdfA = (e: Expression) => {
++      PythonUDF("udf", null, IntegerType, Seq(e), PythonEvalType.SQL_BATCHED_UDF, true)
++    }
++
++    val pythonUdfB = (e: Expression) => {
++      PythonUDF("udf", null, IntegerType, Seq(e), PythonEvalType.SQL_ARROW_BATCHED_UDF, true)
++    }
++
++    val query = testRelation
++      .select(
++        pythonUdfA($"a") as "udf_a", // Maybe inline because `evalType` doesn't match to `udf_b`'s
++        $"b",
++        $"b" + 1 as "b_plus_1", // Never inline
++        $"b" + 2 as "b_plus_2") // Maybe inline
++      .select(
++        $"udf_a",
++        pythonUdfB($"b") as "udf_b",
++        $"b_plus_1" + $"b_plus_1" as "2b_plus_2",
++        "b_plus_2")
++      .analyze
++
++    val optimized = Optimize.execute(query)
++
++    val expected = query // No always inlines so keep both nodes intact
++
++    comparePlans(optimized, expected)
++  }
+ }
+diff --git a/sql/core/src/main/scala/org/apache/spark/sql/execution/python/ExtractPythonUDFs.scala b/sql/core/src/main/scala/org/apache/spark/sql/execution/python/ExtractPythonUDFs.scala
+index 1407e020353..af9b41e93a0 100644
+--- a/sql/core/src/main/scala/org/apache/spark/sql/execution/python/ExtractPythonUDFs.scala
++++ b/sql/core/src/main/scala/org/apache/spark/sql/execution/python/ExtractPythonUDFs.scala
+@@ -25,11 +25,11 @@ import org.apache.spark.api.python.PythonEvalType
+ import org.apache.spark.internal.Logging
+ import org.apache.spark.internal.LogKeys.REASON
+ import org.apache.spark.sql.catalyst.expressions._
++import org.apache.spark.sql.catalyst.expressions.PythonUDF.{correctEvalType, isScalarPythonUDF}
+ import org.apache.spark.sql.catalyst.expressions.aggregate.AggregateExpression
+ import org.apache.spark.sql.catalyst.plans.logical._
+ import org.apache.spark.sql.catalyst.rules.Rule
+ import org.apache.spark.sql.catalyst.trees.TreePattern._
+-import org.apache.spark.sql.types._
+ 
+ 
+ /**
+@@ -48,8 +48,7 @@ object ExtractPythonUDFFromAggregate extends Rule[LogicalPlan] {
+ 
+   private def hasPythonUdfOverAggregate(expr: Expression, agg: Aggregate): Boolean = {
+     expr.exists {
+-      e => PythonUDF.isScalarPythonUDF(e) &&
+-        (e.references.isEmpty || e.exists(belongAggregate(_, agg)))
++      e => isScalarPythonUDF(e) && (e.references.isEmpty || e.exists(belongAggregate(_, agg)))
+     }
+   }
+ 
+@@ -92,7 +91,7 @@ object ExtractPythonUDFFromAggregate extends Rule[LogicalPlan] {
+  */
+ object ExtractGroupingPythonUDFFromAggregate extends Rule[LogicalPlan] {
+   private def hasScalarPythonUDF(e: Expression): Boolean = {
+-    e.exists(PythonUDF.isScalarPythonUDF)
++    e.exists(isScalarPythonUDF)
+   }
+ 
+   private def extract(agg: Aggregate): LogicalPlan = {
+@@ -166,7 +165,7 @@ object ExtractPythonUDFs extends Rule[LogicalPlan] with Logging {
+   private type EvalTypeChecker = EvalType => Boolean
+ 
+   private def hasScalarPythonUDF(e: Expression): Boolean = {
+-    e.exists(PythonUDF.isScalarPythonUDF)
++    e.exists(isScalarPythonUDF)
+   }
+ 
+   /**
+@@ -194,10 +193,14 @@ object ExtractPythonUDFs extends Rule[LogicalPlan] with Logging {
+    * separate nodes.
+    */
+   @scala.annotation.tailrec
+-  private def shouldExtractUDFExpressionTree(e: PythonUDF): Boolean = {
++  private def shouldExtractUDFExpressionTree(
++      e: PythonUDF,
++      pythonUDFArrowFallbackOnUDT: Boolean): Boolean = {
+     e.children match {
+-      case Seq(child: PythonUDF) => correctEvalType(e) == correctEvalType(child) &&
+-        shouldExtractUDFExpressionTree(child)
++      case Seq(child: PythonUDF) =>
++        correctEvalType(e, pythonUDFArrowFallbackOnUDT) ==
++          correctEvalType(child, pythonUDFArrowFallbackOnUDT) &&
++          shouldExtractUDFExpressionTree(child, pythonUDFArrowFallbackOnUDT)
+       // Python UDF can't be evaluated directly in JVM
+       case children => !children.exists(hasScalarPythonUDF)
+     }
+@@ -226,7 +229,9 @@ object ExtractPythonUDFs extends Rule[LogicalPlan] with Logging {
+    *   But we can chain udf1 and udf2, so a later call to collectEvaluableUDFsFromExpressions will
+    *   return Seq(udf1, udf2).
+    */
+-  private def collectEvaluableUDFsFromExpressions(expressions: Seq[Expression]): Seq[PythonUDF] = {
++  private def collectEvaluableUDFsFromExpressions(
++      expressions: Seq[Expression],
++      pythonUDFArrowFallbackOnUDT: Boolean): Seq[PythonUDF] = {
+     // If first UDF is SQL_SCALAR_PANDAS_ITER_UDF or SQL_SCALAR_ARROW_ITER_UDF,
+     // then only return this UDF,
+     // otherwise check if subsequent UDFs are of the same type as the first UDF. (since we can only
+@@ -244,14 +249,14 @@ object ExtractPythonUDFs extends Rule[LogicalPlan] with Logging {
+     }
+ 
+     def collectEvaluableUDFs(expr: Expression): Seq[PythonUDF] = expr match {
+-      case udf: PythonUDF if PythonUDF.isScalarPythonUDF(udf)
+-        && shouldExtractUDFExpressionTree(udf)
++      case udf: PythonUDF if isScalarPythonUDF(udf)
++        && shouldExtractUDFExpressionTree(udf, pythonUDFArrowFallbackOnUDT)
+         && firstVisitedScalarUDFEvalType.isEmpty =>
+-        firstVisitedScalarUDFEvalType = Some(correctEvalType(udf))
++        firstVisitedScalarUDFEvalType = Some(correctEvalType(udf, pythonUDFArrowFallbackOnUDT))
+         Seq(udf)
+-      case udf: PythonUDF if PythonUDF.isScalarPythonUDF(udf)
+-        && shouldExtractUDFExpressionTree(udf)
+-        && canChainWithParallelUDFs(correctEvalType(udf)) =>
++      case udf: PythonUDF if isScalarPythonUDF(udf)
++        && shouldExtractUDFExpressionTree(udf, pythonUDFArrowFallbackOnUDT)
++        && canChainWithParallelUDFs(correctEvalType(udf, pythonUDFArrowFallbackOnUDT)) =>
+         Seq(udf)
+       case e => e.children.flatMap(collectEvaluableUDFs)
+     }
+@@ -286,32 +291,14 @@ object ExtractPythonUDFs extends Rule[LogicalPlan] with Logging {
+     }
+   }
+ 
+-  private def correctEvalType(udf: PythonUDF): Int = {
+-    if (udf.evalType == PythonEvalType.SQL_ARROW_BATCHED_UDF) {
+-      if (conf.pythonUDFArrowFallbackOnUDT &&
+-        (containsUDT(udf.dataType) || udf.children.exists(expr => containsUDT(expr.dataType)))) {
+-        PythonEvalType.SQL_BATCHED_UDF
+-      } else {
+-        PythonEvalType.SQL_ARROW_BATCHED_UDF
+-      }
+-    } else {
+-      udf.evalType
+-    }
+-  }
+-
+-  private def containsUDT(dataType: DataType): Boolean = dataType match {
+-    case _: UserDefinedType[_] => true
+-    case ArrayType(elementType, _) => containsUDT(elementType)
+-    case StructType(fields) => fields.exists(field => containsUDT(field.dataType))
+-    case MapType(keyType, valueType, _) => containsUDT(keyType) || containsUDT(valueType)
+-    case _ => false
+-  }
+-
+   /**
+    * Extract all the PythonUDFs from the current operator and evaluate them before the operator.
+    */
+   private def extract(plan: LogicalPlan): LogicalPlan = {
+-    val udfs = ExpressionSet(collectEvaluableUDFsFromExpressions(plan.expressions))
++    val pythonUDFArrowFallbackOnUDT = conf.pythonUDFArrowFallbackOnUDT
++
++    val udfs = ExpressionSet(
++      collectEvaluableUDFsFromExpressions(plan.expressions, pythonUDFArrowFallbackOnUDT))
+       // ignore the PythonUDF that come from second/third aggregate, which is not used
+       .filter(udf => udf.references.subsetOf(plan.inputSet))
+       .toSeq.asInstanceOf[Seq[PythonUDF]]
+@@ -329,14 +316,14 @@ object ExtractPythonUDFs extends Rule[LogicalPlan] with Logging {
+         }
+         if (validUdfs.nonEmpty) {
+           require(
+-            validUdfs.forall(PythonUDF.isScalarPythonUDF),
++            validUdfs.forall(isScalarPythonUDF),
+             "Can only extract scalar vectorized udf or sql batch udf")
+ 
+           val resultAttrs = validUdfs.zipWithIndex.map { case (u, i) =>
+             AttributeReference(s"pythonUDF$i", u.dataType)()
+           }
+ 
+-          val evalTypes = validUdfs.map(correctEvalType).toSet
++          val evalTypes = validUdfs.map(correctEvalType(_, pythonUDFArrowFallbackOnUDT)).toSet
+           if (evalTypes.size != 1) {
+             throw SparkException.internalError(
+               "Expected udfs have the same evalType but got different evalTypes: " +

@@ -1,0 +1,148 @@
+diff --git a/runners/google-cloud-dataflow-java/worker/src/main/java/org/apache/beam/runners/dataflow/worker/windmill/DirectStreamObserver.java b/runners/google-cloud-dataflow-java/worker/src/main/java/org/apache/beam/runners/dataflow/worker/windmill/DirectStreamObserver.java
+index 0cef13675f9..abea5e0d31f 100644
+--- a/runners/google-cloud-dataflow-java/worker/src/main/java/org/apache/beam/runners/dataflow/worker/windmill/DirectStreamObserver.java
++++ b/runners/google-cloud-dataflow-java/worker/src/main/java/org/apache/beam/runners/dataflow/worker/windmill/DirectStreamObserver.java
+@@ -18,9 +18,14 @@
+ package org.apache.beam.runners.dataflow.worker.windmill;
+ 
+ import java.util.concurrent.Phaser;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.TimeoutException;
++import javax.annotation.concurrent.GuardedBy;
+ import javax.annotation.concurrent.ThreadSafe;
+ import org.apache.beam.vendor.grpc.v1p36p0.io.grpc.stub.CallStreamObserver;
+ import org.apache.beam.vendor.grpc.v1p36p0.io.grpc.stub.StreamObserver;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
+ 
+ /**
+  * A {@link StreamObserver} which uses synchronization on the underlying {@link CallStreamObserver}
+@@ -33,27 +38,70 @@ import org.apache.beam.vendor.grpc.v1p36p0.io.grpc.stub.StreamObserver;
+  */
+ @ThreadSafe
+ public final class DirectStreamObserver<T> implements StreamObserver<T> {
++  private static final Logger LOG = LoggerFactory.getLogger(DirectStreamObserver.class);
+   private final Phaser phaser;
++
++  @GuardedBy("outboundObserver")
+   private final CallStreamObserver<T> outboundObserver;
+ 
+-  public DirectStreamObserver(Phaser phaser, CallStreamObserver<T> outboundObserver) {
++  private final long deadlineSeconds;
++
++  @GuardedBy("outboundObserver")
++  private boolean firstMessage = true;
++
++  public DirectStreamObserver(
++      Phaser phaser, CallStreamObserver<T> outboundObserver, long deadlineSeconds) {
+     this.phaser = phaser;
+     this.outboundObserver = outboundObserver;
++    this.deadlineSeconds = deadlineSeconds;
+   }
+ 
+   @Override
+   public void onNext(T value) {
+-    int phase = phaser.getPhase();
+-    if (!outboundObserver.isReady()) {
++    final int phase = phaser.getPhase();
++    long totalSecondsWaited = 0;
++    long waitSeconds = 1;
++    while (true) {
+       try {
+-        phaser.awaitAdvanceInterruptibly(phase);
++        synchronized (outboundObserver) {
++          // We let the first message passthrough without blocking because it is performed under the
++          // StreamPool synchronized block and single message isn't going to cause memory issues due
++          // to excessive buffering within grpc.
++          if (firstMessage || outboundObserver.isReady()) {
++            firstMessage = false;
++            outboundObserver.onNext(value);
++            return;
++          }
++        }
++        // A callback has been registered to advance the phaser whenever the observer transitions to
++        // is ready. Since we are waiting for a phase observed before the outboundObserver.isReady()
++        // returned false, we expect it to advance after the channel has become ready.  This doesn't
++        // always seem to be the case (despite documentation stating otherwise) so we poll
++        // periodically and enforce an overall timeout related to the stream deadline.
++        phaser.awaitAdvanceInterruptibly(phase, waitSeconds, TimeUnit.SECONDS);
++        synchronized (outboundObserver) {
++          outboundObserver.onNext(value);
++          return;
++        }
++      } catch (TimeoutException e) {
++        totalSecondsWaited += waitSeconds;
++        if (totalSecondsWaited > deadlineSeconds) {
++          LOG.error(
++              "Exceeded timeout waiting for the outboundObserver to become ready meaning "
++                  + "that the streamdeadline was not respected.");
++          throw new RuntimeException(e);
++        }
++        waitSeconds = waitSeconds * 2;
+       } catch (InterruptedException e) {
+         Thread.currentThread().interrupt();
+         throw new RuntimeException(e);
+       }
+-    }
+-    synchronized (outboundObserver) {
+-      outboundObserver.onNext(value);
++      if (totalSecondsWaited > 30) {
++        LOG.info(
++            "Output channel stalled for {}s, outbound thread {}.",
++            totalSecondsWaited,
++            Thread.currentThread().getName());
++      }
+     }
+   }
+ 
+diff --git a/runners/google-cloud-dataflow-java/worker/src/main/java/org/apache/beam/runners/dataflow/worker/windmill/GrpcWindmillServer.java b/runners/google-cloud-dataflow-java/worker/src/main/java/org/apache/beam/runners/dataflow/worker/windmill/GrpcWindmillServer.java
+index 8a76e96c56f..81ae092e635 100644
+--- a/runners/google-cloud-dataflow-java/worker/src/main/java/org/apache/beam/runners/dataflow/worker/windmill/GrpcWindmillServer.java
++++ b/runners/google-cloud-dataflow-java/worker/src/main/java/org/apache/beam/runners/dataflow/worker/windmill/GrpcWindmillServer.java
+@@ -623,7 +623,8 @@ public class GrpcWindmillServer extends WindmillServerStub {
+    * require synchronizing on this.
+    */
+   private abstract class AbstractWindmillStream<RequestT, ResponseT> implements WindmillStream {
+-    private final StreamObserverFactory streamObserverFactory = StreamObserverFactory.direct();
++    private final StreamObserverFactory streamObserverFactory =
++        StreamObserverFactory.direct(streamDeadlineSeconds * 2);
+     private final Function<StreamObserver<ResponseT>, StreamObserver<RequestT>> clientFactory;
+     private final Executor executor = Executors.newSingleThreadExecutor();
+ 
+diff --git a/runners/google-cloud-dataflow-java/worker/src/main/java/org/apache/beam/runners/dataflow/worker/windmill/StreamObserverFactory.java b/runners/google-cloud-dataflow-java/worker/src/main/java/org/apache/beam/runners/dataflow/worker/windmill/StreamObserverFactory.java
+index 349460672c4..541a394b506 100644
+--- a/runners/google-cloud-dataflow-java/worker/src/main/java/org/apache/beam/runners/dataflow/worker/windmill/StreamObserverFactory.java
++++ b/runners/google-cloud-dataflow-java/worker/src/main/java/org/apache/beam/runners/dataflow/worker/windmill/StreamObserverFactory.java
+@@ -28,8 +28,8 @@ import org.apache.beam.vendor.grpc.v1p36p0.io.grpc.stub.StreamObserver;
+  * to use.
+  */
+ public abstract class StreamObserverFactory {
+-  public static StreamObserverFactory direct() {
+-    return new Direct();
++  public static StreamObserverFactory direct(long deadlineSeconds) {
++    return new Direct(deadlineSeconds);
+   }
+ 
+   public abstract <ReqT, RespT> StreamObserver<RespT> from(
+@@ -37,7 +37,11 @@ public abstract class StreamObserverFactory {
+       StreamObserver<ReqT> responseObserver);
+ 
+   private static class Direct extends StreamObserverFactory {
+-    Direct() {}
++    private final long deadlineSeconds;
++
++    Direct(long deadlineSeconds) {
++      this.deadlineSeconds = deadlineSeconds;
++    }
+ 
+     @Override
+     public <ReqT, RespT> StreamObserver<RespT> from(
+@@ -49,7 +53,7 @@ public abstract class StreamObserverFactory {
+               clientFactory.apply(
+                   new ForwardingClientResponseObserver<ReqT, RespT>(
+                       inboundObserver, phaser::arrive, phaser::forceTermination));
+-      return new DirectStreamObserver<>(phaser, outboundObserver);
++      return new DirectStreamObserver<>(phaser, outboundObserver, deadlineSeconds);
+     }
+   }
+ }

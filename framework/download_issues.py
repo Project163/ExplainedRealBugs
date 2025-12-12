@@ -6,6 +6,8 @@ import re
 import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse, urlunparse, urlencode, quote_plus
+import utils
+import time
 
 # Required packages:
 # pip install requests beautifulsoup4
@@ -16,9 +18,9 @@ SUPPORTED_TRACKERS = {
         'default_query': 'label:type-defect',
         'default_limit': 1,
         'build_uri': lambda tracker, project, query, start, limit, org: f"{tracker}{quote_plus(project)}/issues-page-{start + 1}.json",
-        'results': lambda path, project: [
+        'results': lambda content, project: [
             (issue['id'], f"https://storage.googleapis.com/google-code-archive/v2/code.google.com/{quote_plus(project)}/issues/issue-{issue['id']}.json")
-            for issue in json.load(open(path))['issues']
+            for issue in json.loads(content)['issues']
             if any(label.startswith('Type-Defect') for label in issue['labels'])
         ]
     },
@@ -31,35 +33,26 @@ SUPPORTED_TRACKERS = {
             f"jqlQuery={quote_plus(f'project = \"{project}\" AND {query}')}"
             f"&tempMax={limit}&pager/start={start}"
         ),
-        'results': lambda path, project: [
+        'results': lambda content, project: [
             (m.group(1), f"https://issues.apache.org/jira/browse/{m.group(1)}")
-            for line in open(path) if (m := re.search(r'^\s*<key.*?>(.*?)</key>', line))
+            for line in content.splitlines() if (m := re.search(r'^\s*<key.*?>(.*?)</key>', line))
         ]
     },
+    # Altered GitHub tracker to use GraphQL API
     'github': {
-        'default_tracker_uri': 'https://api.github.com/repos/',
+        'default_tracker_uri': 'https://api.github.com/graphql', # replaced with GraphQL endpoint
         'default_query': 'label=bug,defect',
         'default_limit': 100,
         'build_uri': lambda tracker, project, query, start, limit, org: (
-            f"{tracker}{f'{org}/' if '/' not in project and org else ''}{project}/issues?"
+            # attention: this URI builder is bypassed in main() for GraphQL logic
+            f"https://api.github.com/repos/{f'{org}/' if '/' not in project and org else ''}{project}/issues?"
             f"state=all&{query}&per_page={limit}&page={start // limit + 1}"
         ),
-        'results': lambda path, project: [
+        # attention: this lambda is bypassed in main() for GraphQL logic
+        'results': lambda content, project: [
             (issue['number'], issue['html_url'])
-            for issue in json.load(open(path))
+            for issue in json.loads(content)
             if 'pull_request' not in issue
-        ]
-    },
-    'sourceforge': {
-        'default_tracker_uri': 'http://sourceforge.net/rest/p/',
-        'default_query': '/bugs/?',
-        'default_limit': 100,
-        'build_uri': lambda tracker, project, query, start, limit, org: (
-            f"{tracker}{project}{query}&page={start // limit}&limit={limit}"
-        ),
-        'results': lambda path, project: [
-            (ticket['ticket_num'], f"https://sourceforge.net{json.load(open(path))['tracker_config']['options']['url']}{ticket['ticket_num']}")
-            for ticket in json.load(open(path))['tickets']
         ]
     },
     'bugzilla': {
@@ -70,29 +63,12 @@ SUPPORTED_TRACKERS = {
             f"{tracker}buglist.cgi?bug_status=RESOLVED&order=bug_id&limit=0&"
             f"product={project}&query_format=advanced&resolution=FIXED"
         ),
-        'results': lambda path, project: [
+        'results': lambda content, project: [
             (m.group(1), f"https://bz.apache.org/bugzilla/show_bug.cgi?id={m.group(1)}")
-            for line in open(path) if (m := re.search(r'^\s*<bug_id>(.*?)</bug_id>', line))
+            for line in content.splitlines() if (m := re.search(r'^\s*<bug_id>(.*?)</bug_id>', line))
         ]
     }
 }
-
-def get_file(uri, save_to, session):
-    headers = {}
-    # use GH_TOKEN if available for GitHub API requests
-    if 'api.github.com' in uri and os.environ.get('GH_TOKEN'):
-        headers['Authorization'] = f"token {os.environ['GH_TOKEN']}"
-    
-    try:
-        response = session.get(uri, headers=headers, timeout=20)
-        response.raise_for_status() 
-        
-        with open(save_to, 'w', encoding='utf-8') as f:
-            f.write(response.text)
-        return True
-    except requests.exceptions.RequestException as e:
-        print(f"Error downloading {uri}: {e}", file=sys.stderr)
-        return False
 
 def get_bugzilla_id_list(uri, project_name, session):
     try:
@@ -156,6 +132,173 @@ def main():
     session.headers.update({'User-Agent': 'Mozilla/5.0'})
 
     print("----------------------------------------------")
+
+    if args.tracker_name == 'github':
+        print(f"Using GitHub GraphQL strategy (Issues API) for {tracker_id} (to bypass 10k limit).")
+        sys.stdout.flush()
+        
+        # 1. Get GH_TOKEN
+        gh_token = os.environ.get('GH_TOKEN')
+        if not gh_token:
+            print("[Error]: GH_TOKEN environment variable must be set for GraphQL API.", file=sys.stderr)
+            sys.stderr.flush()
+            sys.exit(1)
+        
+        headers = {
+            'Authorization': f'token {gh_token}',
+            'User-Agent': 'Mozilla/5.0'
+        }
+        
+        graphql_endpoint = "https://api.github.com/graphql"
+
+        # 2. Extract owner and repo name
+        try:
+            if '/' in tracker_id:
+                owner, name = tracker_id.split('/', 1)
+            elif organization_id:
+                owner = organization_id
+                name = tracker_id
+            else:
+                raise ValueError(f"[Error]: GitHub project ID '{tracker_id}' must be 'owner/repo' or require -z <org>.")
+        except ValueError as e:
+            print(f"[Error]: Error parsing GitHub project ID: {e}", file=sys.stderr)
+            sys.stderr.flush()
+            sys.exit(1)
+
+        # 3. Define GraphQL Repository.Issues API query template
+        #    Get all states (OPEN, CLOSED)
+        graphql_query_template = """
+        query($owner: String!, $name: String!, $labels: [String!], $cursor: String) {
+          repository(owner: $owner, name: $name) {
+            issues(first: 100, after: $cursor, labels: $labels, states: [OPEN, CLOSED]) {
+              totalCount
+              pageInfo {
+                endCursor
+                hasNextPage
+              }
+              nodes {
+                number
+                url
+              }
+            }
+          }
+        }
+        """
+
+        # 4. Convert REST 'query' (e.g., 'label=bug,defect') to label list
+        labels_to_search = []
+        if query.startswith('label='):
+            labels_to_search = query.split('=', 1)[1].split(',')
+        else:
+            # If no 'label=' prefix, assume comma-separated labels
+            labels_to_search = query.split(',')
+            
+        if not labels_to_search:
+            print(f"[Error]: Could not parse labels from query: {query}", file=sys.stderr)
+            sys.exit(1)
+
+        if debug: print(f"GraphQL will run {len(labels_to_search)} full enumerations for labels: {labels_to_search}")
+
+        # 5. Run GraphQL queries per label
+        all_results_set = set() # set to avoid duplicates
+        
+        # Make sure issues_file is empty
+        try:
+            open(issues_file, 'w').close() 
+        except IOError as e:
+            print(f"[Error]: Cannot clear issues file {issues_file}: {e}", file=sys.stderr)
+            sys.exit(1)
+
+
+        for label in labels_to_search:
+            
+            label_name = label.strip()
+            if not label_name: continue
+            
+            if debug: print(f"--- Starting GraphQL Enumeration (Label: {label_name}) ---")
+            sys.stdout.flush()
+            
+            cursor = None
+            hasNextPage = True
+            page_count = 1
+
+            while hasNextPage:
+                variables = {
+                    "owner": owner,
+                    "name": name,
+                    "labels": [label_name], # Query labels as list
+                    "cursor": cursor
+                }
+                payload = {
+                    "query": graphql_query_template,
+                    "variables": variables
+                }
+                
+                if debug: 
+                    print(f"  -> Fetching page {page_count} for '{label_name}' (Cursor: {cursor})")
+                    sys.stdout.flush()
+                
+                try:
+                    # Use session.post with a longer timeout
+                    response = session.post(graphql_endpoint, headers=headers, json=payload, timeout=45)
+                    response.raise_for_status()
+                    data = response.json()
+                    
+                    if 'errors' in data:
+                        print(f"GraphQL Error: {data['errors']}", file=sys.stderr)
+                        sys.stderr.flush()
+                        break
+                        
+                    issues_data = data.get('data', {}).get('repository', {}).get('issues', {})
+                    pageInfo = issues_data.get('pageInfo', {})
+                    
+                    hasNextPage = pageInfo.get('hasNextPage', False)
+                    cursor = pageInfo.get('endCursor', None)
+                    nodes = issues_data.get('nodes', [])
+                    
+                    if not nodes and page_count == 1:
+                        if debug: print(f"  -> No issues found for label {label_name}.")
+                    
+                    # New results from this page
+                    page_results = []
+                    for node in nodes:
+                        if node:
+                            issue_tuple = (node['number'], node['url'])
+                            # Only process if it hasn't been added yet
+                            if issue_tuple not in all_results_set:
+                                all_results_set.add(issue_tuple)
+                                page_results.append(issue_tuple)
+
+                    # Append new results from this page to file
+                    if page_results:
+                        try:
+                            with open(issues_file, 'a', encoding='utf-8') as f:
+                                for issue_id, issue_url in page_results:
+                                    f.write(f"{issue_id},{issue_url}\n")
+                        except IOError as e:
+                            print(f"[Error]: Cannot write to {issues_file}: {e}", file=sys.stderr)
+                            sys.exit(1) 
+
+                    page_count += 1
+                    time.sleep(1) 
+
+                except requests.exceptions.RequestException as e:
+                    print(f"[Error]: During GraphQL request: {e}. Retrying...", file=sys.stderr)
+                    sys.stderr.flush()
+                    time.sleep(10) 
+                except json.JSONDecodeError:
+                    print(f"[Error]: Decoding GraphQL response (Rate Limit?): {response.text}", file=sys.stderr)
+                    print("  -> Sleeping for 60 seconds...")
+                    sys.stderr.flush()
+                    time.sleep(60)
+                except KeyboardInterrupt:
+                    print("[Error]: GraphQL download interrupted.")
+                    sys.stdout.flush()
+                    sys.exit(1)
+
+        print(f"[Info]: GitHub GraphQL processing complete. Wrote {len(all_results_set)} total unique issues to {issues_file}.")
+        sys.stdout.flush()
+        sys.exit(0)
     
     start = 0
 
@@ -165,7 +308,7 @@ def main():
         if debug: print(f"Fetching Bugzilla ID list from: {list_uri}")
         id_list = get_bugzilla_id_list(list_uri, tracker_id, session)
         if not id_list:
-            print("No Bugzilla IDs found.", file=sys.stderr)
+            print("[Warning]: No Bugzilla IDs found.", file=sys.stderr)
             sys.exit(0)
             
         if debug: print(f"Found {len(id_list)} Bugzilla IDs.")
@@ -175,16 +318,47 @@ def main():
             chunk = id_list[i:i+50]
             ids_query = "&".join([f"id={bid}" for bid in chunk])
             xml_uri = f"https://bz.apache.org/bugzilla/show_bug.cgi?ctype=xml&{ids_query}"
-            out_file = os.path.join(output_dir, f"{tracker_id}-issues-xml-{i}.txt")
             
-            if not os.path.exists(out_file) or os.path.getsize(out_file) == 0:
-                if debug: print(f"Downloading {xml_uri} to {out_file}")
-                if not get_file(xml_uri, out_file, session):
-                    print(f"Could not download {xml_uri}", file=sys.stderr)
-                    continue
+            if debug: print(f"Downloading {xml_uri}")
+
+            xml_content = None
+            max_retries = 5
+            retry_delay = 10
+
+            for attempt in range(max_retries):
+                try:
+                    response = session.get(xml_uri, headers={}, timeout=90) 
+                    response.raise_for_status() 
+                    xml_content = response.text 
+                    break 
+                    
+                except requests.exceptions.RequestException as e:
+                    print(f"[Warning]: Attempt {attempt + 1}/{max_retries} failed for {xml_uri}: {e}", file=sys.stderr)
+                    sys.stderr.flush()
+                    
+                    if 'IncompleteRead' in str(e):
+                        print(f"  -> IncompleteRead detected. Retrying in {retry_delay}s...", file=sys.stderr)
+                    elif hasattr(e, 'response') and e.response is not None and e.response.status_code in [502, 503, 504]:
+                         print(f"  -> Server error {e.response.status_code}. Retrying in {retry_delay}s...", file=sys.stderr)
+                    
+                    if attempt + 1 == max_retries:
+                        print(f"[Error]: Could not download {xml_uri} after {max_retries} attempts.", file=sys.stderr)
+                        sys.stderr.flush()
+                        break
+                    
+                    time.sleep(retry_delay)
+                    retry_delay *= 2
+
+            if not xml_content:
+                print(f"  -> Skipping chunk (starting {i}) due to download failure.", file=sys.stderr)
+                continue
             
-            results = tracker['results'](out_file, tracker_id)
-            all_results.extend(results)
+            try:
+                results = tracker['results'](xml_content, tracker_id)
+                all_results.extend(results)
+            except Exception as e:
+                 if debug: print(f"Failed to parse content from {xml_uri}: {e}.")
+
             
         try:
             with open(issues_file, 'w', encoding='utf-8') as f:
@@ -196,46 +370,85 @@ def main():
         print(f"Bugzilla processing complete. Wrote {len(all_results)} issues.")
         sys.exit(0)
 
-    # other trackers's processing
-    give_up = False # special logic for Google tracker
+    # Other trackers's processing
+    give_up = False # Special logic for Google tracker
     while True:
         uri = tracker['build_uri'](tracker_uri, tracker_id, query, start, limit, organization_id)
-        project_in_file = tracker_id.replace('/', '-')
-        out_file = os.path.join(output_dir, f"{project_in_file}-issues-{start}.json")
+        if debug: print(f"Downloading (in-memory) {uri}")
         
-        if not os.path.exists(out_file) or os.path.getsize(out_file) == 0:
-            if debug: print(f"Downloading {uri} to {out_file}")
-            if not get_file(uri, out_file, session):
-                if give_up: # Google tracker special logic
-                    break
-                else:
-                    print(f"Error: Could not download {uri}", file=sys.stderr)
-                    sys.exit(1)
-        else:
-            if debug: print(f"Skipping download of {out_file}")
+        content = None
+
+        max_retries = 5
+        retry_delay = 10 # Default 10 seconds delay
+
+        
+        for attempt in range(max_retries):
+            try:
+                # 1. Use session.get with a longer timeout
+                response = session.get(uri, headers={}, timeout=90) 
+                response.raise_for_status() 
+                content = response.text
+                break 
+                
+            except requests.exceptions.RequestException as e:
+                print(f"[Warning]: Attempt {attempt + 1}/{max_retries} failed for {uri}: {e}", file=sys.stderr)
+                sys.stderr.flush()
+                
+                if 'IncompleteRead' in str(e):
+                    print(f"  -> IncompleteRead detected. Server connection dropped. Retrying in {retry_delay}s...", file=sys.stderr)
+                elif hasattr(e, 'response') and e.response is not None and e.response.status_code in [502, 503, 504]:
+                     print(f"  -> Server error {e.response.status_code} (Gateway Timeout/Unavailable). Retrying in {retry_delay}s...", file=sys.stderr)
+                
+                if attempt + 1 == max_retries:
+                    print(f"[Error]: Could not download {uri} after {max_retries} attempts.", file=sys.stderr)
+                    sys.stderr.flush()
+                    
+                    if give_up: # Google tracker logic
+                        print("  -> (Google) Assuming end of results.")
+                        break
+                    else:
+                        sys.exit(1)
+                
+                time.sleep(retry_delay)
+                retry_delay *= 2
+
+        # 2. Check if content is still None after retries
+        if content is None:
+             if give_up: # Google tracker logic
+                 if debug: print("Google tracker failed after retries, stopping.")
+                 break
+             else:
+                 # Normal case where sys.exit(1) has already been triggered, but as a safety net
+                 print(f"[Error]: Failed to get content for {uri}. Exiting.", file=sys.stderr)
+                 sys.exit(1)
+
+        # 3. Check for empty content
+        if not content:
+             if debug: print("[Warning]: Downloaded content is empty. Stopping.")
+             break
         
         try:
-            results = tracker['results'](out_file, tracker_id)
+            # 4. Transform content to results
+            results = tracker['results'](content, tracker_id)
         except Exception as e:
-            if debug: print(f"Failed to parse {out_file}: {e}. Assuming end of results.")
+            if debug: print(f"[Error]: Failed to parse content from {uri}: {e}. Assuming end of results.")
             results = []
 
         if results:
             try:
-                # use 'a' (append) mode
                 with open(issues_file, 'a', encoding='utf-8') as f:
                     for issue_id, issue_url in results:
                         f.write(f"{issue_id},{issue_url}\n")
             except IOError as e:
-                print(f"Cannot write to {issues_file}: {e}", file=sys.stderr)
+                print(f"[Error]: Cannot write to {issues_file}: {e}", file=sys.stderr)
                 sys.exit(1)
             
             if args.tracker_name == 'google':
-                give_up = True # special logic for Google tracker
+                give_up = True # Special logic for Google tracker
             
             start += limit 
         else:
-            if debug: print("No more results found. Stopping.")
+            if debug: print("[Warning]: No more results found. Stopping.")
             break 
 
 if __name__ == "__main__":
